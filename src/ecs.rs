@@ -224,6 +224,14 @@ pub struct NativeFullscreenMarker {
     pub order: u32,
 }
 
+/// Marks a window entity whose column is locked to a screen edge.
+/// The column stays visually pinned while the rest of the strip scrolls.
+#[derive(Component, Clone, Debug)]
+pub enum LockedColumnMarker {
+    Left,
+    Right,
+}
+
 /// Stores the width ratio of a window before it was made full-width.
 /// When a stacked window goes full-width, it is unstacked first;
 /// `was_stacked` records whether to restack on exit.

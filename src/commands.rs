@@ -13,8 +13,9 @@ use tracing::{debug, info};
 use crate::config::Config;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, FocusFollowsMouse, FocusedMarker, FullWidthMarker, SendMessageTrigger,
-    Unmanaged, WMEventTrigger, reposition_entity, reshuffle_around, resize_entity,
+    ActiveDisplayMarker, FocusFollowsMouse, FocusedMarker, FullWidthMarker, LockedColumnMarker,
+    SendMessageTrigger, Unmanaged, WMEventTrigger, reposition_entity, reshuffle_around,
+    resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -65,6 +66,8 @@ pub enum Operation {
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
+    /// Toggles the locked state of the focused column, pinning it to the nearest screen edge.
+    LockColumn,
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -102,6 +105,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             stack_windows_handler,
             command_move_focus,
             command_swap_focus,
+            lock_column,
         ),
     );
 }
@@ -302,6 +306,7 @@ fn command_swap_focus(
     windows: Windows,
     apps: Query<&Application>,
     mut active_display: ActiveDisplayMut,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut commands: Commands,
 ) {
     let Some(Operation::Swap(direction)) =
@@ -328,11 +333,43 @@ fn command_swap_focus(
 
     let active_strip = active_display.active_strip();
 
+    // Find the locked column index so we can prevent swapping past it.
+    let locked_index = active_strip.all_windows().iter().find_map(|&e| {
+        locked.get(e).ok().and_then(|(_, marker)| {
+            active_strip
+                .index_of(e)
+                .ok()
+                .map(|idx| (idx, marker.clone()))
+        })
+    });
+
     let mut handler = || {
         let (_, current) = windows.focused()?;
         let index = active_strip.index_of(current).ok()?;
         let other_window = get_window_in_direction(direction, current, active_strip)?;
-        let new_index = active_strip.index_of(other_window).ok()?;
+        let mut new_index = active_strip.index_of(other_window).ok()?;
+
+        // Prevent swapping past a locked column.
+        if let Some((lock_idx, ref marker)) = locked_index {
+            match marker {
+                LockedColumnMarker::Left => {
+                    // Can't swap into index 0 (the locked column's position).
+                    if new_index <= lock_idx {
+                        new_index = lock_idx + 1;
+                    }
+                }
+                LockedColumnMarker::Right => {
+                    // Can't swap into the last index (the locked column's position).
+                    if new_index >= lock_idx {
+                        new_index = lock_idx.saturating_sub(1);
+                    }
+                }
+            }
+            if new_index == index {
+                return None;
+            }
+        }
+
         debug!(
             "swap {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
             active_strip.len()
@@ -770,6 +807,7 @@ pub fn stack_windows_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut commands: Commands,
 ) {
     let Some(Operation::Stack(stack)) =
@@ -789,7 +827,52 @@ pub fn stack_windows_handler(
         } else {
             _ = strip.unstack(entity);
         }
-        reshuffle_around(entity, &mut commands);
+
+        // After stack/unstack, a locked column may no longer be at the strip
+        // edge. Re-bubble it to the correct position.
+        let strip = active_display.active_strip();
+        for window_entity in strip.all_windows() {
+            if let Ok((_, marker)) = locked.get(window_entity) {
+                let side = marker.clone();
+                if let Ok(current_idx) = strip.index_of(window_entity) {
+                    let target_idx = match side {
+                        LockedColumnMarker::Left => 0,
+                        LockedColumnMarker::Right => strip.len().saturating_sub(1),
+                    };
+                    if current_idx != target_idx {
+                        match side {
+                            LockedColumnMarker::Left => {
+                                for i in (1..=current_idx).rev() {
+                                    strip.swap(i, i - 1);
+                                }
+                            }
+                            LockedColumnMarker::Right => {
+                                for i in current_idx..strip.len() - 1 {
+                                    strip.swap(i, i + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // If the focused entity ended up in a locked column, reshuffle_around
+        // will skip viewport offset recalculation. Also reshuffle a non-locked
+        // neighbour so the remaining columns close the gap.
+        let strip = active_display.active_strip();
+        let reshuffle_entity =
+            if strip.all_windows().iter().any(|e| locked.get(*e).is_ok()) {
+                strip
+                    .all_windows()
+                    .into_iter()
+                    .find(|e| locked.get(*e).is_err())
+                    .unwrap_or(entity)
+            } else {
+                entity
+            };
+        reshuffle_around(reshuffle_entity, &mut commands);
     }
 }
 
@@ -912,6 +995,94 @@ fn print_internal_state_handler(
     if let Some(pool) = bevy::tasks::ComputeTaskPool::try_get() {
         info!("Running with {} threads", pool.thread_num());
     }
+}
+
+#[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::needless_pass_by_value)]
+fn lock_column(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::LockColumn))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    let Some((_, entity)) = windows.focused() else {
+        return;
+    };
+
+    // Toggle off if already locked.
+    if locked.get(entity).is_ok() {
+        commands.entity(entity).try_remove::<LockedColumnMarker>();
+        reshuffle_around(entity, &mut commands);
+        return;
+    }
+
+    // Remove any existing lock on other windows in this strip.
+    let strip = active_display.active_strip();
+    for window_entity in strip.all_windows() {
+        if locked.get(window_entity).is_ok() {
+            commands
+                .entity(window_entity)
+                .try_remove::<LockedColumnMarker>();
+        }
+    }
+
+    // Determine closest edge.
+    let display_center = active_display.bounds().center().x;
+    let side = if let Some(frame) = windows.frame(entity) {
+        if frame.center().x <= display_center {
+            LockedColumnMarker::Left
+        } else {
+            LockedColumnMarker::Right
+        }
+    } else {
+        LockedColumnMarker::Left
+    };
+
+    // Move the locked column to the appropriate end of the strip.
+    let strip = active_display.active_strip();
+    if let Ok(current_idx) = strip.index_of(entity) {
+        let target_idx = match side {
+            LockedColumnMarker::Left => 0,
+            LockedColumnMarker::Right => strip.len().saturating_sub(1),
+        };
+        if current_idx != target_idx {
+            match side {
+                LockedColumnMarker::Left => {
+                    // Bubble left to index 0.
+                    for i in (1..=current_idx).rev() {
+                        strip.swap(i, i - 1);
+                    }
+                }
+                LockedColumnMarker::Right => {
+                    // Bubble right to the end.
+                    for i in current_idx..strip.len() - 1 {
+                        strip.swap(i, i + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    debug!("locking column {entity} to {side:?}");
+    commands.entity(entity).try_insert(side);
+
+    // Reshuffle a non-locked entity so the viewport offset is recalculated
+    // with the gap clamp (the locked entity's reshuffle path skips that).
+    let strip = active_display.active_strip();
+    let reshuffle_entity = strip
+        .all_windows()
+        .into_iter()
+        .find(|e| *e != entity && locked.get(*e).is_err())
+        .unwrap_or(entity);
+    reshuffle_around(reshuffle_entity, &mut commands);
 }
 
 #[cfg(test)]

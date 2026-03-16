@@ -26,8 +26,9 @@ use crate::config::{BorderRadiusOption, Config, SwipeGestureDirection};
 use crate::ecs::params::{ActiveDisplay, Configuration, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, DockPosition, Initializing,
-    LocateDockTrigger, Position, ReshuffleAroundMarker, Scrolling, StackAdjustedResize, Unmanaged,
-    WidthRatio, WindowDraggedMarker, reposition_entity, reshuffle_around, resize_entity,
+    LocateDockTrigger, LockedColumnMarker, Position, ReshuffleAroundMarker, Scrolling,
+    StackAdjustedResize, Unmanaged, WidthRatio, WindowDraggedMarker, reposition_entity,
+    reshuffle_around, resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -762,12 +763,16 @@ pub(super) fn animate_entities(
 pub(super) fn animate_resize_entities(
     mut animate: Populated<(&mut Bounds, Entity, &ResizeMarker, Has<RepositionMarker>)>,
     active_display: ActiveDisplay,
+    locked: Query<&LockedColumnMarker, With<Window>>,
     time: Res<Time>,
     config: Res<Config>,
     commands: ParallelCommands,
 ) {
     let move_ratio = config.animation_speed() * time.delta_secs_f64();
     let move_delta = move_ratio * f64::from(active_display.display().width());
+    // When a locked column exists, snap width changes instantly to prevent
+    // the resize animation from temporarily extending into the locked area.
+    let has_locked = !locked.is_empty();
 
     animate
         .par_iter_mut()
@@ -784,11 +789,16 @@ pub(super) fn animate_resize_entities(
                 }
             }
 
-            let delta = bounds
+            let mut delta = bounds
                 .0
                 .as_vec2()
                 .move_towards(size.as_vec2(), move_delta as f32)
                 .as_ivec2();
+
+            // Snap width instantly when a locked column is present.
+            if has_locked {
+                delta.x = size.x;
+            }
 
             trace!(
                 "entity {entity} source {} dest {size} delta {move_delta} resizing to {delta}",
@@ -813,6 +823,7 @@ pub(super) fn apply_scroll_physics(
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     windows: Windows,
     window_manager: Res<WindowManager>,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut config: Configuration,
     time: Res<Time>,
     mut commands: Commands,
@@ -855,9 +866,10 @@ pub(super) fn apply_scroll_physics(
     }
 
     let get_window_frame = |entity| get_moving_window_frame(entity, &windows);
-    let viewport = active_display
+    let raw_viewport = active_display
         .0
         .actual_display_bounds(active_display.1, config.config());
+    let viewport = effective_viewport(&raw_viewport, &locked, strip, &get_window_frame);
 
     let absolute_positions = strip
         .absolute_positions(&get_window_frame)
@@ -883,7 +895,7 @@ pub(super) fn apply_scroll_physics(
     let frame_delta = scroll.velocity * dt;
     let shift = (f64::from(viewport.width()) * frame_delta) as i32;
 
-    if let Some(clamped_offset) = clamp_viewport_offset(
+    if let Some(mut clamped_offset) = clamp_viewport_offset(
         position.x,
         shift,
         &absolute_positions,
@@ -891,6 +903,8 @@ pub(super) fn apply_scroll_physics(
         &viewport,
         config.config(),
     ) {
+        clamped_offset =
+            clamp_for_locked_gap(clamped_offset, strip, &locked, &raw_viewport, &get_window_frame);
         position.x = clamped_offset;
     } else {
         scroll.velocity = 0.0;
@@ -984,15 +998,131 @@ where
     )
 }
 
+/// Checks whether the given column contains a locked window.
+fn column_locked_marker(
+    column: &Column,
+    locked: &Query<(Entity, &LockedColumnMarker), With<Window>>,
+) -> Option<LockedColumnMarker> {
+    let entities = match column {
+        Column::Single(e) => std::slice::from_ref(e),
+        Column::Stack(stack) => stack.as_slice(),
+    };
+    entities
+        .iter()
+        .find_map(|&e| locked.get(e).ok().map(|(_, m)| m.clone()))
+}
+
+/// Adjusts a viewport offset so that non-locked columns don't leave a gap
+/// next to a locked column. The locked column is pinned to a screen edge
+/// independently, but the remaining strip content should abut it.
+fn clamp_for_locked_gap<W>(
+    offset: i32,
+    strip: &LayoutStrip,
+    locked: &Query<(Entity, &LockedColumnMarker), With<Window>>,
+    viewport: &IRect,
+    get_window_frame: &W,
+) -> i32
+where
+    W: Fn(Entity) -> Option<IRect>,
+{
+    for (col, abs_pos) in strip.absolute_positions(get_window_frame) {
+        let Some(marker) = column_locked_marker(col, locked) else {
+            continue;
+        };
+        let locked_width = col
+            .top()
+            .and_then(&get_window_frame)
+            .map_or(0, |f| f.width());
+        return match marker {
+            LockedColumnMarker::Right => {
+                // The locked column is pinned at viewport.max.x - locked_width.
+                // The last non-locked column ends at offset + abs_pos (the locked
+                // column's abs start). Ensure it reaches the locked column's edge.
+                let min_offset = viewport.max.x - locked_width - abs_pos;
+                offset.max(min_offset)
+            }
+            LockedColumnMarker::Left => {
+                // The locked column is pinned at viewport.min.x.
+                // The first non-locked column starts at offset + (abs_pos + locked_width).
+                // Ensure it doesn't leave a gap after the locked column.
+                let max_offset = viewport.min.x - abs_pos;
+                offset.min(max_offset)
+            }
+        };
+    }
+    offset
+}
+
+/// Checks whether the given entity belongs to a column that contains a locked window.
+/// Returns the `LockedColumnMarker` if found, `None` otherwise.
+fn is_in_locked_column(
+    entity: Entity,
+    locked: &Query<(Entity, &LockedColumnMarker), With<Window>>,
+    strip: &LayoutStrip,
+) -> Option<LockedColumnMarker> {
+    let Ok(col_idx) = strip.index_of(entity) else {
+        return None;
+    };
+    let Ok(column) = strip.get(col_idx) else {
+        return None;
+    };
+    column_locked_marker(&column, locked)
+}
+
+/// Shrinks the viewport by the width of any locked column on the appropriate side.
+fn effective_viewport<W>(
+    viewport: &IRect,
+    locked: &Query<(Entity, &LockedColumnMarker), With<Window>>,
+    strip: &LayoutStrip,
+    get_window_frame: &W,
+) -> IRect
+where
+    W: Fn(Entity) -> Option<IRect>,
+{
+    let mut effective = *viewport;
+    for window_entity in strip.all_windows() {
+        if let Ok((_, marker)) = locked.get(window_entity) {
+            if let Some(frame) = get_window_frame(window_entity) {
+                match marker {
+                    LockedColumnMarker::Left => {
+                        effective.min.x = effective.min.x.max(viewport.min.x + frame.width());
+                    }
+                    LockedColumnMarker::Right => {
+                        effective.max.x = effective.max.x.min(viewport.max.x - frame.width());
+                    }
+                }
+            }
+        }
+    }
+    effective
+}
+
 fn expose_window(
     entity: Entity,
     windows: &Windows,
     active_display: &ActiveDisplay,
     config: &Config,
+    locked: &Query<(Entity, &LockedColumnMarker), With<Window>>,
 ) -> Option<IRect> {
     let display_bounds = active_display
         .display()
         .actual_display_bounds(active_display.dock(), config);
+
+    let get_frame = |e| get_moving_window_frame(e, windows);
+    let display_bounds = if is_in_locked_column(entity, locked, active_display.active_strip())
+        .is_some()
+    {
+        // Windows in a locked column use the raw display bounds for snapping.
+        display_bounds
+    } else {
+        effective_viewport(
+            &display_bounds,
+            locked,
+            active_display.active_strip(),
+            &get_frame,
+        )
+    };
+
     let mut frame = get_moving_window_frame(entity, windows)?;
     let size = frame.size();
 
@@ -1012,8 +1142,10 @@ fn expose_window(
 pub(super) fn reshuffle_layout_strip(
     marker: Populated<Entity, With<ReshuffleAroundMarker>>,
     active_display: ActiveDisplay,
+    strip_position: Query<&Position, With<ActiveWorkspaceMarker>>,
     windows: Windows,
     config: Res<Config>,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut commands: Commands,
 ) {
     let get_window_frame = |entity| get_moving_window_frame(entity, &windows);
@@ -1024,7 +1156,24 @@ pub(super) fn reshuffle_layout_strip(
             cmd.try_remove::<ReshuffleAroundMarker>();
         }
 
-        let Some(frame) = expose_window(entity, &windows, &active_display, &config) else {
+        // Locked columns are always visible at their pinned edge,
+        // so skip viewport offset recalculation to avoid strip panning.
+        // But still re-trigger position_layout_strip so the locked column
+        // and its neighbours get repositioned (e.g. after stack/resize).
+        if is_in_locked_column(entity, &locked, active_display.active_strip()).is_some() {
+            if let Ok(pos) = strip_position.single() {
+                reposition_entity(
+                    active_display.active_strip_entity(),
+                    pos.0,
+                    &mut commands,
+                );
+            }
+            continue;
+        }
+
+        let Some(frame) =
+            expose_window(entity, &windows, &active_display, &config, &locked)
+        else {
             return;
         };
 
@@ -1044,9 +1193,15 @@ pub(super) fn reshuffle_layout_strip(
             .active_strip()
             .absolute_positions(&get_window_frame)
             .collect::<Vec<_>>();
-        let viewport = active_display
+        let raw_viewport = active_display
             .display()
             .actual_display_bounds(active_display.dock(), &config);
+        let viewport = effective_viewport(
+            &raw_viewport,
+            &locked,
+            active_display.active_strip(),
+            &get_window_frame,
+        );
         let viewport_x = if frame.center().x == viewport.center().x {
             // Attempting to cente window, don't clamp.
             viewport_position.x
@@ -1061,6 +1216,13 @@ pub(super) fn reshuffle_layout_strip(
             )
             .unwrap_or(viewport_position.x)
         };
+        let viewport_x = clamp_for_locked_gap(
+            viewport_x,
+            active_display.active_strip(),
+            &locked,
+            &raw_viewport,
+            &get_window_frame,
+        );
         reposition_entity(
             active_display.active_strip_entity(),
             viewport_position.with_x(viewport_x),
@@ -1489,6 +1651,7 @@ pub(super) fn position_layout_strip(
     position: Query<(Option<&RepositionMarker>, Option<&ResizeMarker>), With<Window>>,
     active_display: Single<(&Display, Entity, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     active_workspace: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     config: Res<Config>,
 ) {
     let (active_display, display_entity, dock) = *active_display;
@@ -1519,12 +1682,40 @@ pub(super) fn position_layout_strip(
             continue;
         }
 
+        let eff_viewport =
+            effective_viewport(&viewport, &locked, &layout_strip, &get_window_frame);
+
         for (entity, mut frame) in
             layout_strip.layout_to_viewport(**position, &viewport, &get_window_frame)
         {
             let Some(old_frame) = get_window_frame(entity) else {
                 continue;
             };
+
+            // Pin all windows in a locked column to the screen edge.
+            if let Some(marker) =
+                is_in_locked_column(entity, &locked, &layout_strip)
+            {
+                let width = frame.width();
+                match marker {
+                    LockedColumnMarker::Left => {
+                        frame.min.x = viewport.min.x;
+                    }
+                    LockedColumnMarker::Right => {
+                        frame.min.x = viewport.max.x - width;
+                    }
+                }
+                frame.max.x = frame.min.x + width;
+
+                if old_frame.size() != frame.size() {
+                    resized.push((entity, Size::new(frame.width(), frame.height())));
+                }
+                if old_frame.min != frame.min {
+                    moved.push((entity, frame.min));
+                }
+                continue;
+            }
+
             // Account for per-window horizontal_padding: reposition() adds
             // h_pad to the virtual x, so subtract it here so the OS window
             // lands exactly sliver_width pixels from the screen edge.
@@ -1533,13 +1724,33 @@ pub(super) fn position_layout_strip(
                 .map(|w| w.0.horizontal_padding())
                 .unwrap_or(0);
 
+            // Clamp non-locked windows so they never overlap the locked column.
             let width = frame.width();
-            if frame.max.x <= viewport.min.x {
-                // Window hidden to the left
+            if eff_viewport.min.x > viewport.min.x
+                && frame.min.x < eff_viewport.min.x
+                && frame.max.x > eff_viewport.min.x
+            {
+                // Partially overlapping a left-locked column: push right.
+                frame.min.x = eff_viewport.min.x;
+            }
+            if eff_viewport.max.x < viewport.max.x
+                && frame.max.x > eff_viewport.max.x
+                && frame.min.x < eff_viewport.max.x
+            {
+                // Partially overlapping a right-locked column: push left.
+                frame.min.x = eff_viewport.max.x - width;
+            }
+
+            if frame.max.x <= eff_viewport.min.x {
+                // Window hidden to the left: place sliver at raw viewport edge
+                // so it goes behind any left-locked column.
+                frame.min.x = viewport.min.x - width;
                 frame.min.x += offscreen_sliver_width.max(pad_left) - pad_left;
                 frame.min.x += h_pad;
-            } else if frame.min.x >= viewport.max.x {
-                // Window hidden to the right
+            } else if frame.min.x >= eff_viewport.max.x {
+                // Window hidden to the right: place sliver at raw viewport edge
+                // so it goes behind any right-locked column.
+                frame.min.x = viewport.max.x;
                 frame.min.x -= offscreen_sliver_width.max(pad_right) - pad_right;
                 frame.min.x -= h_pad;
             }

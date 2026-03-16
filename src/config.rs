@@ -136,6 +136,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "stack" => Operation::Stack(true),
         "unstack" => Operation::Stack(false),
         "nextdisplay" => Operation::ToNextDisplay,
+        "lock" => Operation::LockColumn,
         _ => {
             return Err(err);
         }

@@ -24,14 +24,14 @@ use crate::commands::ON_FULLSCREEN_SPACE;
 use crate::config::{Config, WindowParams};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Configuration, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, LocateDockTrigger, Position, Scrolling, SendMessageTrigger,
-    WidthRatio, reposition_entity, reshuffle_around, resize_entity,
+    ActiveWorkspaceMarker, Bounds, LocateDockTrigger, LockedColumnMarker, Position, Scrolling,
+    SendMessageTrigger, WidthRatio, reposition_entity, reshuffle_around, resize_entity,
 };
 use crate::errors::Result;
 use crate::events::Event;
 use crate::manager::{
-    Application, Display, LayoutStrip, Origin, Process, Size, Window, WindowManager, WindowPadding,
-    irect_from,
+    Application, Column, Display, LayoutStrip, Origin, Process, Size, Window, WindowManager,
+    WindowPadding, irect_from,
 };
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 use crate::util::symlink_target;
@@ -649,6 +649,7 @@ pub(super) fn window_focused_trigger(
     applications: Query<&Application>,
     windows: Windows,
     active_display: ActiveDisplay,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut config: Configuration,
     mut commands: Commands,
 ) {
@@ -693,8 +694,23 @@ pub(super) fn window_focused_trigger(
 
     commands.entity(entity).try_insert(FocusedMarker);
 
+    let entity_in_locked_column = active_display
+        .active_strip()
+        .index_of(entity)
+        .ok()
+        .and_then(|idx| active_display.active_strip().get(idx).ok())
+        .map(|col| {
+            let entities = match &col {
+                Column::Single(e) => vec![*e],
+                Column::Stack(stack) => stack.clone(),
+            };
+            entities.iter().any(|e| locked.get(*e).is_ok())
+        })
+        .unwrap_or(false);
+
     if !(config.skip_reshuffle() || config.initializing()) {
         if config.auto_center()
+            && !entity_in_locked_column
             && let Some((_, _, None)) = windows.get_managed(entity)
             && let Some(size) = windows.size(entity)
             && let Some(mut origin) = windows.origin(entity)
@@ -983,12 +999,28 @@ pub(super) fn window_unmanaged_trigger(
 pub(super) fn window_managed_trigger(
     trigger: On<Remove, Unmanaged>,
     mut active_display: ActiveDisplayMut,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
     debug!("Entity {entity} is managed again.");
 
-    active_display.active_strip().append(entity);
+    let strip = active_display.active_strip();
+
+    // If there's a right-locked column at the end, insert before it.
+    let right_locked_idx = strip.all_windows().iter().find_map(|&e| {
+        locked.get(e).ok().and_then(|(_, marker)| {
+            matches!(marker, LockedColumnMarker::Right)
+                .then(|| strip.index_of(e).ok())
+                .flatten()
+        })
+    });
+
+    if let Some(lock_idx) = right_locked_idx {
+        strip.insert_at(lock_idx, entity);
+    } else {
+        strip.append(entity);
+    }
     reshuffle_around(entity, &mut commands);
 }
 
@@ -1099,6 +1131,7 @@ pub(super) fn spawn_window_trigger(
     windows: Windows,
     mut apps: Query<(Entity, &mut Application)>,
     mut active_display: ActiveDisplayMut,
+    locked: Query<(Entity, &LockedColumnMarker), With<Window>>,
     mut config: Configuration,
     mut commands: Commands,
 ) {
@@ -1171,6 +1204,7 @@ pub(super) fn spawn_window_trigger(
             &properties,
             &mut active_display,
             &windows,
+            &locked,
             &mut apps,
             &mut config,
             &mut commands,
@@ -1237,6 +1271,7 @@ fn apply_window_properties(
     properties: &[WindowParams],
     active_display: &mut ActiveDisplayMut,
     windows: &Windows,
+    locked: &Query<(Entity, &LockedColumnMarker), With<Window>>,
     apps: &mut Query<(Entity, &mut Application)>,
     config: &mut Configuration,
     commands: &mut Commands,
@@ -1259,6 +1294,16 @@ fn apply_window_properties(
 
     let strip = active_display.active_strip();
 
+    // Find locked column index to constrain insertion.
+    let locked_bound = strip.all_windows().iter().find_map(|&e| {
+        locked.get(e).ok().and_then(|(_, marker)| {
+            strip
+                .index_of(e)
+                .ok()
+                .map(|idx| (idx, marker.clone()))
+        })
+    });
+
     // Attempt inserting the window at a pre-defined position.
     let insert_at = wanted_insertion.map_or_else(
         || {
@@ -1272,13 +1317,34 @@ fn apply_window_properties(
         Some,
     );
 
+    // Clamp insertion index so it doesn't go beyond a locked column.
+    let insert_at = insert_at.map(|idx| {
+        if let Some((lock_idx, ref marker)) = locked_bound {
+            match marker {
+                LockedColumnMarker::Right if idx > lock_idx => lock_idx,
+                LockedColumnMarker::Left if idx <= lock_idx => lock_idx + 1,
+                _ => idx,
+            }
+        } else {
+            idx
+        }
+    });
+
     debug!("New window adding at {strip}");
     match insert_at {
         Some(after) => {
             debug!("New window inserted at {after}");
             strip.insert_at(after, entity);
         }
-        None => strip.append(entity),
+        None => {
+            // Append — but if there's a right-locked column at the end,
+            // insert just before it instead.
+            if let Some((lock_idx, LockedColumnMarker::Right)) = locked_bound {
+                strip.insert_at(lock_idx, entity);
+            } else {
+                strip.append(entity);
+            }
+        }
     }
 
     if config.initializing() {
