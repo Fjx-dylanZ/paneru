@@ -1019,7 +1019,9 @@ fn lock_column(
 
     // Toggle off if already locked.
     if locked.get(entity).is_ok() {
-        commands.entity(entity).try_remove::<LockedColumnMarker>();
+        if let Ok(mut cmd) = commands.get_entity(entity) {
+            cmd.try_remove::<LockedColumnMarker>();
+        }
         reshuffle_around(entity, &mut commands);
         return;
     }
@@ -1028,9 +1030,9 @@ fn lock_column(
     let strip = active_display.active_strip();
     for window_entity in strip.all_windows() {
         if locked.get(window_entity).is_ok() {
-            commands
-                .entity(window_entity)
-                .try_remove::<LockedColumnMarker>();
+            if let Ok(mut cmd) = commands.get_entity(window_entity) {
+                cmd.try_remove::<LockedColumnMarker>();
+            }
         }
     }
 
@@ -1072,7 +1074,9 @@ fn lock_column(
     }
 
     debug!("locking column {entity} to {side:?}");
-    commands.entity(entity).try_insert(side);
+    if let Ok(mut cmd) = commands.get_entity(entity) {
+        cmd.try_insert(side);
+    }
 
     // Reshuffle a non-locked entity so the viewport offset is recalculated
     // with the gap clamp (the locked entity's reshuffle path skips that).

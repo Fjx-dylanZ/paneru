@@ -692,7 +692,9 @@ pub(super) fn window_focused_trigger(
         return;
     }
 
-    commands.entity(entity).try_insert(FocusedMarker);
+    if let Ok(mut cmd) = commands.get_entity(entity) {
+        cmd.try_insert(FocusedMarker);
+    }
 
     let entity_in_locked_column = active_display
         .active_strip()
