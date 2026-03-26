@@ -90,6 +90,12 @@ pub(super) fn dispatch_toplevel_triggers(
             }
             Event::SystemWoke { msg } => {
                 debug!("system woke: {msg:?}");
+                // After wake the active display may have changed (e.g. the
+                // external monitor might not be ready yet).  Force a
+                // re-evaluation so ActiveDisplayMarker and
+                // ActiveWorkspaceMarker are correct before the next
+                // keyboard shortcut.
+                commands.trigger(WMEventTrigger(Event::DisplayChanged));
             }
 
             _ => commands.trigger(WMEventTrigger(event.clone())),

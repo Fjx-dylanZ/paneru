@@ -684,10 +684,11 @@ fn to_next_display(
 
 /// Moves the mouse pointer to the next available display.
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    apps: Query<&Application>,
     layout_strips: Query<(&LayoutStrip, Entity)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     window_manager: Res<WindowManager>,
@@ -718,11 +719,11 @@ fn mouse_to_next_display(
     };
 
     let visible_width = |frame: IRect| other.bounds().intersect(frame).width();
-    let Some(frame) = other_strip
+    let Some((target_entity, frame)) = other_strip
         .all_windows()
         .iter()
-        .filter_map(|entity| windows.frame(*entity))
-        .max_by(|left, right| {
+        .filter_map(|entity| windows.frame(*entity).map(|f| (*entity, f)))
+        .max_by(|(_, left), (_, right)| {
             if visible_width(*left) < visible_width(*right) {
                 std::cmp::Ordering::Less
             } else {
@@ -737,6 +738,14 @@ fn mouse_to_next_display(
     let visible_frame = other.bounds().intersect(frame);
     debug!("warping mouse to {visible_frame:?}",);
     window_manager.warp_mouse(visible_frame.center());
+
+    // Directly focus the target window so that display switching works
+    // even when focus-follows-mouse is disabled.
+    if let Some(window) = windows.get(target_entity)
+        && let Some(psn) = windows.psn(window.id(), &apps)
+    {
+        window.focus_with_raise(psn);
+    }
 
     let point = origin_to(visible_frame.center());
     ffm_flag.as_mut().0 = None;
