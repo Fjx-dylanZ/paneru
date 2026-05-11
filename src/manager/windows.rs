@@ -63,6 +63,9 @@ pub trait WindowApi: Send + Sync {
         focused_psn: ProcessSerialNumber,
     );
     fn focus_with_raise(&self, psn: ProcessSerialNumber);
+    /// Raises the window in the OS z-order without altering focus.
+    /// Used to shuffle the floating-vs-tiled layer order.
+    fn raise_without_focus(&self);
     fn pid(&self) -> Result<Pid>;
     fn set_padding(&mut self, padding: WindowPadding);
     fn horizontal_padding(&self) -> i32;
@@ -549,6 +552,13 @@ impl WindowApi for WindowOS {
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
         self.make_key_window(&psn);
+        let element_ref = self.ax_element.as_ptr();
+        let action = CFString::from_static_str(kAXRaiseAction);
+        unsafe { AXUIElementPerformAction(element_ref, &action) };
+    }
+
+    #[instrument(level = Level::DEBUG)]
+    fn raise_without_focus(&self) {
         let element_ref = self.ax_element.as_ptr();
         let action = CFString::from_static_str(kAXRaiseAction);
         unsafe { AXUIElementPerformAction(element_ref, &action) };

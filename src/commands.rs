@@ -5,12 +5,15 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, Single};
 use bevy::math::IRect;
+use bevy::platform::collections::HashSet;
 use tracing::{Level, instrument};
 use tracing::{debug, info};
 
 mod query;
 
 use crate::config::Config;
+use crate::ecs::display::FloatingLayer;
+use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
@@ -93,6 +96,10 @@ pub enum Operation {
     VirtualMove(Direction, MoveFocus),
     /// Moves the focused window to a virtual strip by its zero-based index.
     VirtualMoveNumber(u32, MoveFocus),
+    /// Alt-tab between the floating and tiled tiers of the active workspace.
+    /// The focus change is intentional: macOS's AX raise can't lift a window
+    /// across apps, so the target's app must be made frontmost.
+    ToggleFloatingLayer,
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -128,6 +135,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             to_next_display,
             equalize_column,
             manage_window,
+            toggle_floating_layer,
             stack_windows_handler,
             command_move_focus,
             command_swap_focus,
@@ -251,6 +259,56 @@ fn switch_native_tab(
     mark_focused_entity(target, commands);
 }
 
+/// 45° direction cone, closest by squared Euclidean distance.
+/// `First`/`Last` are strip-only and return `None`.
+fn pick_nearest_in_direction(
+    direction: &Direction,
+    focused_center: bevy::math::IVec2,
+    candidates: impl IntoIterator<Item = (Entity, bevy::math::IVec2)>,
+) -> Option<Entity> {
+    candidates
+        .into_iter()
+        .filter_map(|(entity, center)| {
+            let dx = center.x - focused_center.x;
+            let dy = center.y - focused_center.y;
+            let in_direction = match direction {
+                Direction::East => dx > 0 && dy.abs() <= dx.abs(),
+                Direction::West => dx < 0 && dy.abs() <= dx.abs(),
+                Direction::North => dy < 0 && dx.abs() <= dy.abs(),
+                Direction::South => dy > 0 && dx.abs() <= dy.abs(),
+                Direction::First | Direction::Last => return None,
+            };
+            in_direction.then_some((entity, dx * dx + dy * dy))
+        })
+        .min_by_key(|(_, dist_sq)| *dist_sq)
+        .map(|(entity, _)| entity)
+}
+
+fn nearest_float_in_direction(
+    direction: &Direction,
+    focused_entity: Entity,
+    windows: &Windows,
+    display_bounds: IRect,
+) -> Option<Entity> {
+    let focused_center = windows.frame(focused_entity)?.center();
+
+    let candidates = windows.iter().filter_map(|(_, entity)| {
+        if entity == focused_entity {
+            return None;
+        }
+        let (_, _, Some(Unmanaged::Floating)) = windows.get_managed(entity)? else {
+            return None;
+        };
+        let frame = windows.frame(entity)?;
+        if display_bounds.intersect(frame).is_empty() {
+            return None;
+        }
+        Some((entity, frame.center()))
+    });
+
+    pick_nearest_in_direction(direction, focused_center, candidates)
+}
+
 /// Handles the "focus" command, moving focus to a window in a specified direction.
 ///
 /// # Arguments
@@ -306,6 +364,15 @@ fn command_move_focus(
             &apps,
             &mut commands,
         );
+        return;
+    }
+
+    if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity) {
+        if let Some(entity) =
+            nearest_float_in_direction(direction, focused_entity, &windows, active_display.bounds())
+        {
+            focus_entity(entity, true, &mut commands);
+        }
         return;
     }
 
@@ -687,6 +754,94 @@ fn manage_window(mut messages: MessageReader<Event>, windows: Windows, mut comma
             entity_commands.try_insert(Unmanaged::Floating);
         }
     }
+}
+
+/// Focus-and-raise are deliberately coupled: macOS's AX raise can't lift a
+/// window above another app's frontmost window, so the target's app must be
+/// made frontmost. Other windows in the target tier are raised within their
+/// own apps' stacks as a best-effort.
+#[allow(clippy::needless_pass_by_value)]
+fn toggle_floating_layer(
+    mut messages: MessageReader<Event>,
+    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    mut active_workspace: Single<(&LayoutStrip, &mut FloatingLayer), With<ActiveWorkspaceMarker>>,
+    focus_history: Res<FocusHistory>,
+    window_manager: Res<WindowManager>,
+    windows: Windows,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::ToggleFloatingLayer)
+    })
+    .next()
+    .is_none()
+    {
+        return;
+    }
+
+    let display_bounds = active_display.bounds();
+    let (active_strip, layer) = &mut *active_workspace;
+    let workspace_id = active_strip.id();
+    let target_layer = layer.flipped();
+
+    // Floats on other macOS Spaces share the display bounds, so without an
+    // explicit workspace-membership filter they leak into the float set.
+    let workspace_window_ids: HashSet<_> = window_manager
+        .windows_in_workspace(workspace_id)
+        .ok()
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default();
+
+    let visible_float = |entity: Entity| -> bool {
+        let Some((window, _, Some(Unmanaged::Floating))) = windows.get_managed(entity) else {
+            return false;
+        };
+        if !workspace_window_ids.contains(&window.id()) {
+            return false;
+        }
+        let Some(frame) = windows.frame(entity) else {
+            return false;
+        };
+        !display_bounds.intersect(frame).is_empty() && !active_strip.contains(entity)
+    };
+
+    let target = match target_layer {
+        FloatingLayer::Front => focus_history
+            .last_floating(workspace_id)
+            .filter(|entity| visible_float(*entity))
+            .or_else(|| {
+                windows
+                    .iter()
+                    .find_map(|(_, e)| visible_float(e).then_some(e))
+            }),
+        FloatingLayer::Behind => focus_history
+            .last_managed(workspace_id)
+            .filter(|entity| active_strip.contains(*entity))
+            .or_else(|| active_strip.all_windows().into_iter().next()),
+    };
+
+    let mut raise = |entity: Entity| {
+        if Some(entity) == target {
+            return;
+        }
+        if let Some(window) = windows.get(entity) {
+            window.raise_without_focus();
+        }
+    };
+    match target_layer {
+        FloatingLayer::Behind => active_strip.all_windows().into_iter().for_each(&mut raise),
+        FloatingLayer::Front => windows
+            .iter()
+            .filter_map(|(_, e)| visible_float(e).then_some(e))
+            .for_each(raise),
+    }
+
+    if let Some(entity) = target {
+        focus_entity(entity, true, &mut commands);
+    }
+
+    **layer = target_layer;
+    debug!("floating layer -> {target_layer:?}");
 }
 
 /// Moves the focused window to the next available display.
@@ -1197,6 +1352,67 @@ mod tests {
         assert_eq!(
             get_window_in_direction(&west, entities[3], &strip),
             Some(entities[1])
+        );
+    }
+
+    #[test]
+    fn test_pick_nearest_in_direction() {
+        let mut world = World::new();
+        let entities = world
+            .spawn_batch(vec![(), (), (), ()])
+            .collect::<Vec<Entity>>();
+        let focused_center = IVec2::new(500, 500);
+        // West-far, East-near, East-far, South.
+        let candidates = vec![
+            (entities[0], IVec2::new(100, 500)),
+            (entities[1], IVec2::new(700, 480)),
+            (entities[2], IVec2::new(900, 520)),
+            (entities[3], IVec2::new(500, 900)),
+        ];
+
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::East, focused_center, candidates.clone()),
+            Some(entities[1])
+        );
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::West, focused_center, candidates.clone()),
+            Some(entities[0])
+        );
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::South, focused_center, candidates.clone()),
+            Some(entities[3])
+        );
+        // No candidate above the focused center → no match.
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::North, focused_center, candidates.clone()),
+            None
+        );
+        // First/Last are strip-only concepts.
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::First, focused_center, candidates.clone()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_pick_nearest_respects_45deg_cone() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), ()]).collect::<Vec<Entity>>();
+        let focused_center = IVec2::new(0, 0);
+        // (50, 100): |dy| > |dx| → falls in the South cone, not East.
+        // (100, 50): |dy| < |dx| → falls in the East cone.
+        let candidates = vec![
+            (entities[0], IVec2::new(50, 100)),
+            (entities[1], IVec2::new(100, 50)),
+        ];
+
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::East, focused_center, candidates.clone()),
+            Some(entities[1])
+        );
+        assert_eq!(
+            pick_nearest_in_direction(&Direction::South, focused_center, candidates),
+            Some(entities[0])
         );
     }
 }

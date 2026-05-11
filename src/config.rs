@@ -205,6 +205,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
+        "togglefloatlayer" => Operation::ToggleFloatingLayer,
         "virtual" => {
             let target = argv.get(1).ok_or(err)?;
             target.parse::<u32>().map_or_else(

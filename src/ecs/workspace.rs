@@ -8,7 +8,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -17,6 +17,8 @@ use tracing::{Level, debug, error, instrument, warn};
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::commands::{Direction, MoveFocus, Operation, filter_window_operations};
 use crate::config::Config;
+use crate::ecs::display::FloatingLayer;
+use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
@@ -272,12 +274,14 @@ fn detect_moved_windows(
 fn workspace_destroyed_trigger(
     mut messages: MessageReader<Event>,
     mut workspaces: Populated<(&mut LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::SpaceDestroyed { space_id } = event else {
             continue;
         };
+        focus_history.forget_workspace(*space_id);
 
         let Some((entity, fullscreen)) =
             workspaces.iter().find_map(|(strip, entity, fullscreen)| {
@@ -339,6 +343,7 @@ fn workspace_created_trigger(
             strip,
             origin,
             SelectedVirtualMarker,
+            FloatingLayer::default(),
             ChildOf(display_entity),
         ));
     }
@@ -376,12 +381,14 @@ fn find_orphaned_workspaces(
     orphans: Populated<(&LayoutStrip, Entity, &Timeout, Option<&ChildOf>), With<Timeout>>,
     displays: Populated<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
+    mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
     let present = window_manager.present_displays();
 
     for (orphan, orphan_entity, timeout, child) in orphans {
         if orphan.len() == 0 {
+            focus_history.forget_workspace(orphan.id());
             if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
                 cmd.try_despawn();
             }
@@ -617,6 +624,7 @@ fn handle_virtual_window_moves(
                 new_strip,
                 Position(origin),
                 SelectedVirtualMarker,
+                FloatingLayer::default(),
                 ChildOf(display_entity),
             ));
             if stay {

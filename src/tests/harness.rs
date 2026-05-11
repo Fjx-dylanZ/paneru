@@ -127,6 +127,7 @@ pub(crate) fn setup_world() -> App {
     bevy_app
         .add_plugins(MinimalPlugins)
         .init_resource::<bevy::ecs::message::Messages<Event>>()
+        .init_resource::<crate::ecs::focus::FocusHistory>()
         .insert_resource(SkipReshuffle(false))
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))

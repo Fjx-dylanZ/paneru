@@ -24,6 +24,7 @@ use super::{
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
@@ -81,6 +82,7 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
                     origin.clone(),
                     ActiveWorkspaceMarker,
                     SelectedVirtualMarker,
+                    FloatingLayer::default(),
                     ChildOf(entity),
                 ));
             } else {
@@ -88,6 +90,7 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
                     strip,
                     origin.clone(),
                     SelectedVirtualMarker,
+                    FloatingLayer::default(),
                     ChildOf(entity),
                 ));
             }

@@ -105,9 +105,9 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 
 | Action | Description |
 | :--- | :--- |
-| `window_focus_west` / `_east` | Focus window to the left/right. |
-| `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
-| `window_focus_first` / `_last` | Jump to the start/end of the strip. |
+| `window_focus_west` / `_east` | Focus window to the left/right. When the currently focused window is floating, walks to the nearest other floating window on the active display in that direction (45° cone). Use `window_tiertoggle` to cross between tiled and floating. |
+| `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. When focused on a floating window, walks to the nearest other float in that direction. |
+| `window_focus_first` / `_last` | Jump to the start/end of the strip. No-op when focus is on a floating window. |
 | `window_swap_west` / `_east` | Swap current window with neighbor. |
 | `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. |
 | `window_swap_first` / `_last` | Move current window to start/end of strip. |
@@ -124,6 +124,7 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `window_snap` | Snap an overflowing window into the viewport. |
+| `window_togglefloatlayer` | Flip the floating-vs-tiled layer on the active workspace and focus the most-recently-focused window in the target tier. The layer state is per-workspace so each macOS Space remembers independently. Brings the target's app frontmost so its windows render above the previously frontmost app — macOS's AX raise alone can't lift a window across apps, so the focus change is part of the operation. |
 | `quit` | Exit Paneru. |
 
 **Example:**

@@ -6,13 +6,15 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
+use bevy::platform::collections::HashMap;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, error, instrument, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, SystemTheme};
+use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
@@ -22,6 +24,7 @@ use crate::ecs::{
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
+use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 pub struct FocusEventsPlugin;
@@ -51,6 +54,65 @@ impl Plugin for FocusEventsPlugin {
 pub(super) struct FocusWindow {
     pub entity: Entity,
     pub raise: bool,
+}
+
+#[derive(Default)]
+pub struct TierMemory {
+    pub last_managed: Option<Entity>,
+    pub last_floating: Option<Entity>,
+}
+
+/// Keyed by `WorkspaceId` (one macOS Space each) so toggling on Space A
+/// can't reach a window last focused on Space B. Cleared on entity despawn
+/// (`forget`) so recycled Entity IDs can't resolve to the wrong window,
+/// and on workspace despawn (`forget_workspace`) to bound the map.
+#[derive(Default, Resource)]
+pub struct FocusHistory {
+    by_workspace: HashMap<WorkspaceId, TierMemory>,
+}
+
+impl FocusHistory {
+    pub fn record(
+        &mut self,
+        workspace: WorkspaceId,
+        entity: Entity,
+        unmanaged: Option<&Unmanaged>,
+    ) {
+        let slot = self.by_workspace.entry(workspace).or_default();
+        match unmanaged {
+            None => slot.last_managed = Some(entity),
+            Some(Unmanaged::Floating) => slot.last_floating = Some(entity),
+            // Minimized / Hidden are not user-visible focus targets.
+            Some(_) => {}
+        }
+    }
+
+    pub fn last_managed(&self, workspace: WorkspaceId) -> Option<Entity> {
+        self.by_workspace
+            .get(&workspace)
+            .and_then(|t| t.last_managed)
+    }
+
+    pub fn last_floating(&self, workspace: WorkspaceId) -> Option<Entity> {
+        self.by_workspace
+            .get(&workspace)
+            .and_then(|t| t.last_floating)
+    }
+
+    pub fn forget(&mut self, entity: Entity) {
+        for slot in self.by_workspace.values_mut() {
+            if slot.last_managed == Some(entity) {
+                slot.last_managed = None;
+            }
+            if slot.last_floating == Some(entity) {
+                slot.last_floating = None;
+            }
+        }
+    }
+
+    pub fn forget_workspace(&mut self, workspace: WorkspaceId) {
+        self.by_workspace.remove(&workspace);
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]

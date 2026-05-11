@@ -474,6 +474,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
     app.add_plugins(MinimalPlugins)
         .init_resource::<Messages<Event>>()
+        .init_resource::<focus::FocusHistory>()
         .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)))
         .insert_resource(WindowManager(window_manager))
         .insert_resource(SkipReshuffle(false))
