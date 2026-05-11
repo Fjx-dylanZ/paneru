@@ -284,6 +284,33 @@ fn pick_nearest_in_direction(
         .map(|(entity, _)| entity)
 }
 
+/// Moves a floating window by `step` pixels in `direction`, clamped to
+/// the active display's viewport. `First`/`Last` are no-ops for floats.
+fn nudge_float(
+    entity: Entity,
+    direction: &Direction,
+    step: i32,
+    windows: &Windows,
+    display_bounds: IRect,
+    commands: &mut Commands,
+) {
+    let Some(frame) = windows.frame(entity) else {
+        return;
+    };
+    let delta = match direction {
+        Direction::West => bevy::math::IVec2::new(-step, 0),
+        Direction::East => bevy::math::IVec2::new(step, 0),
+        Direction::North => bevy::math::IVec2::new(0, -step),
+        Direction::South => bevy::math::IVec2::new(0, step),
+        Direction::First | Direction::Last => return,
+    };
+    let max = (display_bounds.max - frame.size()).max(display_bounds.min);
+    let target = (frame.min + delta).clamp(display_bounds.min, max);
+    if target != frame.min {
+        reposition_entity(entity, target, commands);
+    }
+}
+
 fn nearest_float_in_direction(
     direction: &Direction,
     focused_entity: Entity,
@@ -438,6 +465,7 @@ fn command_swap_focus(
     windows: Windows,
     apps: Query<&Application>,
     mut active_display: ActiveDisplayMut,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(Operation::Swap(direction)) =
@@ -445,6 +473,20 @@ fn command_swap_focus(
     else {
         return;
     };
+
+    if let Some((_, focused)) = windows.focused()
+        && let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused)
+    {
+        nudge_float(
+            focused,
+            direction,
+            config.float_move_step(),
+            &windows,
+            active_display.bounds(),
+            &mut commands,
+        );
+        return;
+    }
 
     let active_strip = active_display.active_strip();
     let mut handler = || {

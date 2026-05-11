@@ -458,6 +458,11 @@ impl Config {
             .unwrap_or(SwipeGestureDirection::Natural)
     }
 
+    pub fn float_move_step(&self) -> i32 {
+        let raw = self.inner().options.float_move_step.unwrap_or(50);
+        i32::from(raw.clamp(1, 500))
+    }
+
     pub fn swipe_gesture_fingers(&self) -> Option<usize> {
         let config = self.inner();
         config
@@ -1010,6 +1015,10 @@ pub struct MainOptions {
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
+
+    /// Pixels moved per `window_swap_*` press for floating windows.
+    /// Default: 50. Clamped to 1–500.
+    pub float_move_step: Option<u16>,
 }
 
 /// Returns a default set of column widths.

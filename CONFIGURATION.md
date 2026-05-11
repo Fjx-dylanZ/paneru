@@ -29,6 +29,7 @@ General behavior settings for the window manager.
 | `menubar_height` | Integer (px) | *Auto* | Manually override the detected macOS menubar height. |
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` stop at the largest/smallest preset instead of cycling back. |
+| `float_move_step` | Integer (px, 1–500) | `50` | Distance moved per `window_swap_*` press when the focused window is floating. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
 | `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
 
@@ -108,9 +109,9 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 | `window_focus_west` / `_east` | Focus window to the left/right. When the currently focused window is floating, walks to the nearest other floating window on the active display in that direction (45° cone). Use `window_tiertoggle` to cross between tiled and floating. |
 | `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. When focused on a floating window, walks to the nearest other float in that direction. |
 | `window_focus_first` / `_last` | Jump to the start/end of the strip. No-op when focus is on a floating window. |
-| `window_swap_west` / `_east` | Swap current window with neighbor. |
-| `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. |
-| `window_swap_first` / `_last` | Move current window to start/end of strip. |
+| `window_swap_west` / `_east` | Swap current window with neighbor. When the currently focused window is floating, nudges the float `float_move_step` pixels in that direction instead (clamped to the active display's viewport). |
+| `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. When focused on a floating window, nudges the float vertically. |
+| `window_swap_first` / `_last` | Move current window to start/end of strip. No-op when focus is on a floating window. |
 | `window_center` | Center the current window in the viewport. |
 | `window_resize` | Cycle through preset widths (Grow). |
 | `window_grow` | Alias for `window_resize`. |
