@@ -6,7 +6,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, ParallelCommands, ParamSet, Populated, Query, Res};
+use bevy::ecs::system::{Commands, Local, ParallelCommands, ParamSet, Populated, Query, Res};
 use bevy::ecs::world::Ref;
 use bevy::math::IRect;
 use std::collections::{HashMap, VecDeque};
@@ -147,6 +147,11 @@ pub struct LayoutStrip {
     id: WorkspaceId,
     pub virtual_index: u32,
     columns: VecDeque<Column>,
+    // Bumped by every mutator that changes the set/order of entities.
+    // layout_strip_changed uses this to distinguish composition changes
+    // (which require re-running position_layout_windows for every entity)
+    // from animation-driven Changed<LayoutStrip> flags.
+    composition_version: u64,
 }
 
 impl LayoutStrip {
@@ -155,6 +160,7 @@ impl LayoutStrip {
             id,
             virtual_index,
             columns: VecDeque::new(),
+            composition_version: 0,
         }
     }
 
@@ -165,7 +171,12 @@ impl LayoutStrip {
             id,
             virtual_index: 0,
             columns,
+            composition_version: 0,
         }
+    }
+
+    pub fn composition_version(&self) -> u64 {
+        self.composition_version
     }
 
     /// Finds the index of a window within the pane.
@@ -215,6 +226,7 @@ impl LayoutStrip {
         } else {
             self.columns.insert(index, Column::Single(entity));
         }
+        self.composition_version = self.composition_version.wrapping_add(1);
     }
 
     /// Appends a window ID as a `Single` panel to the end of the pane.
@@ -227,6 +239,7 @@ impl LayoutStrip {
             return;
         }
         self.columns.push_back(Column::Single(entity));
+        self.composition_version = self.composition_version.wrapping_add(1);
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
@@ -292,6 +305,7 @@ impl LayoutStrip {
                 self.columns.insert(index, Column::Tabs(tabs));
             }
         }
+        self.composition_version = self.composition_version.wrapping_add(1);
         Ok(())
     }
 
@@ -308,6 +322,9 @@ impl LayoutStrip {
             .ok()
             .and_then(|index| self.columns.remove(index).zip(Some(index)));
 
+        if removed.is_some() {
+            self.composition_version = self.composition_version.wrapping_add(1);
+        }
         if let Some((column, index)) = removed {
             match column {
                 Column::Single(_) | Column::Fullscren(_) => {
@@ -378,6 +395,9 @@ impl LayoutStrip {
     /// * `right` - The index of the second panel.
     pub fn swap(&mut self, left: usize, right: usize) {
         self.columns.swap(left, right);
+        if left != right {
+            self.composition_version = self.composition_version.wrapping_add(1);
+        }
     }
 
     /// Returns the number of panels in the pane.
@@ -469,6 +489,7 @@ impl LayoutStrip {
         };
 
         self.columns.insert(index - 1, new_column);
+        self.composition_version = self.composition_version.wrapping_add(1);
         Ok(())
     }
 
@@ -513,6 +534,7 @@ impl LayoutStrip {
                 };
                 self.columns.insert(index, new_column);
             }
+            self.composition_version = self.composition_version.wrapping_add(1);
             Ok(())
         } else {
             // Not in a stack, put it back
@@ -855,13 +877,14 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn layout_strip_changed(
-    changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
+    changed_strips: Populated<(Entity, &LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: Query<
         (&Position, &mut Bounds, &mut LayoutPosition),
         (Without<LayoutStrip>, With<Window>),
     >,
     displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
+    mut last_composition: Local<HashMap<Entity, u64>>,
 ) {
     let get_window_frame = |entity| {
         windows
@@ -870,27 +893,42 @@ fn layout_strip_changed(
             .ok()
     };
 
-    let changed = changed_strips
+    // Per-strip: collect new frames and decide whether composition (set/order
+    // of entities) actually changed. When composition didn't change the
+    // Changed<LayoutStrip> flag was driven by animation-only bounds/position
+    // updates (see layout_sizes_changed), so position_layout_windows only
+    // needs to run for entities whose LayoutPosition value differs.
+    let updates: Vec<(Vec<(Entity, IRect)>, bool)> = changed_strips
         .into_iter()
-        .filter_map(|(layout_strip, child_of)| {
-            displays
-                .get(child_of.parent())
-                .map(|(display, dock)| {
-                    let height = display.actual_display_bounds(dock, &config).height();
-                    layout_strip.relative_positions(height, &get_window_frame)
-                })
-                .ok()
+        .filter_map(|(strip_entity, layout_strip, child_of)| {
+            let (display, dock) = displays.get(child_of.parent()).ok()?;
+            let height = display.actual_display_bounds(dock, &config).height();
+            let version = layout_strip.composition_version();
+            let force = last_composition.insert(strip_entity, version) != Some(version);
+            let frames = layout_strip
+                .relative_positions(height, &get_window_frame)
+                .collect::<Vec<_>>();
+            Some((frames, force))
         })
-        .flatten()
-        .collect::<Vec<_>>();
+        .collect();
 
-    for (entity, frame) in changed {
-        if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
-            if layout_position.0 != frame.min {
-                layout_position.0 = frame.min;
-            }
-            if bounds.0 != frame.size() {
-                bounds.0 = frame.size();
+    for (frames, force) in updates {
+        for (entity, frame) in frames {
+            if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
+                // When composition changed, force position_layout_windows to
+                // re-run for every entity in the strip. Otherwise its
+                // Changed<LayoutPosition> gate would skip entities whose slot
+                // value didn't move — e.g. the re-managed rightmost window,
+                // whose LayoutPosition.x equals what it stored before float.
+                if force {
+                    layout_position.set_changed();
+                }
+                if layout_position.0 != frame.min {
+                    layout_position.0 = frame.min;
+                }
+                if bounds.0 != frame.size() {
+                    bounds.0 = frame.size();
+                }
             }
         }
     }
@@ -1348,6 +1386,55 @@ mod tests {
         assert_eq!(strip.index_of(entities[0]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[1]).unwrap(), 1);
         assert_eq!(strip.index_of(entities[2]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_composition_version_bumps() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        assert_eq!(strip.composition_version(), 0);
+
+        strip.append(entities[0]);
+        let v1 = strip.composition_version();
+        assert!(v1 > 0);
+
+        // Re-appending an already-present entity is a no-op and must not bump.
+        strip.append(entities[0]);
+        assert_eq!(strip.composition_version(), v1);
+
+        strip.append(entities[1]);
+        let v2 = strip.composition_version();
+        assert!(v2 > v1);
+
+        strip.insert_at(1, entities[2]);
+        let v3 = strip.composition_version();
+        assert!(v3 > v2);
+
+        // swap(i, i) is a no-op and must not bump.
+        strip.swap(0, 0);
+        assert_eq!(strip.composition_version(), v3);
+
+        strip.swap(0, 1);
+        let v4 = strip.composition_version();
+        assert!(v4 > v3);
+
+        // Removing a non-member must not bump.
+        let absent = world.spawn(()).id();
+        strip.remove(absent);
+        assert_eq!(strip.composition_version(), v4);
+
+        strip.remove(entities[0]);
+        let v5 = strip.composition_version();
+        assert!(v5 > v4);
+
+        strip.stack(entities[1]).unwrap();
+        let v6 = strip.composition_version();
+        assert!(v6 > v5);
+
+        strip.unstack(entities[1]).unwrap();
+        assert!(strip.composition_version() > v6);
     }
 
     #[test]
