@@ -12,6 +12,7 @@ use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
 
 use crate::config::{Config, MissingWindowBehavior};
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::Windows;
 use crate::ecs::state::{
@@ -535,7 +536,12 @@ pub(super) fn restore_window_state(
             focus: strip.all_windows().first().copied(),
         };
 
-        let mut spawned = commands.spawn((strip, Position(origin), ChildOf(display_entity)));
+        let mut spawned = commands.spawn((
+            strip,
+            Position(origin),
+            FloatingLayer::default(),
+            ChildOf(display_entity),
+        ));
         if is_global_active {
             spawned.insert((ActiveWorkspaceMarker, SelectedVirtualMarker));
         } else if is_active {
