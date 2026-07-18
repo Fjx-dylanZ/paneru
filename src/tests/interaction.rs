@@ -7,8 +7,8 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
-    layout::LayoutStrip,
+    ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, NativeFullscreenMarker,
+    Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -159,6 +159,100 @@ fn floating_grid_window_uses_active_display_usable_origin() {
             Event::Command {
                 command: Command::PrintState,
             },
+        ]);
+}
+
+#[test]
+fn follow_command_preserves_frame_and_leaves_window_floating_when_disabled() {
+    let original_frame = Rc::new(Cell::new(IRect::default()));
+    let captured = original_frame.clone();
+    let enabled_frame = original_frame.clone();
+    let disabled_frame = original_frame.clone();
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, move |world, _state| {
+            captured.set(window_frame(world, 0));
+        })
+        .on_iteration(1, move |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                world
+                    .entity(entity)
+                    .contains::<FollowCurrentWorkspaceMarker>()
+            );
+            assert!(matches!(
+                world.get::<Unmanaged>(entity),
+                Some(Unmanaged::Floating)
+            ));
+            assert_eq!(window_frame(world, 0), enabled_frame.get());
+        })
+        .on_iteration(2, move |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                !world
+                    .entity(entity)
+                    .contains::<FollowCurrentWorkspaceMarker>()
+            );
+            assert!(matches!(
+                world.get::<Unmanaged>(entity),
+                Some(Unmanaged::Floating)
+            ));
+            assert_eq!(window_frame(world, 0), disabled_frame.get());
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::Follow(Some(true))),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Follow(Some(false))),
+            },
+        ]);
+}
+
+#[test]
+fn configured_follower_moves_to_the_active_native_workspace() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut params = WindowParams::new(".*", None);
+    params.follow = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .on_iteration(0, |world, state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                world
+                    .entity(entity)
+                    .contains::<FollowCurrentWorkspaceMarker>()
+            );
+            assert!(matches!(
+                world.get::<Unmanaged>(entity),
+                Some(Unmanaged::Floating)
+            ));
+            assert!(state.workspace_moves().is_empty());
+            state.activate_workspace(TEST_DISPLAY_ID, NEXT_WORKSPACE_ID, false);
+        })
+        .on_iteration(1, |_world, state| {
+            assert_eq!(state.window_workspace(0), NEXT_WORKSPACE_ID);
+            assert_eq!(state.workspace_moves(), vec![(vec![0], NEXT_WORKSPACE_ID)]);
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
         ]);
 }
 

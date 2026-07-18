@@ -213,6 +213,11 @@ pub fn register_triggers(app: &mut bevy::app::App) {
 #[derive(Component)]
 pub struct FocusedMarker;
 
+/// Marks a floating window that should be reassigned to Paneru's current
+/// native macOS Space whenever that Space changes.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct FollowCurrentWorkspaceMarker;
+
 #[derive(Component)]
 pub struct ActiveWorkspaceMarker;
 
@@ -736,9 +741,18 @@ impl WindowProperties {
     }
 
     pub fn floating(&self) -> bool {
+        self.follow()
+            || self
+                .params
+                .iter()
+                .find_map(|props| props.floating)
+                .unwrap_or(false)
+    }
+
+    pub fn follow(&self) -> bool {
         self.params
             .iter()
-            .find_map(|props| props.floating)
+            .find_map(|props| props.follow)
             .unwrap_or(false)
     }
 

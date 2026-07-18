@@ -14,9 +14,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    ActiveDisplayMarker, BProcess, FocusedMarker, FollowCurrentWorkspaceMarker, FreshMarker,
+    MissionControlActive, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -472,6 +472,7 @@ pub(super) fn dispatch_application_messages(
     windows: Windows,
     applications: Query<(&Application, &Children)>,
     unmanaged_query: Query<&Unmanaged>,
+    followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
@@ -491,7 +492,11 @@ pub(super) fn dispatch_application_messages(
                     && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_remove::<Unmanaged>();
+                    if followed.contains(entity) {
+                        entity_commands.try_insert(Unmanaged::Floating);
+                    } else {
+                        entity_commands.try_remove::<Unmanaged>();
+                    }
                 }
             }
 
@@ -537,6 +542,7 @@ pub(super) fn dispatch_application_messages(
 pub(super) fn window_unmanaged_trigger(
     trigger: On<Add, Unmanaged>,
     apps: Query<(Entity, &Application)>,
+    followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
     // whole observer, but the strip removal below must still run without one.
@@ -626,7 +632,10 @@ pub(super) fn window_unmanaged_trigger(
 
     // Skip the active-display reposition/resize during init; the strip
     // removal below still has to run.
-    if parked_out_of_view {
+    if followed.contains(entity) {
+        // Enabling follow is a state change, not a placement rule. Keep the
+        // exact app/user-selected frame.
+    } else if parked_out_of_view {
         debug!("Entity {entity} is floating on a hidden virtual row, keeping its frame.");
     } else if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
         let x = display_bounds.min.x + round_px(f64::from(display_bounds.width()) * rx);
@@ -1182,7 +1191,11 @@ pub(super) fn apply_window_positions(
             }
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
                 // Avoid managing window if it's floating.
-                entity_commands.try_insert(Unmanaged::Floating);
+                if properties.follow() && !window.is_full_screen() {
+                    entity_commands.try_insert((FollowCurrentWorkspaceMarker, Unmanaged::Floating));
+                } else {
+                    entity_commands.try_insert(Unmanaged::Floating);
+                }
             }
             continue;
         }

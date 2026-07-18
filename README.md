@@ -253,6 +253,7 @@ $ paneru send-cmd <command> [args...]
 | -------------------------- | ------------------------------------------------ |
 | `window focus <direction\|number\|managed\|unmanaged>` | Move focus by direction, column number, managed or unmanaged |
 | `window swap <direction>`  | Swap the focused window with a neighbour         |
+| `window follow [on\|off]`   | Make the focused floating window follow the current native Space |
 | `window center`            | Center the focused window on screen              |
 | `window resize`            | Cycle through `preset_column_widths`             |
 | `window grow`              | Grow to the next preset width                    |

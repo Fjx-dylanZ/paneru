@@ -28,9 +28,10 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker,
+    FollowCurrentWorkspaceMarker, Initializing, LowPowerMode, MissionControlActive, Position,
+    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -1111,16 +1112,17 @@ pub(super) fn commit_window_size(
 
 /// Restores user-visible window state before Paneru shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
-/// managed window on the display its frame center falls in.
+/// non-following managed window on the display its frame center falls in.
+/// Followers keep their app/user-selected frame and current native Space.
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<&mut Window>,
+    mut all_windows: Query<(&mut Window, Has<FollowCurrentWorkspaceMarker>)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
+        let ids = all_windows.iter().map(|(w, _)| w.id()).collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
 
@@ -1133,7 +1135,10 @@ pub(super) fn cleanup_on_exit(
             return;
         }
 
-        for mut window in &mut all_windows {
+        for (mut window, followed) in &mut all_windows {
+            if followed {
+                continue;
+            }
             let frame = window.frame();
             let center = frame.center();
             let bounds = display_bounds

@@ -237,6 +237,9 @@ pub enum Operation {
     Balance,
     /// Toggles the managed state of the focused window.
     Manage,
+    /// Toggles whether the focused floating window follows the current native Space.
+    /// `None` toggles the current state; `Some` sets it explicitly.
+    Follow(Option<bool>),
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
     /// Resizes and repositions the focused window to fit within the visible viewport

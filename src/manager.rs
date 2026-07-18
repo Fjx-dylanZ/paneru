@@ -52,6 +52,8 @@ pub use windows::MockWindowApi;
 
 pub(crate) mod app;
 mod display;
+mod macho;
+mod native_spaces;
 mod process;
 mod skylight;
 mod windows;
@@ -167,6 +169,13 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// `Ok(Vec<WinID>)` containing the list of window IDs, otherwise `Err(Error)`.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
+
+    /// Assigns the supplied windows to one native macOS Space.
+    ///
+    /// The operation is asynchronous. Callers should confirm membership with
+    /// `windows_in_workspace` before considering the move complete.
+    fn move_windows_to_workspace(&self, windows: &[WinID], workspace_id: WorkspaceId)
+    -> Result<()>;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -507,6 +516,14 @@ impl WindowManagerApi for WindowManagerOS {
     /// Returns a list of windows in a given workspace.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>> {
         space_window_list_for_connection(self.main_cid, &[space_id], None, true)
+    }
+
+    fn move_windows_to_workspace(
+        &self,
+        windows: &[WinID],
+        workspace_id: WorkspaceId,
+    ) -> Result<()> {
+        native_spaces::move_windows_to_workspace(windows, workspace_id)
     }
 
     fn quit(&self) -> Result<()> {
