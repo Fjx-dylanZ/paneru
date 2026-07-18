@@ -183,6 +183,12 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         "next_display",
         follower(lua, dispatch, Operation::ToNextDisplay)?,
     )?;
+    window.set(
+        "follow",
+        follower(lua, dispatch, |follow| {
+            Operation::Follow(Some(matches!(follow, MoveFocus::Follow)))
+        })?,
+    )?;
 
     for (name, operation) in [
         ("focus_managed", Operation::FocusManaged),
@@ -475,6 +481,8 @@ mod tests {
             paneru.window.focus({ number = 3 })
             paneru.window.balance()
             paneru.workspace.move_window({ number = 2, follow = false })
+            paneru.window.follow()
+            paneru.window.follow({ follow = false })
         "#)
         .unwrap();
 
@@ -485,6 +493,8 @@ mod tests {
                 Command::Window(Operation::Focus(Direction::Nth(2))),
                 Command::Window(Operation::Balance),
                 Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+                Command::Window(Operation::Follow(Some(true))),
+                Command::Window(Operation::Follow(Some(false))),
             ])
         );
     }

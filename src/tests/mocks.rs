@@ -92,6 +92,7 @@ struct MockStateInner {
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
+    workspace_moves: Vec<(Vec<WinID>, WorkspaceId)>,
 }
 
 #[derive(Clone)]
@@ -113,6 +114,7 @@ impl MockState {
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
+                workspace_moves: Vec::new(),
             })),
         }
     }
@@ -424,6 +426,19 @@ impl MockState {
 
     pub fn cursor_position(&self) -> IVec2 {
         self.inner.force_read().cursor_position
+    }
+
+    pub(crate) fn window_workspace(&self, window_id: WinID) -> WorkspaceId {
+        self.inner
+            .force_read()
+            .windows
+            .get(&window_id)
+            .expect("finding window")
+            .workspace_id
+    }
+
+    pub(crate) fn workspace_moves(&self) -> Vec<(Vec<WinID>, WorkspaceId)> {
+        self.inner.force_read().workspace_moves.clone()
     }
 
     // --- Mock Factory Methods ---
@@ -819,6 +834,21 @@ impl MockState {
                 // Sort the windows to keep the tests consistent
                 windows.sort_unstable();
                 Ok(windows)
+            });
+
+        let s = self.clone();
+        wm.expect_move_windows_to_workspace()
+            .returning(move |window_ids, workspace_id| {
+                let mut state = s.inner.force_write();
+                state
+                    .workspace_moves
+                    .push((window_ids.to_vec(), workspace_id));
+                for window_id in window_ids {
+                    if let Some(window) = state.windows.get_mut(window_id) {
+                        window.workspace_id = workspace_id;
+                    }
+                }
+                Ok(())
             });
 
         let s = self.clone();
