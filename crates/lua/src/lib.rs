@@ -171,6 +171,16 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     )?;
     window.set("resize", resize(lua, dispatch)?)?;
     window.set(
+        "move_floating",
+        directional(
+            lua,
+            dispatch,
+            "window.move_floating",
+            Operation::MoveFloating,
+        )?,
+    )?;
+    window.set("cycle_floating", cycle_floating(lua, dispatch)?)?;
+    window.set(
         "next_display",
         follower(lua, dispatch, Operation::ToNextDisplay)?,
     )?;
@@ -299,6 +309,33 @@ fn resize(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
         let direction = ResizeOpts::read(lua, &opts)?;
         dispatch(lua, Command::Window(Operation::Resize(direction)))
     })
+}
+
+/// `paneru.window.cycle_floating{ reverse = true }`, defaulting to forward.
+fn cycle_floating(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let reverse = match opts {
+            Value::Nil => false,
+            Value::Table(_) => lua
+                .from_value::<CycleFloatingOpts>(opts)?
+                .reverse
+                .unwrap_or(false),
+            other => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "window.cycle_floating expects {{ reverse = ... }}, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        dispatch(lua, Command::Window(Operation::CycleFloating(reverse)))
+    })
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CycleFloatingOpts {
+    reverse: Option<bool>,
 }
 
 /// The options every verb accepts: `{ direction = "east" }`, `{ number = 3 }`,
@@ -456,6 +493,9 @@ mod tests {
             paneru.workspace.move_window({ number = 2, follow = false })
             paneru.window.follow()
             paneru.window.follow({ follow = false })
+            paneru.window.move_floating({ direction = "west" })
+            paneru.window.cycle_floating()
+            paneru.window.cycle_floating({ reverse = true })
         "#)
         .unwrap();
 
@@ -468,6 +508,9 @@ mod tests {
                 Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
                 Command::Window(Operation::Follow(Some(true))),
                 Command::Window(Operation::Follow(Some(false))),
+                Command::Window(Operation::MoveFloating(Direction::West)),
+                Command::Window(Operation::CycleFloating(false)),
+                Command::Window(Operation::CycleFloating(true)),
             ])
         );
     }

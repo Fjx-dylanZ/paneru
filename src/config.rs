@@ -769,6 +769,16 @@ impl Config {
         self.options().window_resize_cycle.unwrap_or(true)
     }
 
+    /// Returns the step used when moving a floating window with the
+    /// `window_swap_*` keybinds, as a ratio (0.0–1.0) of the display width
+    /// (east/west) or height (north/south). Default: 0.1.
+    pub fn float_move_step(&self) -> f64 {
+        self.options()
+            .float_move_step
+            .unwrap_or(0.1)
+            .clamp(0.0, 1.0)
+    }
+
     pub fn auto_center(&self) -> bool {
         self.options().auto_center.is_some_and(|center| center)
     }
@@ -1131,6 +1141,11 @@ pub struct MainOptions {
     /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
     /// virtual workspace, create the workspace automatically.
     pub create_virtual_workspace_automatically: Option<bool>,
+    /// Step used when moving a floating window with the `window_swap_*`
+    /// keybinds, as a ratio (0.0–1.0) of the display width (east/west) or
+    /// height (north/south).
+    /// Default: 0.1.
+    pub float_move_step: Option<f64>,
 }
 
 /// Returns a default set of column widths.
@@ -1951,6 +1966,20 @@ fn test_parse_restart_command() {
 }
 
 #[test]
+fn test_parse_movefloat_commands() {
+    assert!(matches!(
+        parse_command(&["window", "movefloat", "west"]).unwrap(),
+        Command::Window(Operation::MoveFloating(Direction::West))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "movefloat", "last"]).unwrap(),
+        Command::Window(Operation::MoveFloating(Direction::Last))
+    ));
+    assert!(parse_command(&["window", "movefloat"]).is_err());
+    assert!(parse_command(&["window", "movefloat", "up"]).is_err());
+}
+
+#[test]
 fn test_parse_follow_commands() {
     assert!(matches!(
         parse_command(&["window", "follow"]).unwrap(),
@@ -1965,6 +1994,19 @@ fn test_parse_follow_commands() {
         Command::Window(Operation::Follow(Some(false)))
     ));
     assert!(parse_command(&["window", "follow", "maybe"]).is_err());
+}
+
+#[test]
+fn test_parse_cyclefloat_commands() {
+    assert!(matches!(
+        parse_command(&["window", "cyclefloat"]).unwrap(),
+        Command::Window(Operation::CycleFloating(false))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "cyclefloat", "reverse"]).unwrap(),
+        Command::Window(Operation::CycleFloating(true))
+    ));
+    assert!(parse_command(&["window", "cyclefloat", "backwards"]).is_err());
 }
 
 #[test]

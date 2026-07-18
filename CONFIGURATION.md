@@ -40,6 +40,7 @@ General behavior settings for the window manager.
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
+| `float_move_step` | Float (0.0–1.0) | `0.1` | Step used when moving a floating window with the `window_swap_*` keybinds, as a ratio of the display width (east/west) or height (north/south). |
 
 ---
 
@@ -145,9 +146,11 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_focus_first` / `_last` | Jump to the start/end of the strip. |
 | `window_focus_managed` | Switch to a previously focused window on this workspace. |
 | `window_focus_unmanaged` | Switch to a previously focused floating window on this workspace. |
-| `window_swap_west` / `_east` | Swap current window with neighbor. |
-| `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. |
-| `window_swap_first` / `_last` | Move current window to start/end of strip. |
+| `window_swap_west` / `_east` | Swap current window with neighbor. If the window is floating, move it left/right by `float_move_step`. |
+| `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. If the window is floating, move it up/down by `float_move_step`. |
+| `window_swap_first` / `_last` | Move current window to start/end of strip. If the window is floating, snap it to the left/right screen edge. |
+| `window_movefloat_west` / `_east` / `_north` / `_south` | Move the focused floating window by `float_move_step`. Does nothing on tiled windows — bind this when you don't want to share the `window_swap_*` keys. |
+| `window_movefloat_first` / `_last` | Snap the focused floating window to the left/right screen edge. |
 | `window_center` | Center the current window in the viewport. |
 | `window_resize` | Cycle through preset widths (Grow). |
 | `window_grow` | Alias for `window_resize`. |
@@ -164,6 +167,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
+| `window_cyclefloat` / `window_cyclefloat_reverse` | Cycle focus through the visible floating windows on the workspace (stable window-ID order, wraps around). From a tiled window, enters the floating tier at the last-focused float. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `quit` | Exit Paneru. |
 | `restart` | Restart the Paneru service (`paneru restart`). |

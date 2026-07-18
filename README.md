@@ -252,7 +252,9 @@ $ paneru send-cmd <command> [args...]
 | Command                    | Description                                      |
 | -------------------------- | ------------------------------------------------ |
 | `window focus <direction\|number\|managed\|unmanaged>` | Move focus by direction, column number, managed or unmanaged |
-| `window swap <direction>`  | Swap the focused window with a neighbour         |
+| `window swap <direction>`  | Swap the focused window with a neighbour (moves the window by `float_move_step` if it is floating) |
+| `window movefloat <direction>` | Move the focused floating window by `float_move_step` (no effect on tiled windows) |
+| `window cyclefloat [reverse]`  | Cycle focus through the visible floating windows |
 | `window follow [on\|off]`   | Make the focused floating window follow the current native Space |
 | `window center`            | Center the focused window on screen              |
 | `window resize`            | Cycle through `preset_column_widths`             |

@@ -89,12 +89,13 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_focus_unmanaged,
             command_focus_managed,
             command_raise_floating,
+            command_cycle_floating,
             command_toggle_floating_layer,
             command_swap_focus,
             snap_window,
         ),
     );
-    app.add_systems(PreUpdate, follow_window);
+    app.add_systems(PreUpdate, (command_move_floating, follow_window));
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -475,6 +476,65 @@ fn command_raise_floating(
     }
 }
 
+/// Cycles focus through the visible floating windows on the active workspace.
+///
+/// The floats are ordered by window ID, so repeated presses visit every
+/// visible float in a stable rotation regardless of position or focus
+/// history, wrapping around at the ends. When the focused window is not a
+/// visible float, this enters the floating tier at the workspace's
+/// last-focused float (like `FocusUnmanaged`).
+#[allow(clippy::needless_pass_by_value)]
+fn command_cycle_floating(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    focus_history: Res<FocusHistory>,
+    mut commands: Commands,
+) {
+    let Some(Operation::CycleFloating(reverse)) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::CycleFloating(_))
+    })
+    .next() else {
+        return;
+    };
+
+    let display_bounds = active_display.bounds();
+    let workspace_id = active_display.active_strip().id();
+    let mut floats =
+        visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds)
+            .into_iter()
+            .filter_map(|entity| windows.get(entity).map(|window| (window.id(), entity)))
+            .collect::<Vec<_>>();
+    floats.sort_unstable_by_key(|(id, _)| *id);
+
+    if floats.is_empty() {
+        return;
+    }
+
+    let focused_index = windows
+        .focused()
+        .and_then(|(_, focused)| floats.iter().position(|(_, entity)| *entity == focused));
+
+    let target = match focused_index {
+        Some(index) => {
+            let len = floats.len();
+            let next = if *reverse {
+                (index + len - 1) % len
+            } else {
+                (index + 1) % len
+            };
+            floats[next].1
+        }
+        None => focus_history
+            .last_floating(workspace_id)
+            .filter(|entity| floats.iter().any(|(_, float)| float == entity))
+            .unwrap_or(floats[0].1),
+    };
+
+    commands.focus_entity(target, true);
+}
+
 /// Focus-and-raise are deliberately coupled here: macOS AX raise can't lift a
 /// window above another app's frontmost window, so the target's app must be
 /// made frontmost. Other windows in the new top tier are raised within their
@@ -623,11 +683,13 @@ fn command_swap_focus(
         );
     }
 
-    if windows
-        .focused()
-        .and_then(|(_, current)| get_window_in_direction(direction, current, active_strip))
-        .is_none()
-    {
+    // Floating windows are handled by command_move_floating; without the
+    // strip-membership check every swap on a floating window would dispatch
+    // a spurious ToNextDisplay.
+    if windows.focused().is_some_and(|(_, current)| {
+        active_strip.contains(current)
+            && get_window_in_direction(direction, current, active_strip).is_none()
+    }) {
         // Check if the movement can swap to another display.
         let bounds = active_display.bounds();
         let Some(other_display) = active_display.other().next() else {
@@ -645,6 +707,73 @@ fn command_swap_focus(
             }));
         }
     }
+}
+
+/// Moves the focused floating window one step in the specified direction.
+///
+/// Handles the dedicated `Operation::MoveFloating` as well as the same
+/// `Operation::Swap` messages as `command_swap_focus`, so the `window_swap_*`
+/// keybinds serve both tiers. The two handlers are disjoint by window state:
+/// swap requires strip membership, while this one requires
+/// `Unmanaged::Floating` — and adding that component removes the window from
+/// every strip (see `window_unmanaged_trigger`).
+///
+/// The step is `float_move_step` of the viewport width (east/west) or height
+/// (north/south); `First`/`Last` snap to the left/right viewport edge. The
+/// window is kept inside the viewport.
+#[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
+fn command_move_floating(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let Some(Operation::Swap(direction) | Operation::MoveFloating(direction)) =
+        filter_window_operations(&mut messages, |op| {
+            matches!(op, Operation::Swap(_) | Operation::MoveFloating(_))
+        })
+        .next()
+    else {
+        return;
+    };
+
+    let Some((_, entity, Some(Unmanaged::Floating))) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+    else {
+        return;
+    };
+    let Some(frame) = windows.moving_frame(entity) else {
+        return;
+    };
+
+    let bounds = active_display.actual_bounds(&config);
+    let step = config.float_move_step();
+    let dx = (f64::from(bounds.width()) * step) as i32;
+    let dy = (f64::from(bounds.height()) * step) as i32;
+
+    let mut origin = frame.min;
+    match direction {
+        Direction::West => origin.x -= dx,
+        Direction::East => origin.x += dx,
+        Direction::North => origin.y -= dy,
+        Direction::South => origin.y += dy,
+        Direction::First => origin.x = bounds.min.x,
+        Direction::Last => origin.x = bounds.max.x - frame.width(),
+        Direction::Nth(_) => return,
+    }
+    // Keep the window inside the viewport. Applying `.min` before `.max`
+    // pins windows larger than the viewport to its top/left edge.
+    origin.x = origin.x.min(bounds.max.x - frame.width()).max(bounds.min.x);
+    origin.y = origin
+        .y
+        .min(bounds.max.y - frame.height())
+        .max(bounds.min.y);
+
+    debug!("moving floating window {entity} {direction:?} to {origin:?}");
+    commands.reposition_entity(entity, origin);
 }
 
 /// Centers the focused window on the active display.

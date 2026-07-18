@@ -221,6 +221,8 @@ pub enum Operation {
     Focus(Direction),
     /// Swaps the current window with another in the specified `Direction`.
     Swap(Direction),
+    /// Moves a floating window without changing the tiled layout.
+    MoveFloating(Direction),
     /// Centers the currently focused window on the display.
     Center,
     /// Resizes the focused window in the given direction.
@@ -263,6 +265,8 @@ pub enum Operation {
     /// Raises all visible floating windows on the active display and focuses
     /// the last-floating window (idempotent — repeat presses behave the same).
     RaiseFloating,
+    /// Cycles visible floating-window focus. `true` selects reverse order.
+    CycleFloating(bool),
     /// Alt-tab between the floating and tiled tiers of the active workspace.
     /// Flips `FloatingLayer`, raises the other windows in the new top tier,
     /// and focuses the tier's last-focused window.

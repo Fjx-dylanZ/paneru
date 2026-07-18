@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use bevy::prelude::*;
@@ -1133,6 +1135,206 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
         })
         .on_iteration(4, |world, _state| {
             assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+/// `window_swap_*` on a focused floating window moves it by `float_move_step`
+/// of the viewport (`command_move_floating`) and clamps it to the viewport
+/// edges. The tiled strip is untouched.
+fn window_frame(world: &mut World, id: i32) -> IRect {
+    let mut query = world.query::<&Window>();
+    query
+        .iter(world)
+        .find(|w| w.id() == id)
+        .expect("window not found")
+        .frame()
+}
+
+#[test]
+fn test_swap_moves_focused_floating_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 1: float window 0
+        Event::Command {
+            command: Command::PrintState,
+        }, // 2: capture settled frames
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::East)),
+        }, // 3
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::West)),
+        }, // 4
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::West)),
+        }, // 5: clamped at the left edge
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::North)),
+        }, // 6: clamped below the menubar
+    ];
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            float_move_step: Some(0.25),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let dx = TEST_DISPLAY_WIDTH / 4;
+    let float_start = Rc::new(Cell::new(IRect::default()));
+    let tiled_start = Rc::new(Cell::new(IRect::default()));
+
+    let capture_float = float_start.clone();
+    let capture_tiled = tiled_start.clone();
+    let east_float = float_start.clone();
+    let west_float = float_start.clone();
+    let clamp_float = float_start.clone();
+    let final_float = float_start.clone();
+    let final_tiled = tiled_start.clone();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            let entity = find_window_entity(0, world);
+            world.entity_mut(entity).insert(Unmanaged::Floating);
+        })
+        .on_iteration(2, move |world, _state| {
+            let frame = window_frame(world, 0);
+            // The moves below assume the float starts near the top-left
+            // corner (where the unmanaged trigger settles it).
+            assert!(frame.min.x < dx, "float starts left of one step");
+            capture_float.set(frame);
+            capture_tiled.set(window_frame(world, 1));
+        })
+        .on_iteration(3, move |world, _state| {
+            let start = east_float.get();
+            assert_window_at!(world, 0, start.min.x + dx, start.min.y);
+        })
+        .on_iteration(4, move |world, _state| {
+            let start = west_float.get();
+            assert_window_at!(world, 0, start.min.x, start.min.y);
+        })
+        .on_iteration(5, move |world, _state| {
+            let start = clamp_float.get();
+            assert_window_at!(world, 0, 0, start.min.y);
+        })
+        .on_iteration(6, move |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            let tiled = final_tiled.get();
+            assert_window_at!(world, 1, tiled.min.x, tiled.min.y);
+            let float = final_float.get();
+            assert_window_size!(world, 0, float.width(), float.height());
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+/// The dedicated `window_movefloat_*` keybinds only act on floating windows:
+/// on a tiled window nothing moves (no swap either), on a floating window
+/// they move it by `float_move_step` like `window_swap_*` does.
+#[test]
+fn test_movefloat_dedicated_keybind() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::MoveFloating(Direction::East)),
+        }, // 1: tiled focused window — no-op
+        Event::Command {
+            command: Command::PrintState,
+        }, // 2: float window 0
+        Event::Command {
+            command: Command::Window(Operation::MoveFloating(Direction::East)),
+        }, // 3: floating window moves one step
+    ];
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            float_move_step: Some(0.25),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let dx = TEST_DISPLAY_WIDTH / 4;
+    let float_start = Rc::new(Cell::new(IRect::default()));
+    let tiled_start = Rc::new(Cell::new(IRect::default()));
+    let capture_float = float_start.clone();
+    let capture_tiled = tiled_start.clone();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, move |world, _state| {
+            // Tiled windows are untouched: neither moved nor swapped.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+
+            let entity = find_window_entity(0, world);
+            world.entity_mut(entity).insert(Unmanaged::Floating);
+        })
+        .on_iteration(2, move |world, _state| {
+            // Floating window 0 pops off the corner and the strip reshuffles
+            // around the departure; capture wherever both settled.
+            capture_float.set(window_frame(world, 0));
+            capture_tiled.set(window_frame(world, 1));
+        })
+        .on_iteration(3, move |world, _state| {
+            let start = float_start.get();
+            assert_window_at!(world, 0, start.min.x + dx, start.min.y);
+            let tiled = tiled_start.get();
+            assert_window_at!(world, 1, tiled.min.x, tiled.min.y);
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+/// `window_cyclefloat` rotates focus through the visible floating windows in
+/// window-ID order, wrapping around; the reverse variant rotates backwards.
+/// Tiled windows are never part of the rotation.
+#[test]
+fn test_cyclefloat_rotates_through_floating_windows() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        }, // 1: float windows 0 and 1; window 2 stays tiled
+        Event::Command {
+            command: Command::Window(Operation::CycleFloating(false)),
+        }, // 2: 0 -> 1
+        Event::Command {
+            command: Command::Window(Operation::CycleFloating(false)),
+        }, // 3: 1 -> wraps to 0
+        Event::Command {
+            command: Command::Window(Operation::CycleFloating(true)),
+        }, // 4: 0 -> wraps back to 1
+    ];
+
+    TestHarness::new()
+        .with_config(Config::default())
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            for id in [0, 1] {
+                let entity = find_window_entity(id, world);
+                world.entity_mut(entity).insert(Unmanaged::Floating);
+            }
+            assert_focused!(world, 0);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_focused!(world, 1);
         })
         .run(commands);
 }
