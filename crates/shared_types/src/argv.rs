@@ -89,6 +89,12 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         }),
         "fullwidth" => Operation::FullWidth,
         "manage" => Operation::Manage,
+        "follow" => match argv.get(1).copied() {
+            None => Operation::Follow(None),
+            Some("on") if argv.len() == 2 => Operation::Follow(Some(true)),
+            Some("off") if argv.len() == 2 => Operation::Follow(Some(false)),
+            Some(_) => return Err(err()),
+        },
         "equalize" => Operation::Equalize,
         "balance" => Operation::Balance,
         "stack" => Operation::Stack(true),
@@ -194,6 +200,9 @@ impl Operation {
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::Manage => owned(&["manage"]),
+            Operation::Follow(None) => owned(&["follow"]),
+            Operation::Follow(Some(true)) => owned(&["follow", "on"]),
+            Operation::Follow(Some(false)) => owned(&["follow", "off"]),
             Operation::Stack(true) => owned(&["stack"]),
             Operation::Stack(false) => owned(&["unstack"]),
             Operation::ToggleTabbedDisplay => owned(&["tabbeddisplay"]),
@@ -253,6 +262,9 @@ mod tests {
             Operation::Equalize,
             Operation::Balance,
             Operation::Manage,
+            Operation::Follow(None),
+            Operation::Follow(Some(true)),
+            Operation::Follow(Some(false)),
             Operation::Stack(true),
             Operation::Stack(false),
             Operation::ToggleTabbedDisplay,
@@ -318,5 +330,7 @@ mod tests {
         assert!(parse_command(&["definitely", "not", "a", "command"]).is_err());
         assert!(parse_command(&["window", "focus"]).is_err());
         assert!(parse_command(&["window", "swap", "3"]).is_err());
+        assert!(parse_command(&["window", "follow", "maybe"]).is_err());
+        assert!(parse_command(&["window", "follow", "on", "extra"]).is_err());
     }
 }

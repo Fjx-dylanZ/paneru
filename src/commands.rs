@@ -8,7 +8,7 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 mod query;
 
@@ -20,9 +20,11 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
+use crate::ecs::workspace::FollowSpacePending;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
+    FollowCurrentWorkspaceMarker, FullWidthMarker, ManualStripOffset, NativeFullscreenMarker,
+    RaiseWindow, SelectedVirtualMarker,
     SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
@@ -103,6 +105,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
     app.add_systems(PreUpdate, (copy_window_rule, toggle_tabbed_display_handler));
+    app.add_systems(PreUpdate, follow_window);
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -990,6 +993,7 @@ fn full_width_window(
 fn manage_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
@@ -1014,10 +1018,17 @@ fn manage_window(
     let was_unmanaged = unmanaged.is_some();
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if was_unmanaged {
-            entity_commands.try_remove::<Unmanaged>();
+            entity_commands
+                .try_remove::<FollowCurrentWorkspaceMarker>()
+                .try_remove::<FollowSpacePending>()
+                .try_remove::<Unmanaged>();
         } else {
             entity_commands.try_insert(Unmanaged::Floating);
         }
+    }
+
+    if was_unmanaged && followed.contains(entity) {
+        debug!("disabled follow while managing window {}", window.id());
     }
 
     // Going floating -> managed only flips the component. Nothing else in
@@ -1084,6 +1095,51 @@ fn copy_window_rule(
         commands.flash_message("Window rule copied".to_owned(), 1.5);
     } else {
         error!("unable to copy the window rule to the clipboard");
+    }
+}
+
+/// Toggles sticky-style following for the focused window. A followed window
+/// is necessarily floating; disabling follow leaves it floating on its current
+/// native Space so the command never unexpectedly changes its layout.
+#[allow(clippy::needless_pass_by_value)]
+fn follow_window(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
+    mut commands: Commands,
+) {
+    let Some(Operation::Follow(requested)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::Follow(_))).next()
+    else {
+        return;
+    };
+
+    let Some((window, entity)) = windows.focused() else {
+        return;
+    };
+    if window.is_full_screen() {
+        warn!("cannot follow a native-fullscreen window");
+        return;
+    }
+
+    let currently_following = followed.contains(entity);
+    let enable = requested.unwrap_or(!currently_following);
+    let Ok(mut entity_commands) = commands.get_entity(entity) else {
+        return;
+    };
+    if enable {
+        if !currently_following {
+            debug!("window {} will follow the current workspace", window.id());
+            entity_commands.try_insert((FollowCurrentWorkspaceMarker, Unmanaged::Floating));
+        }
+    } else if currently_following {
+        debug!(
+            "window {} will stop following the current workspace",
+            window.id()
+        );
+        entity_commands
+            .try_remove::<FollowCurrentWorkspaceMarker>()
+            .try_remove::<FollowSpacePending>();
     }
 }
 

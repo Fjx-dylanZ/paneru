@@ -9,10 +9,13 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{
+    Commands, Local, NonSend, ParamSet, Populated, Query, Res, ResMut, Single,
+};
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
@@ -21,17 +24,19 @@ use crate::commands::{
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
+use crate::ecs::layout::{
+    LayoutStrip, PARKED_STRIP_SLIVER, clamp_origin_to_viewport, origin_exposing,
+};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, ManualStripOffset,
-    NativeFullscreenMarker, Position, RaiseWindow, RepositionMarker, Scrolling,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, FollowCurrentWorkspaceMarker, Initializing,
+    ManualStripOffset, NativeFullscreenMarker, Position, RaiseWindow, RepositionMarker, Scrolling,
     SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::errors::Result;
 use crate::events::{DestroySource, Event};
 use crate::manager::{Application, Display, Origin, Window, WindowManager};
-use crate::platform::{WinID, WorkspaceId};
+use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
 
 pub struct WorkspaceEventsPlugin;
 
@@ -106,6 +111,10 @@ impl Plugin for WorkspaceEventsPlugin {
             ),
         );
         app.add_systems(PostUpdate, workspace_destroyed_handler);
+        app.add_systems(
+            PostUpdate,
+            (queue_followed_windows, sync_followed_windows).chain(),
+        );
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
     }
@@ -116,6 +125,31 @@ impl Plugin for WorkspaceEventsPlugin {
 pub(super) struct VirtualMoveMarker {
     pub target_virtual_index: u32,
     pub move_focus: MoveFocus,
+}
+
+/// Tracks eventual consistency for the asynchronous native Space operation.
+/// Keeping this state on the entity makes rapid Space changes last-target-wins.
+#[derive(Component, Debug)]
+pub(crate) struct FollowSpacePending {
+    target_space: WorkspaceId,
+    attempts: u8,
+    next_retry: Instant,
+    confirmed: bool,
+}
+
+impl FollowSpacePending {
+    fn new(target_space: WorkspaceId) -> Self {
+        Self {
+            target_space,
+            attempts: 0,
+            next_retry: Instant::now(),
+            confirmed: false,
+        }
+    }
+
+    fn reset(&mut self, target_space: WorkspaceId) {
+        *self = Self::new(target_space);
+    }
 }
 
 #[derive(Component, Debug)]
@@ -294,6 +328,153 @@ fn workspace_change_handler(
     }
 }
 
+/// Queue every follower for the newly active strip. Switching Paneru virtual
+/// rows queues the same native Space and becomes an idempotent membership
+/// check; switching native Spaces updates the explicit destination.
+#[allow(clippy::needless_pass_by_value)]
+fn queue_followed_windows(
+    activated: Query<(), Added<ActiveWorkspaceMarker>>,
+    added_followers: Query<(), Added<FollowCurrentWorkspaceMarker>>,
+    followers: Query<(Entity, Option<&mut FollowSpacePending>), With<FollowCurrentWorkspaceMarker>>,
+    active_display: ActiveDisplay,
+    mut commands: Commands,
+) {
+    if activated.is_empty() && added_followers.is_empty() {
+        return;
+    }
+
+    let target_space = active_display.active_strip().id();
+    for (entity, pending) in followers {
+        if let Some(mut pending) = pending {
+            pending.reset(target_space);
+        } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(FollowSpacePending::new(target_space));
+        }
+    }
+}
+
+/// Reassign followed floating windows to the current native Space. The hidden
+/// `SkyLight` operation is asynchronous, so membership is confirmed and retried
+/// with a small bound instead of assuming submission means completion.
+#[allow(clippy::needless_pass_by_value)]
+fn sync_followed_windows(
+    mut followers: Query<
+        (Entity, &Window, &Unmanaged, &mut FollowSpacePending),
+        With<FollowCurrentWorkspaceMarker>,
+    >,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    _platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
+    mut commands: Commands,
+) {
+    const MAX_ATTEMPTS: u8 = 5;
+    const RETRY_DELAY: Duration = Duration::from_millis(150);
+
+    let target_space = active_display.active_strip().id();
+    let target_bounds = active_display.actual_bounds(&config);
+    let now = Instant::now();
+    let mut target_members = None;
+
+    for (entity, window, unmanaged, mut pending) in &mut followers {
+        if !matches!(unmanaged, Unmanaged::Floating) {
+            continue;
+        }
+        if pending.target_space != target_space {
+            pending.reset(target_space);
+        }
+        if pending.confirmed || now < pending.next_retry {
+            continue;
+        }
+
+        let members = target_members.get_or_insert_with(|| {
+            window_manager
+                .windows_in_workspace(target_space)
+                .map_or_else(
+                    |err| {
+                        warn!("unable to confirm followed windows in Space {target_space}: {err}");
+                        HashSet::new()
+                    },
+                    |windows| windows.into_iter().collect::<HashSet<_>>(),
+                )
+        });
+        if members.contains(&window.id()) {
+            pending.confirmed = true;
+            reposition_follower(
+                entity,
+                window,
+                &active_display,
+                target_bounds,
+                &mut commands,
+            );
+            continue;
+        }
+        if pending.attempts >= MAX_ATTEMPTS {
+            continue;
+        }
+
+        let mut window_ids = vec![window.id()];
+        window_ids.extend(window_manager.get_associated_windows(window.id()));
+        window_ids.sort_unstable();
+        window_ids.dedup();
+
+        match window_manager.move_windows_to_workspace(&window_ids, target_space) {
+            Ok(()) => {
+                pending.attempts += 1;
+                pending.next_retry = now + RETRY_DELAY;
+                reposition_follower(
+                    entity,
+                    window,
+                    &active_display,
+                    target_bounds,
+                    &mut commands,
+                );
+            }
+            Err(err) => {
+                pending.attempts = MAX_ATTEMPTS;
+                warn!(
+                    "unable to move followed window {} to Space {target_space}: {err}",
+                    window.id()
+                );
+            }
+        }
+    }
+}
+
+fn reposition_follower(
+    entity: Entity,
+    window: &Window,
+    active_display: &ActiveDisplay,
+    target_bounds: bevy::math::IRect,
+    commands: &mut Commands,
+) {
+    let frame = window.frame();
+    if !active_display.bounds().intersect(frame).is_empty() {
+        return;
+    }
+
+    let relative_origin = active_display
+        .other()
+        .find(|display| !display.bounds().intersect(frame).is_empty())
+        .map_or(frame.min - active_display.bounds().min, |display| {
+            frame.min - display.bounds().min
+        });
+    let destination = clamp_origin_to_viewport(
+        target_bounds.min + relative_origin,
+        frame.size(),
+        target_bounds,
+    );
+    if destination != frame.min {
+        debug!(
+            "moving followed window {} onto display {} at {destination}",
+            window.id(),
+            active_display.id()
+        );
+        commands.reposition_entity(entity, destination);
+    }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,

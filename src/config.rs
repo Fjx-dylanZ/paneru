@@ -23,7 +23,7 @@ use self::decorations::{
 use self::swipe::SwipeGestureDirection;
 
 #[cfg(test)]
-use crate::commands::{MoveFocus, Operation, ResizeDirection};
+use crate::commands::{Direction, MoveFocus, Operation, ResizeDirection};
 use crate::{
     commands::Command,
     manager::ProcessApi,
@@ -1343,6 +1343,9 @@ pub struct WindowParams {
     bundle_id: Option<String>,
     /// If `true`, the window will be managed as a floating window (not tiled).
     pub floating: Option<bool>,
+    /// If `true`, keep the floating window on Paneru's current native macOS Space.
+    /// This implies `floating = true`.
+    pub follow: Option<bool>,
     /// If `true`, force the process/window to be managed even if macOS reports it as
     /// unobservable or the window does not look like a standard window.
     pub manage: Option<bool>,
@@ -1377,6 +1380,7 @@ impl WindowParams {
             title: Regex::new(title).unwrap(),
             bundle_id,
             floating: None,
+            follow: None,
             manage: None,
             index: None,
             vertical_padding: None,
@@ -2119,6 +2123,23 @@ fn test_parse_restart_command() {
 }
 
 #[test]
+fn test_parse_follow_commands() {
+    assert!(matches!(
+        parse_command(&["window", "follow"]).unwrap(),
+        Command::Window(Operation::Follow(None))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "follow", "on"]).unwrap(),
+        Command::Window(Operation::Follow(Some(true)))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "follow", "off"]).unwrap(),
+        Command::Window(Operation::Follow(Some(false)))
+    ));
+    assert!(parse_command(&["window", "follow", "maybe"]).is_err());
+}
+
+#[test]
 fn test_parse_absolute_virtual_workspace_commands() {
     assert!(matches!(
         parse_command(&["window", "virtualnum", "3"]).unwrap(),
@@ -2170,6 +2191,7 @@ fn test_grid_ratios() {
         title: Regex::new(".*").unwrap(),
         bundle_id: None,
         floating: None,
+        follow: None,
         manage: None,
         index: None,
         vertical_padding: None,
@@ -2330,6 +2352,25 @@ floating = true
     let props = config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool");
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].floating, Some(true));
+}
+
+#[test]
+fn test_window_rules_follow() {
+    let input = r#"
+[options]
+
+[bindings]
+
+[windows.quick_access]
+bundle_id = "com.1password.1password"
+title = "^Quick Access — 1Password$"
+follow = true
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    let props =
+        config.find_window_properties("Quick Access — 1Password", "com.1password.1password");
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].follow, Some(true));
 }
 
 #[test]
