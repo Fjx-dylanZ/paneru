@@ -72,6 +72,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         },
         "togglefloatlayer" => Operation::ToggleFloatingLayer,
         "swap" => Operation::Swap(Direction::parse(argument()?)?),
+        "movefloat" => Operation::MoveFloating(Direction::parse(argument()?)?),
         "center" => Operation::Center,
         "resize" => Operation::Resize(
             argv.get(1)
@@ -93,6 +94,11 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
             None => Operation::Follow(None),
             Some("on") if argv.len() == 2 => Operation::Follow(Some(true)),
             Some("off") if argv.len() == 2 => Operation::Follow(Some(false)),
+            Some(_) => return Err(err()),
+        },
+        "cyclefloat" => match argv.get(1).copied() {
+            None => Operation::CycleFloating(false),
+            Some("reverse") if argv.len() == 2 => Operation::CycleFloating(true),
             Some(_) => return Err(err()),
         },
         "equalize" => Operation::Equalize,
@@ -188,6 +194,9 @@ impl Operation {
             Operation::Focus(direction) => vec!["focus".to_string(), direction.token()],
             Operation::Swap(direction) => vec!["swap".to_string(), direction.token()],
             Operation::Center => owned(&["center"]),
+            Operation::MoveFloating(direction) => {
+                vec!["movefloat".to_string(), direction.token()]
+            }
             Operation::Resize(direction) => owned(&["resize", direction.token()]),
             Operation::ResizeVertical(direction) => {
                 owned(&["vertical", "resize", direction.token()])
@@ -230,6 +239,8 @@ impl Operation {
             Operation::FocusUnmanaged => owned(&["focus", "unmanaged"]),
             Operation::FocusManaged => owned(&["focus", "managed"]),
             Operation::RaiseFloating => owned(&["raise", "floating"]),
+            Operation::CycleFloating(false) => owned(&["cyclefloat"]),
+            Operation::CycleFloating(true) => owned(&["cyclefloat", "reverse"]),
             Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
             Operation::CopyRule => owned(&["copyrule"]),
         }
@@ -257,6 +268,7 @@ mod tests {
             Operation::ResizeVertical(ResizeDirection::Grow),
             Operation::ResizeVertical(ResizeDirection::Shrink),
             Operation::FullWidth,
+            Operation::MoveFloating(Direction::North),
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
             Operation::Equalize,
@@ -280,6 +292,8 @@ mod tests {
             Operation::FocusUnmanaged,
             Operation::FocusManaged,
             Operation::RaiseFloating,
+            Operation::CycleFloating(false),
+            Operation::CycleFloating(true),
             Operation::ToggleFloatingLayer,
             Operation::CopyRule,
         ];
@@ -332,5 +346,7 @@ mod tests {
         assert!(parse_command(&["window", "swap", "3"]).is_err());
         assert!(parse_command(&["window", "follow", "maybe"]).is_err());
         assert!(parse_command(&["window", "follow", "on", "extra"]).is_err());
+        assert!(parse_command(&["window", "movefloat", "3"]).is_err());
+        assert!(parse_command(&["window", "cyclefloat", "backwards"]).is_err());
     }
 }
