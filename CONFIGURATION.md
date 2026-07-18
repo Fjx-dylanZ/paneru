@@ -189,6 +189,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_vertical_shrink` | Cycle a stacked window through preset heights (Shrink). |
 | `window_fullwidth` | Toggle full-width mode. |
 | `window_manage` | Toggle between tiled and floating state. |
+| `window_follow` | Toggle sticky-style following of the current native macOS Space. Following implies floating. |
 | `window_stack` | Stack the current window into the column on the left. |
 | `window_unstack` | Pull a window out of a stack into its own column. |
 | `window_equalize` | Make all windows in a stack equal height. |
@@ -280,6 +281,7 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | `title` | Regex | **(Required)** Regex pattern to match the window title. |
 | `bundle_id` | String | Optional Bundle ID to match (e.g., `com.apple.Terminal`). |
 | `floating` | Boolean | Force the window to be floating/unmanaged. |
+| `follow` | Boolean | Keep the window on Paneru's current native macOS Space. Implies `floating = true`. |
 | `manage` | Boolean | Force Paneru to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
@@ -323,6 +325,41 @@ the commented `.*` to cover every window of the app instead. The `app`, `role`
 and `subrole` line is there to tell one pasted rule from the next; none of those
 are matchable. When an `init.lua` is in charge, the snippet is written as a Lua
 table instead of TOML.
+
+### Following the current workspace
+
+`follow = true` gives a window sticky-style behavior across both kinds of
+Paneru workspaces. Unlike ordinary floating windows, followed windows remain
+visible across virtual workspace rows. When the active native macOS Space
+changes, Paneru reassigns a followed window to that one Space without changing
+focus or reapplying its grid placement.
+
+```toml
+[windows.onepassword_quick_access]
+title = "^Quick Access — 1Password$"
+bundle_id = "com.1password.1password"
+manage = true
+follow = true
+```
+
+The runtime command can toggle or request an explicit state:
+
+```shell
+paneru send-cmd window follow
+paneru send-cmd window follow on
+paneru send-cmd window follow off
+```
+
+Disabling follow leaves the window floating on its current Space; use
+`window_manage` separately if you want to tile it. Runtime toggles last for the
+current Paneru process, while a window rule reapplies whenever the window is
+discovered.
+
+This is a one-Space-to-one-Space move, not true simultaneous membership in all
+macOS Spaces. It uses a capability-detected private SkyLight operation and does
+not require disabling System Integrity Protection. If Apple removes that
+operation in a future macOS build, Paneru logs the feature as unavailable and
+does not use a SIP-requiring fallback.
 
 ### Forcing management of LSUIElement or non-standard windows
 
