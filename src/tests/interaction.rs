@@ -1025,17 +1025,17 @@ fn mouse_outside_corner_still_changes_focus() {
         .run(commands);
 }
 
-#[test]
-fn toggle_floating_layer_flips_state() {
-    fn current_layer(world: &mut World) -> FloatingLayer {
-        let mut query = world.query::<&FloatingLayer>();
-        *query
-            .query(world)
-            .iter()
-            .find(|layer| layer.workspace_id == TEST_WORKSPACE_ID)
-            .expect("active workspace has FloatingLayer")
-    }
+fn current_floating_layer(world: &mut World) -> FloatingLayer {
+    let mut query = world.query::<&FloatingLayer>();
+    *query
+        .query(world)
+        .iter()
+        .find(|layer| layer.workspace_id == TEST_WORKSPACE_ID)
+        .expect("active workspace has FloatingLayer")
+}
 
+#[test]
+fn toggle_floating_layer_tracks_focused_tier() {
     let commands = vec![
         Event::Command {
             command: Command::PrintState,
@@ -1050,15 +1050,65 @@ fn toggle_floating_layer_flips_state() {
 
     TestHarness::new()
         .with_config(Config::default())
-        .with_windows(3)
+        .with_windows(2)
         .on_iteration(0, |world, _state| {
-            assert!(!current_layer(world).front);
+            let floating = find_window_entity(1, world);
+            world.entity_mut(floating).insert(Unmanaged::Floating);
+            assert!(!current_floating_layer(world).front);
         })
         .on_iteration(1, |world, _state| {
-            assert!(current_layer(world).front);
+            assert!(current_floating_layer(world).front);
+            assert_focused!(world, 1);
         })
         .on_iteration(2, |world, _state| {
-            assert!(!current_layer(world).front);
+            assert!(!current_floating_layer(world).front);
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn toggle_floating_layer_uses_mouse_refocused_tiled_window() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToggleFloatingLayer),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToggleFloatingLayer),
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(Config::default())
+        .with_windows(2)
+        .on_iteration(0, |world, _state| {
+            let floating = find_window_entity(1, world);
+            world.entity_mut(floating).insert(Unmanaged::Floating);
+        })
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 1);
+            assert!(current_floating_layer(world).front);
+
+            // Simulate clicking the tiled window after the command focused the
+            // floating tier. The queued OS focus event is processed during the
+            // following no-op command.
+            state.focus_window(0);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+            assert!(current_floating_layer(world).front);
+        })
+        .on_iteration(3, |world, _state| {
+            // One toggle is enough to return to the floating tier even though
+            // the stored layer state was already `front`.
+            assert_focused!(world, 1);
+            assert!(current_floating_layer(world).front);
         })
         .run(commands);
 }

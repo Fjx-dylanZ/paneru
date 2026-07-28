@@ -344,8 +344,8 @@ fn reparent_existing_workspaces(
     }
 }
 
-/// Tracks whether floating windows on a workspace sit above or behind tiled
-/// ones in the OS z-order. Default is `Front` (floats above tiles).
+/// Records which tier was most recently raised by the layer toggle on a
+/// workspace. New workspaces start with the tiled layer selected.
 #[derive(Clone, Component, Copy)]
 pub struct FloatingLayer {
     pub workspace_id: WorkspaceId,
@@ -358,10 +358,6 @@ impl FloatingLayer {
             workspace_id,
             front: false,
         }
-    }
-
-    pub fn flip(&mut self) {
-        self.front = !self.front;
     }
 }
 

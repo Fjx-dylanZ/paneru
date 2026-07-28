@@ -561,27 +561,40 @@ fn command_toggle_floating_layer(
     let active_strip = active_display.active_strip();
     let workspace_id = active_strip.id();
 
+    let visible_floats =
+        visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
+    let visible_float = |entity: Entity| -> bool {
+        visible_floats.contains(&entity) && !active_strip.contains(entity)
+    };
+    let focused_is_floating = windows.focused().and_then(|(_, entity)| {
+        if visible_float(entity) {
+            Some(true)
+        } else if active_strip.contains(entity) {
+            Some(false)
+        } else {
+            None
+        }
+    });
+
     let floating_front = floating_layers
         .iter_mut()
         .find_map(|mut layer| {
             if layer.workspace_id == workspace_id {
-                layer.flip();
+                layer.front = focused_is_floating.map_or(!layer.front, |front| !front);
                 Some(layer.front)
             } else {
                 None
             }
         })
         .unwrap_or_else(|| {
-            let layer = FloatingLayer::new(workspace_id);
+            let mut layer = FloatingLayer::new(workspace_id);
+            if let Some(front) = focused_is_floating {
+                layer.front = !front;
+            }
+            let front = layer.front;
             commands.spawn((layer, ChildOf(active_display.entity())));
-            false
+            front
         });
-
-    let visible_floats =
-        visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
-    let visible_float = |entity: Entity| -> bool {
-        visible_floats.contains(&entity) && !active_strip.contains(entity)
-    };
 
     let target = if floating_front {
         focus_history
@@ -598,7 +611,9 @@ fn command_toggle_floating_layer(
     if floating_front {
         windows
             .iter()
-            .filter_map(|(_, e)| visible_float(e).then_some(e))
+            .filter_map(|(_, entity)| {
+                (visible_float(entity) && Some(entity) != target).then_some(entity)
+            })
             .for_each(|entity| {
                 commands.trigger(RaiseWindow {
                     entity,
@@ -610,6 +625,10 @@ fn command_toggle_floating_layer(
             entity,
             with_strip: true,
         });
+    }
+
+    if let Some(entity) = target {
+        commands.focus_entity(entity, true);
     }
 
     debug!("floating layer -> front: {floating_front}");
