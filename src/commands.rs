@@ -566,7 +566,8 @@ fn command_toggle_floating_layer(
     let visible_float = |entity: Entity| -> bool {
         visible_floats.contains(&entity) && !active_strip.contains(entity)
     };
-    let focused_is_floating = windows.focused().and_then(|(_, entity)| {
+    let focused_entity = windows.focused().map(|(_, entity)| entity);
+    let focused_is_floating = focused_entity.and_then(|entity| {
         if visible_float(entity) {
             Some(true)
         } else if active_strip.contains(entity) {
@@ -596,6 +597,26 @@ fn command_toggle_floating_layer(
             front
         });
 
+    let tiled_columns = active_strip.all_columns();
+    let nearest_tiled_to_focused_float = || {
+        let focused_center = focused_entity
+            .filter(|entity| visible_float(*entity))
+            .and_then(|entity| windows.moving_frame(entity))
+            .map(|frame| frame.center())?;
+
+        tiled_columns
+            .iter()
+            .copied()
+            .filter_map(|entity| {
+                let center = windows.moving_frame(entity)?.center();
+                let dx = i64::from(center.x) - i64::from(focused_center.x);
+                let dy = i64::from(center.y) - i64::from(focused_center.y);
+                Some((entity, dx * dx + dy * dy))
+            })
+            .min_by_key(|(_, distance_squared)| *distance_squared)
+            .map(|(entity, _)| entity)
+    };
+
     let target = if floating_front {
         focus_history
             .last_floating(workspace_id)
@@ -605,7 +626,8 @@ fn command_toggle_floating_layer(
         focus_history
             .last_managed(workspace_id)
             .filter(|entity| active_strip.contains(*entity))
-            .or_else(|| active_strip.all_columns().into_iter().next())
+            .or_else(nearest_tiled_to_focused_float)
+            .or_else(|| tiled_columns.first().copied())
     };
 
     if floating_front {

@@ -1068,6 +1068,40 @@ fn toggle_floating_layer_tracks_focused_tier() {
 }
 
 #[test]
+fn toggle_floating_layer_uses_nearest_tiled_window_after_floating_focus() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Nth(2))),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToggleFloatingLayer),
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(Config::default())
+        .with_windows(5)
+        .on_iteration(1, |world, _state| assert_focused!(world, 2))
+        .on_iteration(2, |world, _state| {
+            let floating = find_window_entity(2, world);
+            assert!(matches!(
+                world.get::<Unmanaged>(floating),
+                Some(Unmanaged::Floating)
+            ));
+            assert_focused!(world, 2);
+        })
+        .on_iteration(3, |world, _state| {
+            assert!(!current_floating_layer(world).front);
+            assert_focused!(world, 3);
+        })
+        .run(commands);
+}
+
+#[test]
 fn toggle_floating_layer_uses_mouse_refocused_tiled_window() {
     let commands = vec![
         Event::Command {
