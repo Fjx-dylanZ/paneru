@@ -54,7 +54,8 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, parse_command,
+    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, SpaceOperation,
+    SpaceSelector, parse_command,
 };
 
 /// Issues a [`Command`]. The only thing the two hosts differ by.
@@ -78,6 +79,7 @@ pub fn install(lua: &Lua, paneru: &Table, dispatch: &Dispatch) -> Result<()> {
 
     paneru.set("window", window_table(lua, dispatch)?)?;
     paneru.set("workspace", workspace_table(lua, dispatch)?)?;
+    paneru.set("space", space_table(lua, dispatch)?)?;
 
     let mouse = lua.create_table()?;
     mouse.set(
@@ -268,6 +270,22 @@ fn workspace_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     )?;
 
     Ok(workspace)
+}
+
+/// Builds the `paneru.space` sub-table.
+fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
+    let space = lua.create_table()?;
+    let dispatch = Rc::clone(dispatch);
+    space.set(
+        "focus",
+        lua.create_function(move |lua, value: Value| {
+            let token = scalar_token(&value)?;
+            let selector = SpaceSelector::parse(&token)
+                .map_err(|err| mlua::Error::RuntimeError(err.to_string()))?;
+            dispatch(lua, Command::Space(SpaceOperation::Focus(selector)))
+        })?,
+    )?;
+    Ok(space)
 }
 
 /// Virtual-workspace verbs come in two shapes: a position selects a numbered
@@ -523,6 +541,8 @@ mod tests {
             paneru.window.move_floating({ direction = "west" })
             paneru.window.cycle_floating()
             paneru.window.cycle_floating({ reverse = true })
+            paneru.space.focus("next")
+            paneru.space.focus(3)
         "#)
         .unwrap();
 
@@ -538,6 +558,8 @@ mod tests {
                 Command::Window(Operation::MoveFloating(Direction::West)),
                 Command::Window(Operation::CycleFloating(false)),
                 Command::Window(Operation::CycleFloating(true)),
+                Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+                Command::Space(SpaceOperation::Focus(SpaceSelector::Number(3))),
             ])
         );
     }

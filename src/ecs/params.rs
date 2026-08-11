@@ -11,7 +11,7 @@ use bevy::{
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
 
-use super::{ActiveDisplayMarker, FocusFollowsMouse, SkipReshuffle};
+use super::{ActiveDisplayMarker, FocusFollowsMouse, InstantSpaceSwitch, SkipReshuffle};
 use crate::{
     config::Config,
     ecs::{
@@ -31,6 +31,8 @@ pub struct GlobalState<'w> {
     focus_follows_mouse_id: ResMut<'w, FocusFollowsMouse>,
     /// Resource to determine if window reshuffling should be skipped.
     skip_reshuffle: ResMut<'w, SkipReshuffle>,
+    /// State for instant native Space focus transitions.
+    instant_space_switch: ResMut<'w, InstantSpaceSwitch>,
 
     initializing: Option<Res<'w, Initializing>>,
 }
@@ -71,6 +73,18 @@ impl GlobalState<'_> {
     /// `true` if reshuffling is skipped, `false` otherwise.
     pub fn skip_reshuffle(&self) -> bool {
         self.skip_reshuffle.0
+    }
+
+    pub fn should_begin_instant_space_switch(&self, window_id: WinID) -> bool {
+        self.instant_space_switch.should_begin(window_id)
+    }
+
+    pub fn begin_instant_space_switch(&mut self, window_id: WinID) {
+        self.instant_space_switch.begin(window_id);
+    }
+
+    pub fn suppress_focus_follows_mouse(&self) -> bool {
+        self.instant_space_switch.suppress_focus_follows_mouse()
     }
 
     pub fn initializing(&self) -> bool {
