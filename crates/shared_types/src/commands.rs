@@ -280,6 +280,52 @@ pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
 }
+/// Selects a native macOS Space in global Mission Control order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceSelector {
+    Next,
+    Previous,
+    /// A one-based index in global Mission Control order.
+    Number(usize),
+}
+
+impl SpaceSelector {
+    /// Parses `next`, `prev`/`previous`, or a positive one-based number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `input` is not a native Space selector.
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        match input {
+            "next" => Ok(Self::Next),
+            "prev" | "previous" => Ok(Self::Previous),
+            number => number
+                .parse::<usize>()
+                .ok()
+                .filter(|number| *number > 0)
+                .map(Self::Number)
+                .ok_or_else(|| ParseError::new(format!("invalid native Space selector '{input}'"))),
+        }
+    }
+
+    /// The argv token representing this selector.
+    #[must_use]
+    pub fn token(self) -> String {
+        match self {
+            Self::Next => "next".into(),
+            Self::Previous => "prev".into(),
+            Self::Number(number) => number.to_string(),
+        }
+    }
+}
+
+/// Defines operations that can be performed on native macOS Spaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceOperation {
+    Focus(SpaceSelector),
+}
 
 /// Represents a command that can be issued to the window manager.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -289,6 +335,8 @@ pub enum Command {
     Window(Operation),
     /// A command targeting the mouse with a specific `MouseOperation`.
     Mouse(MouseMove),
+    /// A command targeting a native macOS Space.
+    Space(SpaceOperation),
     /// A command to quit the window manager application.
     Quit,
     /// A command to restart the window manager service.

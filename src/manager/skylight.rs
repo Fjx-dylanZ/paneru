@@ -81,6 +81,16 @@ unsafe extern "C" {
     /// extern `CFStringRef` SLSCopyManagedDisplayForWindow(int cid, `uint32_t` wid);
     // pub fn SLSCopyManagedDisplayForWindow(cid: ConnID, window_id: WinID) -> CFStringRef;
 
+    /// Copies the native Spaces containing any window in `window_list`.
+    ///
+    /// # Original signature
+    /// extern `CFArrayRef` SLSCopySpacesForWindows(int cid, int selector, `CFArrayRef` `window_list`);
+    pub fn SLSCopySpacesForWindows(
+        cid: ConnID,
+        selector: i32,
+        window_list: &CFArray,
+    ) -> *mut CFArray<CFNumber>;
+
     /// Copies the best managed display identifier for a given rectangle.
     /// This function determines which display best contains or is intersected by the provided rectangle.
     ///
@@ -164,6 +174,22 @@ unsafe extern "C" {
     /// # Original signature
     /// extern `CFStringRef` SLSCopyActiveMenuBarDisplayIdentifier(int cid);
     pub fn SLSCopyActiveMenuBarDisplayIdentifier(cid: ConnID) -> CFStringRef;
+
+    /// Makes a managed display the active menu bar display.
+    ///
+    /// # Original signature
+    /// `CGError SLSSetActiveMenuBarDisplayIdentifier(int cid, CFStringRef uuid, CFStringRef repeat_uuid);`
+    pub fn SLSSetActiveMenuBarDisplayIdentifier(
+        cid: ConnID,
+        uuid: &CFString,
+        repeat_uuid: &CFString,
+    ) -> CGError;
+
+    /// Reports whether the managed display is currently changing Spaces.
+    ///
+    /// # Original signature
+    /// extern bool SLSManagedDisplayIsAnimating(int cid, `CFStringRef` uuid);
+    pub fn SLSManagedDisplayIsAnimating(cid: ConnID, uuid: &CFString) -> bool;
 
     /// Retrieves the height of the menu bar for a given display.
     ///
@@ -388,6 +414,16 @@ unsafe extern "C" {
         cid: ConnID,
         psn: &ProcessSerialNumber,
         psn_cid: &mut ConnID,
+    ) -> CGError;
+
+    /// Associates the target Space with the process that is gaining focus.
+    ///
+    /// # Original signature
+    /// extern `CGError` SLSSpaceSetFrontPSN(int cid, `uint64_t` sid, `ProcessSerialNumber` *psn);
+    pub fn SLSSpaceSetFrontPSN(
+        cid: ConnID,
+        workspace_id: u64,
+        psn: &ProcessSerialNumber,
     ) -> CGError;
 
     /// Sets the frontmost process with additional options and a target window ID.

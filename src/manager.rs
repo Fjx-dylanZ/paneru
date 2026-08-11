@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::manager::skylight::SLSSetWindowListBrightness;
-use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
+use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId, macos_major_version};
 use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
@@ -39,9 +39,11 @@ use skylight::{
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIteratorAdvance,
-    SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags,
-    SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
+    SLSManagedDisplayGetCurrentSpace, SLSManagedDisplayIsAnimating,
+    SLSSetActiveMenuBarDisplayIdentifier, SLSSpaceGetType, SLSSpaceSetFrontPSN,
+    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
+    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
+    SLSWindowQueryWindows,
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
@@ -125,6 +127,19 @@ pub trait WindowManagerApi: Send + Sync {
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId>;
     /// Returns `true` if the current space on the given display is a native fullscreen space.
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
+    /// Returns every native macOS Space in global Mission Control order.
+    fn native_spaces(&self) -> Result<Vec<WorkspaceId>>;
+    /// Instantly focuses `workspace_id`, including an empty Space. Returns
+    /// `true` when display focus or a Space gesture was issued.
+    fn focus_native_space(&self, workspace_id: WorkspaceId) -> Result<bool>;
+    /// Instantly switches to the native Space containing `window_id`, if that
+    /// Space is not already visible. Returns the selected Space when a gesture
+    /// was posted.
+    fn focus_window_workspace(
+        &self,
+        window_id: WinID,
+        psn: ProcessSerialNumber,
+    ) -> Result<Option<WorkspaceId>>;
     /// Centers the mouse cursor on a given window within its display bounds if it's not already within the window.
     ///
     /// # Arguments
@@ -238,57 +253,59 @@ impl WindowManagerOS {
     /// # Returns
     ///
     /// `Ok(Vec<u64>)` with the list of space IDs if successful, otherwise `Err(Error)` if the spaces cannot be retrieved or the display is not found.
-    fn display_space_list(&self, uuid: &CFString) -> Result<Vec<WorkspaceId>> {
+    fn managed_display_space_lists(&self) -> Result<Vec<(String, Vec<WorkspaceId>)>> {
         let display_spaces = NonNull::new(unsafe { SLSCopyManagedDisplaySpaces(self.main_cid) })
             .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
-            .ok_or(Error::PermissionDenied(format!(
-                "can not copy managed display spaces for {}.",
-                self.main_cid
-            )))?;
-        let uuid = uuid.to_string();
-
-        let display = display_spaces.iter().find(|display| {
-            let identifier = display
-                .get(&CFString::from_static_str("Display Identifier"))
-                .map(|name| name.to_string());
-            identifier.is_some_and(|identifier| {
-                // FIXME: Sometimes the main display simply has the name 'Main'.
-                identifier == "Main" || identifier == uuid
-            })
-        });
-        let Some(display) = display else {
-            return Err(Error::PermissionDenied(format!(
-                "could not get any displays for {}",
-                self.main_cid
-            )));
-        };
-        debug!("found display with uuid '{uuid}'");
-
-        let display = unsafe {
-            display.cast_unchecked::<CFString, CFArray<CFDictionary<CFString, CFNumber>>>()
-        };
-        let Some(spaces) = display.get(&CFString::from_static_str("Spaces")) else {
-            return Err(Error::PermissionDenied(format!(
-                "could not get any spaces for display '{uuid}'",
-            )));
-        };
-
-        let spaces = spaces
+            .ok_or_else(|| {
+                Error::PermissionDenied(format!(
+                    "can not copy managed display spaces for {}.",
+                    self.main_cid
+                ))
+            })?;
+        let identifier_key = CFString::from_static_str("Display Identifier");
+        let spaces_key = CFString::from_static_str("Spaces");
+        let id_key = CFString::from_static_str("id64");
+        let displays = display_spaces
             .iter()
-            .filter_map(|space| {
-                space
-                    .get(&CFString::from_static_str("id64"))
-                    .and_then(|id| id.as_i64().and_then(|value| u64::try_from(value).ok()))
+            .filter_map(|display| {
+                let identifier = display.get(&identifier_key)?.to_string();
+                let display = unsafe {
+                    display.cast_unchecked::<CFString, CFArray<CFDictionary<CFString, CFNumber>>>()
+                };
+                let spaces = display
+                    .get(&spaces_key)?
+                    .iter()
+                    .filter_map(|space| {
+                        space
+                            .get(&id_key)
+                            .and_then(|id| id.as_i64())
+                            .and_then(|value| WorkspaceId::try_from(value).ok())
+                    })
+                    .collect();
+                Some((identifier, spaces))
             })
-            .collect::<Vec<WorkspaceId>>();
-        debug!(
-            "spaces [{}]",
-            spaces
-                .iter()
-                .map(|id| format!("{id}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+            .collect::<Vec<_>>();
+        if displays.is_empty() {
+            return Err(Error::NotFound(
+                "no managed display Spaces were returned".to_string(),
+            ));
+        }
+        Ok(displays)
+    }
+
+    fn display_space_list(&self, uuid: &CFString) -> Result<Vec<WorkspaceId>> {
+        let uuid = uuid.to_string();
+        let spaces = self
+            .managed_display_space_lists()?
+            .into_iter()
+            .find_map(|(identifier, spaces)| {
+                // FIXME: Sometimes the main display simply has the name 'Main'.
+                (identifier == "Main" || identifier == uuid).then_some(spaces)
+            })
+            .ok_or_else(|| {
+                Error::PermissionDenied(format!("could not get Spaces for display '{uuid}'"))
+            })?;
+        debug!(uuid, ?spaces, "found managed display Spaces");
         Ok(spaces)
     }
 
@@ -322,6 +339,93 @@ impl WindowManagerOS {
         let mut connection: ConnID = 0;
         unsafe { SLSGetConnectionIDForPSN(self.main_cid, &psn, &mut connection) };
         (connection != 0).then_some(connection)
+    }
+
+    fn display_is_animating(&self, display_id: CGDirectDisplayID) -> bool {
+        // This private API is unreliable after Ventura; match yabai's guard.
+        if !(11..=13).contains(&macos_major_version()) {
+            return false;
+        }
+        Display::uuid_from_id(display_id)
+            .is_ok_and(|uuid| unsafe { SLSManagedDisplayIsAnimating(self.main_cid, &uuid) })
+    }
+
+    fn focus_display(&self, display: &Display, workspace_id: WorkspaceId) -> Result<()> {
+        let uuid = Display::uuid_from_id(display.id())?;
+        unsafe { SLSSetActiveMenuBarDisplayIdentifier(self.main_cid, &uuid, &uuid) }
+            .to_result("SLSSetActiveMenuBarDisplayIdentifier")?;
+
+        let active_workspace = self
+            .active_display_id()
+            .and_then(|display_id| self.active_display_space(display_id))
+            .ok();
+        if active_workspace != Some(workspace_id) {
+            native_spaces::post_left_click(origin_to(display.bounds().center()))?;
+        }
+        Ok(())
+    }
+
+    fn focus_native_space_with_displays(
+        &self,
+        workspace_id: WorkspaceId,
+        displays: &[(Display, Vec<WorkspaceId>)],
+    ) -> Result<bool> {
+        let (display, workspaces) = displays
+            .iter()
+            .find(|(_, workspaces)| workspaces.contains(&workspace_id))
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "native Space {workspace_id} is not assigned to a present display"
+                ))
+            })?;
+        if self.display_is_animating(display.id()) {
+            return Err(Error::Generic(format!(
+                "display {} is already changing native Spaces",
+                display.id()
+            )));
+        }
+
+        let current_workspace = self.active_display_space(display.id())?;
+        let active_display = self.active_display_id().ok();
+        if current_workspace == workspace_id && active_display == Some(display.id()) {
+            return Ok(false);
+        }
+
+        if self
+            .cursor_position()
+            .is_none_or(|point| !display.bounds().contains(origin_from(point)))
+        {
+            self.warp_mouse(display.bounds().center());
+        }
+
+        if current_workspace == workspace_id {
+            self.focus_display(display, workspace_id)?;
+            return Ok(true);
+        }
+
+        let current_index = workspaces
+            .iter()
+            .position(|workspace| *workspace == current_workspace)
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "current native Space {current_workspace} is missing from display {}",
+                    display.id()
+                ))
+            })?;
+        let target_index = workspaces
+            .iter()
+            .position(|workspace| *workspace == workspace_id)
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "target native Space {workspace_id} is missing from display {}",
+                    display.id()
+                ))
+            })?;
+        let switched = native_spaces::post_workspace_switch_gesture(current_index, target_index)?;
+        if switched && active_display != Some(display.id()) {
+            self.focus_display(display, workspace_id)?;
+        }
+        Ok(switched)
     }
 }
 
@@ -404,6 +508,65 @@ impl WindowManagerApi for WindowManagerOS {
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool {
         self.active_display_space(display_id)
             .is_ok_and(|space_id| unsafe { SLSSpaceGetType(self.main_cid, space_id) } == 4)
+    }
+
+    fn native_spaces(&self) -> Result<Vec<WorkspaceId>> {
+        let spaces = self
+            .managed_display_space_lists()?
+            .into_iter()
+            .flat_map(|(_, spaces)| spaces)
+            .collect::<Vec<_>>();
+        if spaces.is_empty() {
+            return Err(Error::NotFound(
+                "no native macOS Spaces were returned".to_string(),
+            ));
+        }
+        Ok(spaces)
+    }
+
+    fn focus_native_space(&self, workspace_id: WorkspaceId) -> Result<bool> {
+        let displays = self.present_displays();
+        self.focus_native_space_with_displays(workspace_id, &displays)
+    }
+
+    fn focus_window_workspace(
+        &self,
+        window_id: WinID,
+        psn: ProcessSerialNumber,
+    ) -> Result<Option<WorkspaceId>> {
+        let window_workspaces = native_spaces::window_workspaces(self.main_cid, window_id)?;
+        let displays = self.present_displays();
+
+        for (display, _) in &displays {
+            if self
+                .active_display_space(display.id())
+                .is_ok_and(|workspace| window_workspaces.contains(&workspace))
+            {
+                return Ok(None);
+            }
+        }
+
+        let target_workspace = window_workspaces
+            .into_iter()
+            .find(|target| {
+                displays
+                    .iter()
+                    .any(|(_, workspaces)| workspaces.contains(target))
+            })
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "no display contains a native Space for window {window_id}"
+                ))
+            })?;
+
+        if let Err(err) = unsafe { SLSSpaceSetFrontPSN(self.main_cid, target_workspace, &psn) }
+            .to_result("SLSSpaceSetFrontPSN")
+        {
+            warn!("could not associate Space {target_workspace} with its front process: {err}");
+        }
+
+        let switched = self.focus_native_space_with_displays(target_workspace, &displays)?;
+        Ok(switched.then_some(target_workspace))
     }
 
     /// Centers the mouse cursor on the window if it's not already within the window's bounds.

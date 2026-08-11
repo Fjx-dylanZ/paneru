@@ -447,6 +447,62 @@ pub struct MissionControlActive(pub bool);
 #[derive(Resource)]
 pub struct FocusFollowsMouse(pub Option<WinID>);
 
+#[derive(Clone, Copy)]
+enum InstantSpaceSwitchSource {
+    Window(WinID),
+    Command,
+}
+
+/// Tracks a synthetic native Space switch so duplicate focus notifications do
+/// not post another gesture and focus-follows-mouse stays quiet while it lands.
+#[derive(Resource, Default)]
+pub struct InstantSpaceSwitch {
+    pending: Option<(InstantSpaceSwitchSource, Instant)>,
+    last_gesture: Option<Instant>,
+}
+
+impl InstantSpaceSwitch {
+    const PENDING_TIMEOUT: Duration = Duration::from_secs(2);
+    const FOCUS_FOLLOWS_MOUSE_DELAY: Duration = Duration::from_millis(1250);
+
+    pub fn should_begin(&self, window_id: WinID) -> bool {
+        match self.pending {
+            Some((_, started)) if started.elapsed() >= Self::PENDING_TIMEOUT => true,
+            Some((InstantSpaceSwitchSource::Window(pending_window), _)) => {
+                pending_window != window_id
+            }
+            Some((InstantSpaceSwitchSource::Command, _)) => false,
+            None => true,
+        }
+    }
+
+    pub fn begin(&mut self, window_id: WinID) {
+        let now = Instant::now();
+        self.pending = Some((InstantSpaceSwitchSource::Window(window_id), now));
+        self.last_gesture = Some(now);
+    }
+
+    pub fn should_begin_command(&self) -> bool {
+        self.pending
+            .is_none_or(|(_, started)| started.elapsed() >= Self::PENDING_TIMEOUT)
+    }
+
+    pub fn begin_command(&mut self) {
+        let now = Instant::now();
+        self.pending = Some((InstantSpaceSwitchSource::Command, now));
+        self.last_gesture = Some(now);
+    }
+
+    pub fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    pub fn suppress_focus_follows_mouse(&self) -> bool {
+        self.last_gesture
+            .is_some_and(|started| started.elapsed() < Self::FOCUS_FOLLOWS_MOUSE_DELAY)
+    }
+}
+
 #[derive(Resource)]
 pub struct Initializing;
 
@@ -638,6 +694,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         })
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
+        .insert_resource(InstantSpaceSwitch::default())
         .insert_resource(Initializing)
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)

@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, instrument, warn};
 
-use super::{ActiveDisplayMarker, SpawnWindowTrigger};
+use super::{ActiveDisplayMarker, InstantSpaceSwitch, SpawnWindowTrigger};
 use crate::commands::{Direction, MoveFocus, Operation, filter_window_operations};
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -215,6 +215,7 @@ fn fullscreen_window_in_strip(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn workspace_change_handler(
     mut messages: MessageReader<Event>,
+    mut instant_space_switch: ResMut<InstantSpaceSwitch>,
     windows: Windows,
     mut workspaces: Query<(
         &mut LayoutStrip,
@@ -232,6 +233,7 @@ fn workspace_change_handler(
     {
         return;
     }
+    instant_space_switch.clear();
     let (active_display, display_entity) = *active_display;
 
     let Ok(workspace_id) = window_manager.active_display_space(active_display.id()) else {

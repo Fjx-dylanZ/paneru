@@ -5,12 +5,12 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
-use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::commands::{Command, Direction, MoveFocus, Operation, SpaceOperation, SpaceSelector};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, NativeFullscreenMarker,
-    Position, Unmanaged, layout::LayoutStrip,
+    ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, MissionControlActive,
+    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -256,6 +256,158 @@ fn configured_follower_moves_to_the_active_native_workspace() {
             },
             Event::SpaceChanged,
         ]);
+}
+
+#[test]
+fn configured_focus_skips_native_space_animation_once() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let config: Config = (
+        MainOptions {
+            skip_native_space_switch_animation: Some(true),
+            ..default()
+        },
+        vec![],
+    )
+        .into();
+    let harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        )
+        .with_windows(1);
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, NEXT_WORKSPACE_ID, false);
+
+    harness
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, state| {
+            assert_eq!(state.active_workspace(TEST_DISPLAY_ID), TEST_WORKSPACE_ID);
+            assert_eq!(state.workspace_focuses(), vec![0]);
+            assert!(
+                world
+                    .resource::<crate::ecs::InstantSpaceSwitch>()
+                    .suppress_focus_follows_mouse(),
+                "focus-follows-mouse remains suppressed after SpaceChanged"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn native_space_commands_use_global_non_wrapping_order() {
+    const SECOND_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    const THIRD_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 2;
+    const OTHER_DISPLAY_ID: u32 = TEST_DISPLAY_ID + 1;
+    const OTHER_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 10;
+    const OTHER_LAST_WORKSPACE_ID: WorkspaceId = OTHER_WORKSPACE_ID + 1;
+
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, SECOND_WORKSPACE_ID, THIRD_WORKSPACE_ID],
+        )
+        .with_display(
+            OTHER_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH * 2,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![OTHER_WORKSPACE_ID, OTHER_LAST_WORKSPACE_ID],
+        )
+        .on_iteration(0, |_world, state| {
+            assert_eq!(state.active_display(), OTHER_DISPLAY_ID);
+            assert_eq!(
+                state.native_space_focuses(),
+                vec![OTHER_WORKSPACE_ID],
+                "number 4 focuses a Space already visible on another display"
+            );
+        })
+        .on_iteration(1, |_world, state| {
+            assert_eq!(
+                state.native_space_focuses(),
+                vec![OTHER_WORKSPACE_ID, OTHER_LAST_WORKSPACE_ID]
+            );
+        })
+        .on_iteration(2, |_world, state| {
+            assert_eq!(
+                state.native_space_focuses(),
+                vec![OTHER_WORKSPACE_ID, OTHER_LAST_WORKSPACE_ID],
+                "next does not wrap past the last global Space"
+            );
+        })
+        .on_iteration(3, |_world, state| {
+            assert_eq!(
+                state.native_space_focuses(),
+                vec![
+                    OTHER_WORKSPACE_ID,
+                    OTHER_LAST_WORKSPACE_ID,
+                    OTHER_WORKSPACE_ID
+                ]
+            );
+        })
+        .on_iteration(4, |_world, state| {
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+            assert_eq!(
+                state.native_space_focuses(),
+                vec![
+                    OTHER_WORKSPACE_ID,
+                    OTHER_LAST_WORKSPACE_ID,
+                    OTHER_WORKSPACE_ID,
+                    SECOND_WORKSPACE_ID
+                ],
+                "numeric selection can focus an empty Space"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::Space(SpaceOperation::Focus(SpaceSelector::Number(4))),
+            },
+            Event::Command {
+                command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+            },
+            Event::Command {
+                command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+            },
+            Event::Command {
+                command: Command::Space(SpaceOperation::Focus(SpaceSelector::Previous)),
+            },
+            Event::Command {
+                command: Command::Space(SpaceOperation::Focus(SpaceSelector::Number(2))),
+            },
+        ]);
+}
+
+#[test]
+fn native_space_commands_are_rejected_during_mission_control() {
+    let mut harness = TestHarness::new().with_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1],
+    );
+    harness.world().resource_mut::<MissionControlActive>().0 = true;
+
+    harness
+        .on_iteration(0, |_world, state| {
+            assert!(state.native_space_focuses().is_empty());
+            assert_eq!(state.active_workspace(TEST_DISPLAY_ID), TEST_WORKSPACE_ID);
+        })
+        .run(vec![Event::Command {
+            command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+        }]);
 }
 
 #[test]

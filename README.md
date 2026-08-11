@@ -163,6 +163,9 @@ mouse_follows_focus = true
 [bindings]
 window_focus_west = "cmd - h"
 window_focus_east = "cmd - l"
+space_focus_next = "ctrl - right"
+space_focus_prev = "ctrl - left"
+space_focus_3 = "ctrl - 3"
 window_resize = "alt - r"
 window_center = "alt - c"
 quit = "ctrl + alt - q"
@@ -274,6 +277,8 @@ $ paneru send-cmd <command> [args...]
 | `window virtualmovenum <n>` | Move the window to numbered virtual workspace and follow it |
 | `window virtualsend <dir>` | Send the window to a virtual workspace but stay  |
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
+| `space focus next\|prev`   | Focus the adjacent native macOS Space without wrapping |
+| `space focus <n>`          | Focus a native Space by global Mission Control number |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
 | `printstate`               | Print the internal ECS state to the debug log    |
@@ -312,6 +317,12 @@ $ paneru send-cmd window virtualnum 3
 
 # Send the focused window to virtual workspace 3 without following it.
 $ paneru send-cmd window virtualsendnum 3
+# Switch instantly to the next native macOS Space.
+$ paneru send-cmd space focus next
+
+# Switch instantly to native macOS Space 3.
+$ paneru send-cmd space focus 3
+
 ```
 
 ### Querying and Subscribing to State

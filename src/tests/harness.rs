@@ -17,8 +17,8 @@ use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
-    BProcess, ExistingMarker, FocusFollowsMouse, Initializing, MissionControlActive, SkipReshuffle,
-    SpawnWindowTrigger, register_systems, register_triggers,
+    BProcess, ExistingMarker, FocusFollowsMouse, Initializing, InstantSpaceSwitch,
+    MissionControlActive, SkipReshuffle, SpawnWindowTrigger, register_systems, register_triggers,
 };
 use crate::events::Event;
 use crate::manager::{Window, WindowManager};
@@ -225,6 +225,7 @@ fn setup_world() -> App {
         .insert_resource(SkipReshuffle(false))
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
+        .insert_resource(InstantSpaceSwitch::default())
         .insert_resource(Config::default())
         .insert_resource(Initializing)
         .add_plugins(MouseEventsPlugin)

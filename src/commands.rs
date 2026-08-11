@@ -20,10 +20,11 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::workspace::FollowSpacePending;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FollowCurrentWorkspaceMarker, FullWidthMarker, NativeFullscreenMarker, RaiseWindow,
-    SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    FollowCurrentWorkspaceMarker, FullWidthMarker, InstantSpaceSwitch, MissionControlActive,
+    NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
+use crate::errors::Error;
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
@@ -32,7 +33,8 @@ use crate::util::round_px;
 // The command vocabulary itself lives in the `paneru-command` crate, shared with
 // the Lua API in `crates/lua-api` so every host speaks the same types.
 pub use paneru_shared_types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
+    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, SpaceOperation,
+    SpaceSelector,
 };
 
 /// The strips that are selected on their display but not the one on screen —
@@ -95,7 +97,14 @@ pub fn register_commands(app: &mut bevy::app::App) {
             snap_window,
         ),
     );
-    app.add_systems(PreUpdate, (command_move_floating, follow_window));
+    app.add_systems(
+        PreUpdate,
+        (
+            command_move_floating,
+            follow_window,
+            command_focus_native_space,
+        ),
+    );
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -113,6 +122,83 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
             None
         }
     })
+}
+
+fn resolve_native_space(
+    spaces: &[WorkspaceId],
+    current_workspace: WorkspaceId,
+    selector: SpaceSelector,
+) -> Option<WorkspaceId> {
+    let current_index = spaces
+        .iter()
+        .position(|workspace| *workspace == current_workspace)?;
+    match selector {
+        SpaceSelector::Next => spaces.get(current_index + 1).copied(),
+        SpaceSelector::Previous => current_index
+            .checked_sub(1)
+            .and_then(|index| spaces.get(index))
+            .copied(),
+        SpaceSelector::Number(number) => number
+            .checked_sub(1)
+            .and_then(|index| spaces.get(index))
+            .copied(),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn command_focus_native_space(
+    mut messages: MessageReader<Event>,
+    window_manager: Res<WindowManager>,
+    mission_control: Res<MissionControlActive>,
+    mut instant_space_switch: ResMut<InstantSpaceSwitch>,
+) {
+    for selector in messages.read().filter_map(|event| {
+        let Event::Command {
+            command: Command::Space(SpaceOperation::Focus(selector)),
+        } = event
+        else {
+            return None;
+        };
+        Some(*selector)
+    }) {
+        if mission_control.0 {
+            warn!("native Space focus is unavailable during Mission Control");
+            continue;
+        }
+        if !instant_space_switch.should_begin_command() {
+            warn!("native Space focus is already in progress");
+            continue;
+        }
+
+        let target = window_manager
+            .native_spaces()
+            .and_then(|spaces| {
+                let display_id = window_manager.active_display_id()?;
+                let current_workspace = window_manager.active_display_space(display_id)?;
+                resolve_native_space(&spaces, current_workspace, selector).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "native Space selector {selector:?} is out of range"
+                    ))
+                })
+            })
+            .and_then(|workspace_id| {
+                window_manager
+                    .focus_native_space(workspace_id)
+                    .map(|switched| (workspace_id, switched))
+            });
+
+        match target {
+            Ok((workspace_id, true)) => {
+                instant_space_switch.begin_command();
+                debug!(workspace_id, "focused native Space");
+            }
+            Ok((workspace_id, false)) => {
+                debug!(workspace_id, "native Space is already focused");
+            }
+            Err(err) => warn!("could not focus native Space: {err}"),
+        }
+    }
 }
 
 /// Retrieves a window `Entity` in a specified direction relative to a `current_window_id` within a `LayoutStrip`.

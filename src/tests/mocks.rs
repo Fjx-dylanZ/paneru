@@ -74,6 +74,7 @@ struct MockDisplayData {
     id: u32,
     bounds: IRect,
     workspaces: Vec<WorkspaceId>,
+    active_workspace: WorkspaceId,
 }
 
 /// The internal state of our "Virtual macOS".
@@ -89,6 +90,8 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     workspace_moves: Vec<(Vec<WinID>, WorkspaceId)>,
+    workspace_focuses: Vec<WinID>,
+    native_space_focuses: Vec<WorkspaceId>,
 }
 
 #[derive(Clone)]
@@ -109,6 +112,8 @@ impl MockState {
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 workspace_moves: Vec::new(),
+                workspace_focuses: Vec::new(),
+                native_space_focuses: Vec::new(),
             })),
         }
     }
@@ -179,6 +184,7 @@ impl MockState {
     }
 
     pub fn add_display(&mut self, id: u32, bounds: IRect, workspaces: Vec<WorkspaceId>) {
+        let active_workspace = workspaces.first().copied().unwrap_or_default();
         let mut inner = self.inner.force_write();
         if inner.displays.is_empty() {
             inner.active_display_id = id;
@@ -189,6 +195,7 @@ impl MockState {
                 id,
                 bounds,
                 workspaces,
+                active_workspace,
             },
         );
     }
@@ -218,8 +225,10 @@ impl MockState {
                 .displays
                 .get_mut(&display_id)
                 .expect("finding display");
-            display.workspaces.retain(|id| *id != workspace_id);
-            display.workspaces.insert(0, workspace_id);
+            if !display.workspaces.contains(&workspace_id) {
+                display.workspaces.push(workspace_id);
+            }
+            display.active_workspace = workspace_id;
         }
         if fullscreen {
             inner.fullscreen_spaces.insert(workspace_id);
@@ -231,6 +240,23 @@ impl MockState {
     pub fn drain_events(&self) -> Vec<Event> {
         let mut inner = self.inner.force_write();
         inner.event_queue.drain(..).collect()
+    }
+
+    pub(crate) fn workspace_focuses(&self) -> Vec<WinID> {
+        self.inner.force_read().workspace_focuses.clone()
+    }
+
+    pub(crate) fn active_workspace(&self, display_id: u32) -> WorkspaceId {
+        self.inner
+            .force_read()
+            .displays
+            .get(&display_id)
+            .map(|display| display.active_workspace)
+            .expect("finding active workspace")
+    }
+
+    pub(crate) fn native_space_focuses(&self) -> Vec<WorkspaceId> {
+        self.inner.force_read().native_space_focuses.clone()
     }
 
     // --- State Mutation Methods ---
@@ -658,7 +684,7 @@ impl MockState {
                 .force_read()
                 .displays
                 .get(&id)
-                .map(|d| d.workspaces[0])
+                .map(|display| display.active_workspace)
                 .ok_or(Error::InvalidWindow)
         });
 
@@ -666,11 +692,87 @@ impl MockState {
         wm.expect_is_fullscreen_space()
             .returning(move |display_id| {
                 let inner = s.inner.force_read();
+                inner.displays.get(&display_id).is_some_and(|display| {
+                    inner.fullscreen_spaces.contains(&display.active_workspace)
+                })
+            });
+
+        let s = self.clone();
+        wm.expect_native_spaces().returning(move || {
+            let inner = s.inner.force_read();
+            let mut displays = inner.displays.values().collect::<Vec<_>>();
+            displays.sort_unstable_by_key(|display| display.id);
+            Ok(displays
+                .into_iter()
+                .flat_map(|display| display.workspaces.iter().copied())
+                .collect())
+        });
+
+        let s = self.clone();
+        wm.expect_focus_native_space()
+            .returning(move |workspace_id| {
+                let mut inner = s.inner.force_write();
+                let display_id = inner
+                    .displays
+                    .iter()
+                    .find_map(|(id, display)| {
+                        display.workspaces.contains(&workspace_id).then_some(*id)
+                    })
+                    .ok_or(Error::InvalidWindow)?;
+                let changed = inner.active_display_id != display_id
+                    || inner
+                        .displays
+                        .get(&display_id)
+                        .is_some_and(|display| display.active_workspace != workspace_id);
+                if !changed {
+                    return Ok(false);
+                }
+                inner.active_display_id = display_id;
                 inner
                     .displays
-                    .get(&display_id)
-                    .and_then(|display| display.workspaces.first())
-                    .is_some_and(|workspace_id| inner.fullscreen_spaces.contains(workspace_id))
+                    .get_mut(&display_id)
+                    .expect("finding target display")
+                    .active_workspace = workspace_id;
+                inner.native_space_focuses.push(workspace_id);
+                inner.event_queue.push_back(Event::SpaceChanged);
+                Ok(true)
+            });
+
+        let s = self.clone();
+        wm.expect_focus_window_workspace()
+            .returning(move |window_id, _psn| {
+                let mut inner = s.inner.force_write();
+                let target_workspace = inner
+                    .windows
+                    .get(&window_id)
+                    .map(|window| window.workspace_id)
+                    .ok_or(Error::InvalidWindow)?;
+                let display_id = inner
+                    .displays
+                    .iter()
+                    .find_map(|(id, display)| {
+                        display
+                            .workspaces
+                            .contains(&target_workspace)
+                            .then_some(*id)
+                    })
+                    .ok_or(Error::InvalidWindow)?;
+                if inner
+                    .displays
+                    .values()
+                    .any(|display| display.active_workspace == target_workspace)
+                {
+                    return Ok(None);
+                }
+                inner.active_display_id = display_id;
+                inner
+                    .displays
+                    .get_mut(&display_id)
+                    .expect("finding target display")
+                    .active_workspace = target_workspace;
+                inner.workspace_focuses.push(window_id);
+                inner.event_queue.push_back(Event::SpaceChanged);
+                Ok(Some(target_workspace))
             });
 
         let s = self.clone();

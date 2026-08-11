@@ -5,8 +5,8 @@
 //! together here and are checked against each other by round-trip tests.
 
 use crate::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
-    parse_virtual_workspace_number,
+    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, SpaceOperation,
+    SpaceSelector, parse_virtual_workspace_number,
 };
 
 /// Why an argv vector is not a command. Consumers wrap this in their own error
@@ -46,6 +46,7 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
         "printstate" => Command::PrintState,
         "window" => Command::Window(parse_operation(&argv[1..])?),
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
+        "space" => Command::Space(parse_space_operation(&argv[1..])?),
         "quit" => Command::Quit,
         "restart" => Command::Restart,
         _ => return Err(ParseError::new(format!("unhandled command '{argv:?}'"))),
@@ -148,6 +149,13 @@ fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     }
 }
 
+fn parse_space_operation(argv: &[&str]) -> Result<SpaceOperation> {
+    let ["focus", selector] = argv else {
+        return Err(ParseError::invalid(argv));
+    };
+    Ok(SpaceOperation::Focus(SpaceSelector::parse(selector)?))
+}
+
 impl Command {
     /// The argv encoding of this command, as understood by [`parse_command`].
     ///
@@ -163,6 +171,9 @@ impl Command {
             }
             Command::Mouse(MouseMove::ToNextDisplay) => {
                 vec!["mouse".to_string(), "nextdisplay".to_string()]
+            }
+            Command::Space(SpaceOperation::Focus(selector)) => {
+                vec!["space".to_string(), "focus".to_string(), selector.token()]
             }
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
@@ -289,6 +300,9 @@ mod tests {
             Command::Restart,
             Command::PrintState,
             Command::Mouse(MouseMove::ToNextDisplay),
+            Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+            Command::Space(SpaceOperation::Focus(SpaceSelector::Previous)),
+            Command::Space(SpaceOperation::Focus(SpaceSelector::Number(3))),
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),
@@ -321,5 +335,7 @@ mod tests {
         assert!(parse_command(&["window", "follow", "on", "extra"]).is_err());
         assert!(parse_command(&["window", "movefloat", "3"]).is_err());
         assert!(parse_command(&["window", "cyclefloat", "backwards"]).is_err());
+        assert!(parse_command(&["space", "focus", "0"]).is_err());
+        assert!(parse_command(&["space", "focus", "next", "extra"]).is_err());
     }
 }

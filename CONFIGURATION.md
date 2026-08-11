@@ -24,6 +24,7 @@ General behavior settings for the window manager.
 | :--- | :--- | :--- | :--- |
 | `focus_follows_mouse` | Boolean | `true` | If enabled, the window under the mouse cursor will automatically gain focus. |
 | `mouse_follows_focus` | Boolean | `true` | If enabled, the mouse cursor will warp to the center of the focused window when focus changes via keyboard. |
+| `skip_native_space_switch_animation` | Boolean | `false` | If enabled, focusing a window on another native macOS Space posts a high-velocity Dock gesture to skip the transition animation. This works with SIP enabled. On another display, the cursor moves to that display so the gesture targets the correct Space. |
 | `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
@@ -177,6 +178,42 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 [bindings]
 window_focus_west = "cmd - h"
 window_resize = ["alt - r", "ctrl - r"]
+```
+
+### Native macOS Spaces (Experimental)
+
+Native Spaces use their one-based global Mission Control order across all
+displays. Relative selection does not wrap: `next` on the last Space and
+`prev` on the first Space do nothing. These explicit commands always use the
+instant native Space transition, independently of
+`skip_native_space_switch_animation`. They also support empty Spaces.
+
+When a target Space is already visible on another display, Paneru activates
+that display. Otherwise, it moves the cursor to the target display before
+posting the Space gesture. Commands are ignored while Mission Control is open
+or a prior instant transition is still pending.
+
+| Action | Description |
+| :--- | :--- |
+| `space_focus_next` | Focus the next native macOS Space. |
+| `space_focus_prev` / `_previous` | Focus the previous native macOS Space. |
+| `space_focus_<number>` | Focus a native Space by global Mission Control number. |
+
+**Example:**
+```toml
+[bindings]
+space_focus_next = "ctrl - right"
+space_focus_prev = "ctrl - left"
+space_focus_1 = "ctrl - 1"
+space_focus_2 = "ctrl - 2"
+space_focus_3 = "ctrl - 3"
+```
+
+**Example command line:**
+```shell
+$ paneru send-cmd space focus next
+$ paneru send-cmd space focus prev
+$ paneru send-cmd space focus 3
 ```
 
 ### Virtual workspaces (Experimental)

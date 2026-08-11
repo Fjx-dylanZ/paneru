@@ -73,6 +73,33 @@ pub(crate) fn apply_config_side_effects(
     }
 }
 
+fn focus_window_workspace_if_configured(
+    window_id: WinID,
+    app: &Application,
+    config: &Config,
+    mission_control_active: bool,
+    window_manager: &WindowManager,
+    global_state: &mut GlobalState,
+) {
+    if mission_control_active
+        || !config.skip_native_space_switch_animation()
+        || !global_state.should_begin_instant_space_switch(window_id)
+    {
+        return;
+    }
+
+    match window_manager.focus_window_workspace(window_id, app.psn()) {
+        Ok(Some(workspace_id)) => {
+            global_state.begin_instant_space_switch(window_id);
+            debug!(window_id, workspace_id, "posted instant Space switch");
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(window_id, "instant Space switch unavailable: {err}");
+        }
+    }
+}
+
 /// Handles the event when an application switches to the front. It updates the focused window and PSN.
 ///
 /// # Arguments
@@ -83,12 +110,15 @@ pub(crate) fn apply_config_side_effects(
 /// * `focused_window` - A query for the focused window.
 /// * `focus_follows_mouse_id` - The resource to track focus follows mouse window ID.
 /// * `commands` - Bevy commands to trigger events and manage components.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
     applications: Query<&Application>,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
+    config_options: Res<Config>,
+    mission_control_active: Res<MissionControlActive>,
     mut commands: Commands,
 ) {
     const FRONT_SWITCH_RETRY_SEC: u64 = 2;
@@ -131,6 +161,14 @@ pub(super) fn front_switched_trigger(
                 config.set_skip_reshuffle(false);
                 config.set_ffm_flag(None);
             }
+            focus_window_workspace_if_configured(
+                focused_id,
+                app,
+                &config_options,
+                mission_control_active.0,
+                &window_manager,
+                &mut config,
+            );
             commands.trigger(SendMessageTrigger(Event::WindowFocused {
                 window_id: focused_id,
             }));
@@ -203,6 +241,7 @@ pub(super) fn theme_change_trigger(
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
@@ -210,7 +249,9 @@ pub(super) fn window_focused_trigger(
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
-    global_state: GlobalState,
+    mission_control_active: Res<MissionControlActive>,
+    window_manager: Res<WindowManager>,
+    mut global_state: GlobalState,
     mut ctx: WindowCtx,
 ) {
     const STRAY_FOCUS_RETRY_SEC: u64 = 2;
@@ -258,6 +299,15 @@ pub(super) fn window_focused_trigger(
         if app.focused_window_id().is_ok_and(|id| id != window_id) {
             continue;
         }
+
+        focus_window_workspace_if_configured(
+            window_id,
+            app,
+            &ctx.config,
+            mission_control_active.0,
+            &window_manager,
+            &mut global_state,
+        );
 
         let managed = ctx
             .windows

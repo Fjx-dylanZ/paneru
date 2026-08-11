@@ -20,7 +20,9 @@ use tracing::{error, info, warn};
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 #[cfg(test)]
-use crate::commands::{Direction, MoveFocus, Operation, ResizeDirection};
+use crate::commands::{
+    Direction, MoveFocus, Operation, ResizeDirection, SpaceOperation, SpaceSelector,
+};
 use crate::{
     commands::Command,
     manager::ProcessApi,
@@ -801,6 +803,14 @@ impl Config {
         self.options().mouse_follows_focus.is_none_or(|mff| mff)
     }
 
+    /// Returns whether native Space changes triggered by window focus should
+    /// use an instant synthetic gesture. Disabled by default.
+    pub fn skip_native_space_switch_animation(&self) -> bool {
+        self.options()
+            .skip_native_space_switch_animation
+            .is_some_and(|skip| skip)
+    }
+
     pub fn horizontal_mouse_warp_offset(&self) -> i32 {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
     }
@@ -1055,6 +1065,9 @@ pub struct MainOptions {
     pub focus_follows_mouse: Option<bool>,
     /// Enables or disables mouse follows focus behavior.
     pub mouse_follows_focus: Option<bool>,
+    /// Skips the native macOS Space-switch animation when a window on another
+    /// Space gains focus. Requires accessibility permission.
+    pub skip_native_space_switch_animation: Option<bool>,
     /// Warps the mouse to the closest screen when at the edge.
     pub horizontal_mouse_warp: Option<i16>,
     /// Vertical pixel offset applied to the warp landing position, signed by
@@ -1938,6 +1951,47 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
 }
 
 #[test]
+fn test_config_parsing_native_space_bindings() {
+    let input = r#"
+[options]
+
+[bindings]
+space_focus_next = "cmd - n"
+space_focus_prev = "cmd - p"
+space_focus_3 = "cmd - 3"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("Failed to parse config"),
+        )),
+    };
+    let find_key = |key| {
+        virtual_keycode()
+            .find_map(|(name, code)| (format!("{key}") == *name).then_some(*code))
+            .unwrap()
+    };
+
+    assert!(matches!(
+        config.find_keybind(find_key('n'), Modifiers::CMD),
+        Some(Command::Space(SpaceOperation::Focus(SpaceSelector::Next)))
+    ));
+    assert!(matches!(
+        config.find_keybind(find_key('p'), Modifiers::CMD),
+        Some(Command::Space(SpaceOperation::Focus(
+            SpaceSelector::Previous
+        )))
+    ));
+    assert!(matches!(
+        config.find_keybind(find_key('3'), Modifiers::CMD),
+        Some(Command::Space(SpaceOperation::Focus(
+            SpaceSelector::Number(3)
+        )))
+    ));
+}
+
+#[test]
 fn test_parse_resize_commands() {
     assert!(matches!(
         parse_command(&["window", "resize"]).unwrap(),
@@ -1963,6 +2017,29 @@ fn test_parse_restart_command() {
         parse_command(&["restart"]).unwrap(),
         Command::Restart
     ));
+}
+
+#[test]
+fn test_parse_native_space_focus_commands() {
+    assert!(matches!(
+        parse_command(&["space", "focus", "next"]).unwrap(),
+        Command::Space(SpaceOperation::Focus(SpaceSelector::Next))
+    ));
+    assert!(matches!(
+        parse_command(&["space", "focus", "prev"]).unwrap(),
+        Command::Space(SpaceOperation::Focus(SpaceSelector::Previous))
+    ));
+    assert!(matches!(
+        parse_command(&["space", "focus", "previous"]).unwrap(),
+        Command::Space(SpaceOperation::Focus(SpaceSelector::Previous))
+    ));
+    assert!(matches!(
+        parse_command(&["space", "focus", "3"]).unwrap(),
+        Command::Space(SpaceOperation::Focus(SpaceSelector::Number(3)))
+    ));
+    assert!(parse_command(&["space", "focus", "0"]).is_err());
+    assert!(parse_command(&["space", "focus"]).is_err());
+    assert!(parse_command(&["space", "focus", "next", "extra"]).is_err());
 }
 
 #[test]

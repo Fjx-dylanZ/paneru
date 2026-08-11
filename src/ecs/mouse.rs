@@ -101,6 +101,11 @@ fn mouse_moved_trigger(
             continue;
         };
 
+        if global_state.suppress_focus_follows_mouse() {
+            trace!("mouse moved suppressed during instant Space switch");
+            continue;
+        }
+
         if config
             .mouse_resize_modifier()
             .is_some_and(|modifier| modifier.matches(*modifiers))
