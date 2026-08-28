@@ -304,6 +304,11 @@ pub struct Scrolling {
     pub position: f64,
     /// When true, the user's fingers are on the trackpad.
     pub is_user_swiping: bool,
+    /// True when the active gesture will emit an explicit [`Event::TouchpadUp`].
+    ///
+    /// A quiet interval cannot end this gesture because the fingers may still
+    /// be resting on the trackpad.
+    pub awaiting_touchpad_up: bool,
     /// Last time a physical swipe event was received.
     pub last_event: Duration,
 }

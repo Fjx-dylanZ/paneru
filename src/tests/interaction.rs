@@ -556,9 +556,26 @@ fn test_sliver_smaller_than_edge_padding() {
         .run(commands);
 }
 
+fn perform_trackpad_swipe(harness: &mut TestHarness, delta: f64) {
+    let world = harness.world();
+    world.write_message(Event::TouchpadDown);
+    world.write_message(Event::Swipe { delta, fingers: 3 });
+    world.write_message(Event::TouchpadUp);
+    harness.advance(Duration::from_secs(1));
+}
+
 #[test]
 fn test_scrolling() {
-    let commands = vec![
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::Last)),
@@ -569,22 +586,30 @@ fn test_scrolling() {
         Event::Command {
             command: Command::PrintState,
         },
-        // A single event's delta is a fraction of the viewport travelled in
-        // one frame, and the gesture velocity it produces is `delta / dt`.
-        // 0.04 over a 20ms frame is two viewport widths per second — a brisk
-        // but ordinary swipe, which is the regime this test is about. An order
-        // of magnitude more and the strip simply flies into its clamp bound
-        // and every window parks off-screen at the sliver, which asserts
-        // nothing about scrolling.
-        Event::Swipe {
-            delta: 0.04,
-            fingers: 3,
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
+    ]);
 
+    {
+        let world = harness.world();
+        assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+        assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+        assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+    }
+
+    // A single event's delta is a fraction of the viewport travelled in one
+    // frame, and the gesture velocity it produces is `delta / dt`. 0.04 over
+    // a 20ms frame is two viewport widths per second — a brisk ordinary swipe.
+    perform_trackpad_swipe(&mut harness, 0.04);
+
+    // The strip has come to rest mid-scroll: still one contiguous run of
+    // 400px columns, none of them parked at an edge sliver.
+    let world = harness.world();
+    assert_window_at!(world, 0, -130, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 1, 270, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 2, 670, TEST_MENUBAR_HEIGHT);
+}
+
+#[test]
+fn swipe_delta_is_not_integrated_twice_while_fingers_are_down() {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
@@ -593,23 +618,129 @@ fn test_scrolling() {
         vec![],
     )
         .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(3)
-        .on_iteration(3, move |world, _state| {
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
-        })
-        // The strip has come to rest mid-scroll: still one contiguous run of
-        // 400px columns, none of them parked at an edge sliver.
-        .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -186, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 214, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 614, TEST_MENUBAR_HEIGHT);
-        })
-        .run(commands);
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let mut strips =
+        world.query_filtered::<(&Position, &crate::ecs::Scrolling), With<ActiveWorkspaceMarker>>();
+    let (position, scrolling) = strips.single(world).unwrap();
+
+    // 0.04 trackpad units × 1024px viewport × default 0.35 sensitivity.
+    // The constraint system rounds the resulting -14.336px to -14px.
+    assert_eq!(position.x, -14);
+    assert!(scrolling.velocity > 0.0);
+    assert!(scrolling.is_user_swiping);
+}
+
+#[test]
+fn touchpad_up_transitions_directly_to_inertia() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    let position_before_lift = {
+        let world = harness.world();
+        let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        strips.single(world).unwrap().x
+    };
+
+    harness.world().write_message(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let mut strips =
+        world.query_filtered::<(&Position, &crate::ecs::Scrolling), With<ActiveWorkspaceMarker>>();
+    let (position, scrolling) = strips.single(world).unwrap();
+
+    assert!(!scrolling.is_user_swiping);
+    assert!(scrolling.velocity > 0.0);
+    assert!(position.x < position_before_lift);
+}
+
+#[test]
+fn stationary_fingers_do_not_start_inertia() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    let position_while_moving = {
+        let world = harness.world();
+        let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        strips.single(world).unwrap().x
+    };
+
+    // No gesture deltas while the fingers remain down means they are
+    // stationary, not lifted. Wait past the idle threshold and another frame
+    // that would have integrated momentum if the gesture had ended.
+    harness.advance(Duration::from_millis(100));
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let mut strips =
+        world.query_filtered::<(&Position, &crate::ecs::Scrolling), With<ActiveWorkspaceMarker>>();
+    let (position, scrolling) = strips.single(world).unwrap();
+
+    assert_eq!(position.x, position_while_moving);
+    assert!(scrolling.velocity.abs() < f64::EPSILON);
+    assert!(scrolling.is_user_swiping);
+}
+
+#[test]
+fn phase_less_scroll_uses_idle_cleanup() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::Scroll { delta: 1.0 });
+    harness.advance(Duration::from_millis(20));
+
+    {
+        let world = harness.world();
+        let mut strips =
+            world.query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>();
+        assert!(strips.single(world).unwrap().is_user_swiping);
+    }
+
+    harness.advance(Duration::from_millis(100));
+
+    let world = harness.world();
+    let mut strips = world.query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>();
+    assert!(strips.iter(world).next().is_none());
 }
 
 #[test]
@@ -2627,7 +2758,7 @@ fn test_virtual_workspace_switch_hides_old_strip_with_animations() {
 /// the edges.
 #[test]
 fn test_stack_unstack_brings_focused_window_into_view() {
-    fn check_if_offscreen(world: &mut World, _state: MockState) {
+    fn check_if_offscreen(world: &mut World) {
         let mut q = world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
         let (_, position) = q.single(world).expect("a focused window");
 
@@ -2650,48 +2781,35 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         .into();
 
     // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
-    let harness = TestHarness::new().with_config(config).with_windows(5);
-
-    let commands = vec![
+    let mut harness = TestHarness::new().with_config(config).with_windows(5);
+    harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
-        // Swipe windows 0 and 1 off screen.
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-        // Noop to let the scroll settle.
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Stack(true)),
-        },
-        // Now swipe the stacked windows off screen again.
-        Event::Swipe {
-            delta: 0.1,
-            fingers: 3,
-        },
-        // Noop to let the scroll settle.
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Stack(false)),
-        },
-    ];
+    ]);
 
-    harness
-        .on_iteration(3, check_if_offscreen)
-        .on_iteration(4, |world, _state| {
-            // Check that both window are stacked and moved into view.
-            assert_window_at!(world, 0, 0, 20);
-            assert_window_at!(world, 1, 0, 394);
-        })
-        .on_iteration(5, check_if_offscreen)
-        .on_iteration(7, |world, _state| {
-            // Check that both window are stacked and moved into view.
-            assert_window_at!(world, 1, 0, 20);
-        })
-        .run(commands);
+    // Swipe windows 0 and 1 off screen.
+    perform_trackpad_swipe(&mut harness, 0.3);
+    check_if_offscreen(harness.world());
+
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::Stack(true)),
+    }]);
+    {
+        let world = harness.world();
+        assert_window_at!(world, 0, 0, 20);
+        assert_window_at!(world, 1, 0, 394);
+    }
+
+    // Swipe the stacked windows off screen again.
+    perform_trackpad_swipe(&mut harness, 0.1);
+    check_if_offscreen(harness.world());
+
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::Stack(false)),
+    }]);
+    assert_window_at!(harness.world(), 1, 0, 20);
 }
 
 /// A window parked on a hidden virtual row must stay parked when its app
