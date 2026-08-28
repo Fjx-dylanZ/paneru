@@ -32,7 +32,7 @@ pub struct ScrollEventsPlugin;
 ///
 /// `Time::<Virtual>` is deliberately given a 10s `max_delta` (see [`crate::ecs`])
 /// so `elapsed()` keeps tracking wall-clock across a stalled frame — the
-/// finger-lift timeout below depends on that. It is the wrong bound for
+/// finished-scroll cleanup below depends on that. It is the wrong bound for
 /// integration: a frame delayed by a blocking AX round trip would otherwise
 /// advance the strip by `velocity * dt * viewport_width` in one step and slam
 /// it into the far clamp bound. Integrate at most one 30fps frame per update,
@@ -65,9 +65,8 @@ impl Plugin for ScrollEventsPlugin {
             mission_control.is_none_or(|active| !active.0)
         };
 
-        // Only the two gesture systems are gated on an input event. The rest of
-        // the chain (inertia, snap force, integrator) must keep running after
-        // the fingers stop sending events, since that's when they take over.
+        // Only input ingestion is event-gated. Physics must continue after an
+        // explicit lift, and phase-less scroll input still needs idle cleanup.
         app.add_systems(
             Update,
             (
@@ -82,7 +81,7 @@ impl Plugin for ScrollEventsPlugin {
                     apply_snap_force,
                     scrolling_integrator,
                     apply_scrolling_constraints,
-                    swiping_timeout,
+                    handle_scrolling_idle,
                 )
                     .chain(),
             ),
@@ -106,6 +105,7 @@ fn swipe_gesture(
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
+    let mut touchpad_up = false;
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
@@ -123,6 +123,9 @@ fn swipe_gesture(
             Event::TouchpadDown => {
                 touchpad_down = true;
                 total_delta = 0.0;
+            }
+            Event::TouchpadUp => {
+                touchpad_up = true;
             }
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
@@ -142,7 +145,7 @@ fn swipe_gesture(
         }
     }
 
-    if !touchpad_down && !has_scroll_event {
+    if !touchpad_down && !touchpad_up && !has_scroll_event {
         return;
     }
 
@@ -157,6 +160,7 @@ fn swipe_gesture(
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
+        scrolling.awaiting_touchpad_up = true;
         scrolling.last_event = time.elapsed();
     }
 
@@ -186,6 +190,7 @@ fn swipe_gesture(
                 0.0
             };
             scrolling.is_user_swiping = true;
+            scrolling.awaiting_touchpad_up |= has_gesture_event;
             scrolling.last_event = time.elapsed();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
@@ -194,22 +199,30 @@ fn swipe_gesture(
                 velocity: new_velocity,
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
-                is_user_swiping: true,
+                is_user_swiping: !touchpad_up,
+                awaiting_touchpad_up: has_gesture_event && !touchpad_up,
                 last_event: time.elapsed(),
             });
         }
     }
+
+    // Gesture end must be explicit. A gap in deltas can also mean the fingers
+    // are stationary, so elapsed time cannot be used to infer a lift.
+    if touchpad_up && let Some(scrolling) = scrolling.as_mut() {
+        scrolling.is_user_swiping = false;
+        scrolling.awaiting_touchpad_up = false;
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn swiping_timeout(
+pub(super) fn handle_scrolling_idle(
     strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
     active_display: ActiveDisplay,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
+    const SCROLL_IDLE_THRESHOLD: Duration = Duration::from_millis(50);
     const MIN_VELOCITY_PX: f64 = 5.0;
     // Predicts the distance the integrator is about to move, so it has to use
     // the same bounded step the integrator does.
@@ -217,7 +230,13 @@ pub(super) fn swiping_timeout(
     let viewport_width = f64::from(active_display.bounds().width());
 
     for (entity, mut scroll) in strips {
-        if time.elapsed().abs_diff(scroll.last_event) > FINGER_LIFT_THRESHOLD {
+        if time.elapsed().abs_diff(scroll.last_event) > SCROLL_IDLE_THRESHOLD {
+            if scroll.is_user_swiping && scroll.awaiting_touchpad_up {
+                // No deltas means stationary fingers, not a completed gesture.
+                // Drop stale release velocity without starting inertia.
+                scroll.velocity = 0.0;
+                continue;
+            }
             scroll.is_user_swiping = false;
 
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
@@ -329,6 +348,12 @@ fn scrolling_integrator(
     };
 
     let scroll = &mut *strip;
+    // Gesture deltas already move `scroll.position` directly in `swipe_gesture`.
+    // Keep the derived velocity only for momentum after the fingers lift;
+    // integrating it here would apply the same movement twice.
+    if scroll.is_user_swiping {
+        return;
+    }
     if scroll.velocity.abs() > 0.0001 {
         scroll.position += scroll.velocity * dt * viewport_width * direction_modifier;
     }
