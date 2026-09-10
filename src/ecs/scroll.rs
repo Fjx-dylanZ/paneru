@@ -1,4 +1,4 @@
-use bevy::app::{App, Plugin, Update};
+use bevy::app::{App, Plugin, PostUpdate, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{With, Without};
@@ -86,6 +86,9 @@ impl Plugin for ScrollEventsPlugin {
                     .chain(),
             ),
         );
+        // Finish layout first: its last swipe frame must still snap windows
+        // rather than animate them while a workspace is being deactivated.
+        app.add_systems(PostUpdate, cancel_inactive_scrolling);
     }
 }
 
@@ -153,7 +156,9 @@ fn swipe_gesture(
 
     // The user is driving the strip by hand now, so an earlier deliberate
     // placement (center, snap) no longer describes where they want it.
-    if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+    if (touchpad_down || has_scroll_event)
+        && let Ok(mut entity_commands) = commands.get_entity(*entity)
+    {
         entity_commands.try_remove::<ManualStripOffset>();
     }
 
@@ -216,18 +221,18 @@ fn swipe_gesture(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn handle_scrolling_idle(
-    strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
+    strips: Populated<(Entity, &mut Scrolling), With<ActiveWorkspaceMarker>>,
     active_display: ActiveDisplay,
     time: Res<Time>,
+    config: Res<Config>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
     const SCROLL_IDLE_THRESHOLD: Duration = Duration::from_millis(50);
-    const MIN_VELOCITY_PX: f64 = 5.0;
-    // Predicts the distance the integrator is about to move, so it has to use
-    // the same bounded step the integrator does.
-    let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
-    let viewport_width = f64::from(active_display.bounds().width());
+    // Preserve the old five-pixel cutoff at a 20ms animation step, expressed
+    // as speed so a short catch-up frame cannot discard the remaining coast.
+    const MIN_VELOCITY_PX_PER_SEC: f64 = 250.0;
+    let viewport_width = f64::from(active_display.actual_bounds(&config).width());
 
     for (entity, mut scroll) in strips {
         if time.elapsed().abs_diff(scroll.last_event) > SCROLL_IDLE_THRESHOLD {
@@ -239,7 +244,7 @@ pub(super) fn handle_scrolling_idle(
             }
             scroll.is_user_swiping = false;
 
-            if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
+            if scroll.velocity.abs() * viewport_width < MIN_VELOCITY_PX_PER_SEC
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
                 entity_commands.try_remove::<Scrolling>();
@@ -250,6 +255,19 @@ pub(super) fn handle_scrolling_idle(
                     modifiers: Modifiers::empty(),
                 }));
             }
+        }
+    }
+}
+
+fn cancel_inactive_scrolling(
+    strips: Populated<Entity, (With<Scrolling>, Without<ActiveWorkspaceMarker>)>,
+    mut commands: Commands,
+) {
+    // Finger lift is routed to the active strip, so an inactive one must not
+    // keep waiting for a release it will never receive.
+    for entity in strips {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<Scrolling>();
         }
     }
 }
@@ -280,7 +298,7 @@ fn apply_inertia(
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
-    mut strip: Single<(&LayoutStrip, &Position, &mut Scrolling)>,
+    mut strip: Single<(&LayoutStrip, &Position, &mut Scrolling), With<ActiveWorkspaceMarker>>,
     active_display: ActiveDisplay,
     windows: Windows,
     config: Res<Config>,
@@ -332,7 +350,7 @@ fn apply_snap_force(
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn scrolling_integrator(
-    mut strip: Single<&mut Scrolling, With<LayoutStrip>>,
+    mut strip: Single<&mut Scrolling, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
     time: Res<Time>,
     active_display: ActiveDisplay,
     config: Res<Config>,
@@ -370,8 +388,9 @@ fn apply_scrolling_constraints(
     let (strip, ref mut position, ref mut scroll) = *strip;
 
     let get_window_frame = |entity| windows.moving_frame(entity);
+    let requested_offset = round_px(scroll.position);
     if let Some(clamped_offset) = clamp_viewport_offset(
-        round_px(scroll.position),
+        requested_offset,
         strip,
         &windows,
         &get_window_frame,
@@ -379,7 +398,11 @@ fn apply_scrolling_constraints(
         &config,
     ) {
         position.x = clamped_offset;
-        scroll.position = f64::from(clamped_offset);
+        // Keep fractional motion until a viewport boundary actually clamps it.
+        // Rounding the accumulator each frame erases slow, short-frame inertia.
+        if clamped_offset != requested_offset {
+            scroll.position = f64::from(clamped_offset);
+        }
     } else {
         scroll.velocity = 0.0;
     }
