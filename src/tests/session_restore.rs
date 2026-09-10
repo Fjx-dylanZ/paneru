@@ -516,8 +516,9 @@ fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing(
 fn test_startup_restore_overrides_floating_config_for_matched_window() {
     let mut params = WindowParams::new(".*", Some("test".to_string()));
     params.floating = Some(true);
+    params.follow = Some(true);
     let config: Config = (MainOptions::default(), vec![params]).into();
-    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
     harness
         .app
         .world_mut()
@@ -535,6 +536,24 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
     assert!(
         world.entity(restored_window).get::<Unmanaged>().is_none(),
         "matched restore windows should not inherit floating config"
+    );
+    assert!(
+        !world
+            .entity(restored_window)
+            .contains::<crate::ecs::FollowCurrentWorkspaceMarker>(),
+        "saved tiling takes precedence over a follow rule"
+    );
+
+    let unmatched_window = find_window_entity(1, world);
+    assert!(matches!(
+        world.get::<Unmanaged>(unmatched_window),
+        Some(Unmanaged::Floating)
+    ));
+    assert!(
+        world
+            .entity(unmatched_window)
+            .contains::<crate::ecs::FollowCurrentWorkspaceMarker>(),
+        "unmatched windows still inherit the follow rule"
     );
 }
 
