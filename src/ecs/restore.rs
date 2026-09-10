@@ -17,9 +17,10 @@ use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
-use crate::ecs::workspace::PreviousStripPosition;
+use crate::ecs::workspace::{FollowSpacePending, PreviousStripPosition};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RestoreWindowState, SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FollowCurrentWorkspaceMarker, RestoreWindowState,
+    SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -481,7 +482,10 @@ pub(super) fn restore_window_state(
 
     for entity in &plan.consumed_entities {
         if let Ok(mut entity_commands) = ctx.commands.get_entity(*entity) {
-            entity_commands.try_remove::<Unmanaged>();
+            entity_commands
+                .try_remove::<Unmanaged>()
+                .try_remove::<FollowCurrentWorkspaceMarker>()
+                .try_remove::<FollowSpacePending>();
         }
     }
 
