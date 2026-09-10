@@ -42,10 +42,9 @@ use skylight::{
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
     SLSManagedDisplayGetCurrentSpace, SLSManagedDisplayIsAnimating,
     SLSSetActiveMenuBarDisplayIdentifier, SLSSpaceGetType, SLSSpaceSetFrontPSN,
-    SLSWindowIsOrderedIn,
-    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
-    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
-    SLSWindowQueryWindows,
+    SLSWindowIsOrderedIn, SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes,
+    SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID,
+    SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 

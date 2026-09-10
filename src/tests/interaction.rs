@@ -11,8 +11,7 @@ use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
     ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, ManualStripOffset,
-    MissionControlActive,
-    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
+    MissionControlActive, NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -677,6 +676,164 @@ fn touchpad_up_transitions_directly_to_inertia() {
     assert!(!scrolling.is_user_swiping);
     assert!(scrolling.velocity > 0.0);
     assert!(position.x < position_before_lift);
+}
+
+#[test]
+fn inertia_survives_switching_displays_before_finger_lift() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                2 * TEST_DISPLAY_WIDTH,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![EXT_WORKSPACE_ID],
+        );
+    for id in 100..103 {
+        harness = harness.with_workspace_window(id, EXT_WORKSPACE_ID, |window| {
+            window.frame.min.x += TEST_DISPLAY_WIDTH;
+            window.frame.max.x += TEST_DISPLAY_WIDTH;
+        });
+    }
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    // Focus crosses displays before the release reaches the input reader.
+    harness
+        .world()
+        .resource::<crate::manager::WindowManager>()
+        .focus_native_space(EXT_WORKSPACE_ID)
+        .unwrap();
+    harness.world().write_message(Event::DisplayChanged);
+    harness.mock_state.focus_window(100);
+    harness.advance(Duration::from_millis(100));
+    harness.world().write_message(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(100));
+
+    let window = find_window_entity(100, harness.world());
+    let before_swipe = harness.world().get::<Position>(window).unwrap().x;
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+    let before_lift = harness.world().get::<Position>(window).unwrap().x;
+    assert!(
+        before_lift < before_swipe,
+        "finger motion must reach the second display before testing its inertia"
+    );
+
+    harness.world().write_message(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(60));
+
+    assert!(
+        harness.world().get::<Position>(window).unwrap().x < before_lift,
+        "the second display must keep moving after finger lift without a restart"
+    );
+}
+
+#[test]
+fn inertia_survives_a_short_frame() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(8);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.world().write_message(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(60));
+
+    // A catch-up update can be much shorter than the usual animation frame.
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(1),
+        ));
+    harness.app.update();
+    let window = find_window_entity(1, harness.world());
+    let after_short_frame = harness.world().get::<Position>(window).unwrap().x;
+
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(20),
+        ));
+    harness.advance(Duration::from_millis(20));
+
+    assert!(
+        harness.world().get::<Position>(window).unwrap().x < after_short_frame,
+        "a short frame must not discard the remaining momentum"
+    );
+}
+
+#[test]
+fn inertia_accumulates_subpixel_motion() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.world().write_message(Event::Swipe {
+        delta: 0.01,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(20));
+    let window = find_window_entity(1, harness.world());
+    let before_lift = harness.world().get::<Position>(window).unwrap().x;
+
+    harness.world().write_message(Event::TouchpadUp);
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(1),
+        ));
+    // Each update moves less than half a pixel, but together they must coast.
+    for _ in 0..60 {
+        harness.advance(Duration::from_millis(20));
+    }
+
+    assert!(
+        harness.world().get::<Position>(window).unwrap().x < before_lift - 5,
+        "fractional inertia must accumulate instead of rounding away each frame"
+    );
 }
 
 #[test]
@@ -1548,6 +1705,59 @@ fn test_unfloat_after_virtual_switch_uses_active_workspace() {
             assert!(strip.contains(entity));
         })
         .run(commands);
+}
+
+#[test]
+fn ordinary_float_remains_available_across_virtual_rows() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.run(vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Nth(2))),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+    ]);
+    let original_frame = window_frame(harness.world(), 0);
+
+    // Both rows have a tiled window. The ordinary float is shared by the native
+    // Space: switching rows must neither move it nor exclude it from commands.
+    for (virtual_index, tiled_window) in [(1, 2), (0, 1)] {
+        harness.run(vec![Event::Command {
+            command: Command::Window(Operation::VirtualNumber(virtual_index)),
+        }]);
+        assert_eq!(window_frame(harness.world(), 0), original_frame);
+
+        for operation in [
+            Operation::CycleFloating(false),
+            Operation::CycleFloating(true),
+            Operation::FocusUnmanaged,
+            Operation::RaiseFloating,
+            Operation::ToggleFloatingLayer,
+        ] {
+            harness.run(vec![Event::Command {
+                command: Command::Window(Operation::FocusManaged),
+            }]);
+            assert_focused!(harness.world(), tiled_window);
+            harness.run(vec![Event::Command {
+                command: Command::Window(operation),
+            }]);
+            assert_focused!(harness.world(), 0);
+            assert_eq!(window_frame(harness.world(), 0), original_frame);
+            let world = harness.world();
+            let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+            assert_eq!(strips.single(world).unwrap().virtual_index, virtual_index);
+        }
+    }
 }
 
 #[test]
@@ -3170,6 +3380,41 @@ fn test_center_survives_repeated_focus_event() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn manual_center_survives_an_unrelated_touchpad_release() {
+    let mut harness = TestHarness::new()
+        .with_config(manual_offset_config())
+        .with_windows(4)
+        .with_focused_window(0);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+    let float = find_window_entity(3, harness.world());
+    harness
+        .world()
+        .entity_mut(float)
+        .insert(Unmanaged::Floating);
+    harness.advance(Duration::from_millis(100));
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::Center),
+    }]);
+    assert_eq!(window_x(harness.world(), 0), CENTERED_X);
+
+    harness.mock_state.focus_window(3);
+    harness.advance(Duration::from_millis(100));
+    // macOS emits a release even for gestures Paneru did not use for panning.
+    harness.world().write_message(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(20));
+    harness.mock_state.focus_window(0);
+    harness.advance(Duration::from_millis(100));
+
+    assert_eq!(
+        window_x(harness.world(), 0),
+        CENTERED_X,
+        "returning focus must retain the deliberate placement after a non-pan release"
+    );
 }
 
 /// The offset is only a claim about the layout it was taken on. Adding a window

@@ -826,7 +826,9 @@ fn command_swap_focus(
     // Floating movement is handled separately, and a successful swap must
     // not be checked again against the already-swapped layout.
     if swapped.is_none()
-        && windows.focused().is_some_and(|(_, current)| active_strip.contains(current))
+        && windows
+            .focused()
+            .is_some_and(|(_, current)| active_strip.contains(current))
     {
         // Check if the movement can swap to another display.
         let bounds = active_display.bounds();

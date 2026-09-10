@@ -6,12 +6,13 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With, Without};
+use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{
     Commands, Local, NonSend, ParamSet, Populated, Query, Res, ResMut, Single,
 };
+use bevy::math::IRect;
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -111,7 +112,11 @@ impl Plugin for WorkspaceEventsPlugin {
         app.add_systems(PostUpdate, workspace_destroyed_handler);
         app.add_systems(
             PostUpdate,
-            (queue_followed_windows, sync_followed_windows).chain(),
+            (
+                queue_followed_windows.run_if(not(resource_exists::<Initializing>)),
+                sync_followed_windows,
+            )
+                .chain(),
         );
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
@@ -299,23 +304,51 @@ fn workspace_change_handler(
     }
 }
 
-/// Queue every follower for the newly active strip. Switching Paneru virtual
-/// rows queues the same native Space and becomes an idempotent membership
-/// check; switching native Spaces updates the explicit destination.
+type ChangedFollowers<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<FollowCurrentWorkspaceMarker>,
+        Or<(Added<FollowCurrentWorkspaceMarker>, Changed<Unmanaged>)>,
+    ),
+>;
+
+type FollowingWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Window,
+        &'static Unmanaged,
+        &'static mut FollowSpacePending,
+        Option<&'static RepositionMarker>,
+    ),
+    With<FollowCurrentWorkspaceMarker>,
+>;
+
+/// Queue every follower for the newly active native Space, including floats
+/// that gained follow without adding `Unmanaged`, or were just deminimized.
 #[allow(clippy::needless_pass_by_value)]
 fn queue_followed_windows(
     activated: Query<(), Added<ActiveWorkspaceMarker>>,
-    added_followers: Query<(), Added<FollowCurrentWorkspaceMarker>>,
-    followers: Query<(Entity, Option<&mut FollowSpacePending>), With<FollowCurrentWorkspaceMarker>>,
+    changed_followers: ChangedFollowers,
+    followers: Query<
+        (Entity, &Window, &Unmanaged, Option<&mut FollowSpacePending>),
+        With<FollowCurrentWorkspaceMarker>,
+    >,
     active_display: ActiveDisplay,
     mut commands: Commands,
 ) {
-    if activated.is_empty() && added_followers.is_empty() {
+    if activated.is_empty() && changed_followers.is_empty() {
         return;
     }
 
     let target_space = active_display.active_strip().id();
-    for (entity, pending) in followers {
+    for (entity, window, unmanaged, pending) in followers {
+        if !matches!(unmanaged, Unmanaged::Floating) || window.is_full_screen() {
+            continue;
+        }
         if let Some(mut pending) = pending {
             pending.reset(target_space);
         } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -329,10 +362,7 @@ fn queue_followed_windows(
 /// with a small bound instead of assuming submission means completion.
 #[allow(clippy::needless_pass_by_value)]
 fn sync_followed_windows(
-    mut followers: Query<
-        (Entity, &Window, &Unmanaged, &mut FollowSpacePending),
-        With<FollowCurrentWorkspaceMarker>,
-    >,
+    mut followers: FollowingWindows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -347,8 +377,8 @@ fn sync_followed_windows(
     let now = Instant::now();
     let mut target_members = None;
 
-    for (entity, window, unmanaged, mut pending) in &mut followers {
-        if !matches!(unmanaged, Unmanaged::Floating) {
+    for (entity, window, unmanaged, mut pending, moving) in &mut followers {
+        if !matches!(unmanaged, Unmanaged::Floating) || window.is_full_screen() {
             continue;
         }
         if pending.target_space != target_space {
@@ -357,6 +387,12 @@ fn sync_followed_windows(
         if pending.confirmed || now < pending.next_retry {
             continue;
         }
+        let frame = moving.map_or_else(
+            || window.frame(),
+            |RepositionMarker(origin)| {
+                IRect::from_corners(*origin, *origin + window.frame().size())
+            },
+        );
 
         let members = target_members.get_or_insert_with(|| {
             window_manager
@@ -374,6 +410,7 @@ fn sync_followed_windows(
             reposition_follower(
                 entity,
                 window,
+                frame,
                 &active_display,
                 target_bounds,
                 &mut commands,
@@ -396,6 +433,7 @@ fn sync_followed_windows(
                 reposition_follower(
                     entity,
                     window,
+                    frame,
                     &active_display,
                     target_bounds,
                     &mut commands,
@@ -415,11 +453,11 @@ fn sync_followed_windows(
 fn reposition_follower(
     entity: Entity,
     window: &Window,
+    frame: IRect,
     active_display: &ActiveDisplay,
-    target_bounds: bevy::math::IRect,
+    target_bounds: IRect,
     commands: &mut Commands,
 ) {
-    let frame = window.frame();
     if !active_display.bounds().intersect(frame).is_empty() {
         return;
     }
@@ -1249,19 +1287,26 @@ fn column_closest_to_center(
         .map(|(candidate, _)| candidate)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn show_active_workspace(
-    activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
+    activated: Query<Entity, Added<ActiveWorkspaceMarker>>,
     windows: Windows,
     mut workspaces: RestorableStrips,
     displays: Query<(&Display, Option<&DockPosition>)>,
     focus_markers: Query<Ref<FocusedMarker>>,
+    followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    // Run even without an activation so Ref<FocusedMarker>::is_added means
+    // this frame, not any focus change since the last workspace switch.
+    let Ok(activated) = activated.single() else {
+        return;
+    };
     let Some(workspace_id) = workspaces
         .iter()
-        .find_map(|(entity, _, strip, _, _, _)| (entity == *activated).then_some(strip.id()))
+        .find_map(|(entity, _, strip, _, _, _)| (entity == activated).then_some(strip.id()))
     else {
         return;
     };
@@ -1270,7 +1315,7 @@ pub(crate) fn show_active_workspace(
     let current_focus = windows.focused();
     let current_workspace = workspaces
         .iter_mut()
-        .filter(|(entity, _, strip, _, _, _)| strip.id() == workspace_id && *entity != *activated);
+        .filter(|(entity, _, strip, _, _, _)| strip.id() == workspace_id && *entity != activated);
 
     for (entity, mut position, strip, child, previous, moving) in current_workspace {
         let Ok((active_display, _)) = displays.get(child.parent()) else {
@@ -1308,15 +1353,15 @@ pub(crate) fn show_active_workspace(
         }
     }
 
-    let Ok((_, mut position, strip, child, previous_position, _)) = workspaces.get_mut(*activated)
+    let Ok((_, mut position, strip, child, previous_position, _)) = workspaces.get_mut(activated)
     else {
         return;
     };
-    debug!("showing virtual workspace {} ({})", strip.id(), *activated);
+    debug!("showing virtual workspace {} ({})", strip.id(), activated);
 
     // If no previous strip position exists, then the workspace was not hidden.
     if let Some(PreviousStripPosition { origin, focus }) = previous_position {
-        if let Ok(mut entity_commands) = commands.get_entity(*activated) {
+        if let Ok(mut entity_commands) = commands.get_entity(activated) {
             entity_commands.try_remove::<PreviousStripPosition>();
         }
 
@@ -1328,7 +1373,17 @@ pub(crate) fn show_active_workspace(
             .focused()
             .map(|(_, entity)| entity)
             .filter(|entity| strip.contains(*entity));
-        let keeps_focus = focused.is_some();
+        // Followers stay focused across virtual rows, including while a native
+        // Space move is awaiting confirmation. They never scroll the tiled strip.
+        let keeps_focus = focused.is_some()
+            || current_focus.is_some_and(|(window, entity)| {
+                followed.contains(entity)
+                    && !window.is_full_screen()
+                    && matches!(
+                        windows.get_managed(entity),
+                        Some((_, _, Some(Unmanaged::Floating)))
+                    )
+            });
 
         // Only a focus that arrived with this activation gets the strip moved
         // for it. A window that held focus all along - switching back from an
@@ -1357,7 +1412,7 @@ pub(crate) fn show_active_workspace(
             .unwrap_or(*origin);
 
         if config.virtual_workspace_animations() {
-            commands.reposition_entity(*activated, origin);
+            commands.reposition_entity(activated, origin);
         } else {
             position.0 = origin;
         }

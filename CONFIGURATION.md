@@ -78,6 +78,8 @@ Configure trackpad gestures and scroll-wheel window sliding.
 
 When `fingers_count` is omitted or set below 3, Paneru does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
 
+Horizontal gesture inertia starts when the fingers lift; resting them without moving does not start inertia. Switching the focused workspace or display cancels the previous strip's scroll. Modifier-scroll uses macOS-provided momentum rather than adding gesture inertia.
+
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -259,6 +261,11 @@ Logically it can be thought of several strips of windows (rows) stacked on top
 of each other within the single workspace. Similar to how Niri implements the
 movement between the vertical workspaces.
 
+Floating windows are shared across all virtual rows in the same native macOS
+Space. Switching rows moves the tiled strips, not the floating windows. Floating
+layer focus and raise commands operate on those shared floats; they are not
+automatically kept above tiled windows.
+
 Shifting up or down goes to the previous or next strip of windows - wrapping
 around at the start or the end.
 
@@ -369,10 +376,10 @@ table instead of TOML.
 
 ### Following the current workspace
 
-`follow = true` gives a window sticky-style behavior across both kinds of
-Paneru workspaces. Unlike ordinary floating windows, followed windows remain
-visible across virtual workspace rows. When the active native macOS Space
-changes, Paneru reassigns a followed window to that one Space without changing
+`follow = true` makes a floating window follow the active native macOS Space.
+Ordinary floating windows already stay visible across virtual rows within their
+native Space; following additionally moves them when the active native Space
+changes. Paneru reassigns a followed window to that one Space without changing
 focus or reapplying its grid placement.
 
 ```toml

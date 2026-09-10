@@ -243,7 +243,6 @@ pub(super) fn theme_change_trigger(
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_lines)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
