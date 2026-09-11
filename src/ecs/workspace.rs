@@ -1536,9 +1536,8 @@ fn switch_virtual_workspace_bind(
 }
 
 /// Handles the keybinding to move windows between virtual workspaces.
-/// Missing destinations are created by `handle_virtual_window_moves`. South at
-/// the last row only proceeds when `create_workspace_automatically` is on;
-/// numbered targets always may create, row 0 included.
+/// Missing destinations are created by `handle_virtual_window_moves`, even when
+/// moving the source strip's only window.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn move_virtual_workspace_bind(
     mut messages: MessageReader<Event>,
@@ -1572,9 +1571,7 @@ fn move_virtual_workspace_bind(
     let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
 
     let (target_virtual_index, move_focus) = match operation {
-        Operation::VirtualMove(Direction::South | Direction::East, move_focus)
-            if active_display.active_strip().len() > 1 =>
-        {
+        Operation::VirtualMove(Direction::South | Direction::East, move_focus) => {
             if config.create_workspace_automatically() && current_index + 1 < rows.len() {
                 (rows[current_index + 1].1.virtual_index, *move_focus)
             } else {

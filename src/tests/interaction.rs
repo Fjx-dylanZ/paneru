@@ -4541,6 +4541,63 @@ fn test_own_window_move_echo_is_ignored() {
 }
 
 #[test]
+fn test_virtual_move_single_window_to_new_and_existing_rows() {
+    fn assert_single_window_row(world: &mut World, expected: u32) {
+        let window = find_window_entity(0, world);
+        let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+        let active = strips
+            .iter(world)
+            .find_map(|(strip, active)| active.then_some(strip.virtual_index))
+            .expect("active virtual row");
+        assert_eq!(
+            active, expected,
+            "follow the window when its source is empty"
+        );
+        let membership = strips
+            .iter(world)
+            .filter_map(|(strip, _)| strip.contains(window).then_some(strip.virtual_index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            membership,
+            vec![expected],
+            "move, rather than copy, the window"
+        );
+        assert_focused!(world, 0);
+    }
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(1, |world, _| assert_single_window_row(world, 1))
+        .on_iteration(2, |world, _| assert_single_window_row(world, 0))
+        .on_iteration(3, |world, _| assert_single_window_row(world, 1))
+        .on_iteration(4, |world, _| assert_single_window_row(world, 2))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            // A follow-move may create a destination for the only window.
+            Event::Command {
+                command: Command::Window(Operation::VirtualMove(
+                    Direction::South,
+                    MoveFocus::Follow,
+                )),
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualMove(
+                    Direction::North,
+                    MoveFocus::Follow,
+                )),
+            },
+            // Sending into an existing row follows when the source becomes empty.
+            Event::Command {
+                command: Command::Window(Operation::VirtualMove(Direction::South, MoveFocus::Stay)),
+            },
+            // The same fallback applies when sending to a newly created row.
+            Event::Command {
+                command: Command::Window(Operation::VirtualMove(Direction::East, MoveFocus::Stay)),
+            },
+        ]);
+}
+
+#[test]
 fn test_virtual_directions_first_last_east_west() {
     use crate::config::{Config, MainOptions};
 

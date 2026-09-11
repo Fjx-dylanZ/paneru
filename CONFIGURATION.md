@@ -37,7 +37,7 @@ General behavior settings for the window manager.
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` (and their `window_vertical_*` counterparts) stop at the largest/smallest preset instead of cycling back. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
-| `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
+| `reap_empty_workspaces` | Boolean | `false` | On virtual workspace switches, remove empty inactive rows in the same native Space. The active row and row 1 are always kept; surviving rows retain their numbers. |
 | `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a window into a tab group with an existing same-app sibling that shares its frame. Merging happens when the window is created, and again for a background tab that the window server stops showing while a sibling of the same app holds the same frame — an app that hides its old tab a moment late would otherwise leave a column nothing can appear in. Use this if you find unrelated windows being grouped together. |
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
@@ -286,22 +286,29 @@ Space. Switching rows moves the tiled strips, not the floating windows. Floating
 layer focus and raise commands operate on those shared floats; they are not
 automatically kept above tiled windows.
 
-Shifting up or down goes to the previous or next strip of windows - wrapping
-around at the start or the end.
+Shifting up or down goes to the previous or next strip of windows, without
+wrapping. South can create a new row at the end when
+`create_virtual_workspace_automatically = true`.
 
-Moving the last window out of the virtual row, will "collapse it".
+Moving a row's only window to another virtual row is supported. `virtualsend`
+and `virtualsendnum` normally stay on the source row, but follow the window if
+there is no source neighbour left.
+
+Empty rows are retained by default. Set `[options] reap_empty_workspaces = true`
+to remove empty inactive rows when switching virtual workspaces. The current
+row and row 1 are kept, and surviving rows are not renumbered.
 
 Virtual workspaces can also be navigated using trackpad gestures. If `[swipe.gesture]` is configured, a vertical 3/4-finger swipe will switch between virtual workspace rows, while horizontal swipes continue to scroll the strip as usual. For mouse users, see the `vertical_modifier` option under `[swipe.scroll]`.
 
 | Action | Description |
 | :--- | :--- |
-| `window_virtual_north` / `_south` / `_first` / `_last` | Switch to the previous/next or first/last virtual workspace (row of windows), unconditionally. `_east` or `_west` are aliases for `_north` and `_south`. |
+| `window_virtual_north` / `_south` / `_first` / `_last` | Switch to the previous/next or first/last virtual workspace (row of windows), unconditionally. `_east` aliases `_south`; `_west` aliases `_north`. |
 | `window_virtualfocus_north` / `_south` | Like `window_virtual_north`/`_south`, but if the focused window is in a stack and has a neighbor above/below, focuses that neighbor instead of switching — the same within-column traversal as `window_focus_north`/`_south`. Only switches the virtual workspace once there's nothing left to focus that way. No `_east`/`_west`/`_first`/`_last` form (there's no "focus" reading to pair with those). |
 | `window_virtualnum_<number>` | Switch directly to the numbered virtual workspace. |
-| `window_virtualmove_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace and follow it. `_east` or `_west` are aliases for `_north` and `_south`. |
-| `window_virtualsend_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace but stay on the current one. `_east` or `_west` are aliases for `_north` and `_south`. |
+| `window_virtualmove_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace and follow it. `_east` aliases `_south`; `_west` aliases `_north`. |
+| `window_virtualsend_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace but stay on the current one unless no source neighbour remains. `_east` aliases `_south`; `_west` aliases `_north`. |
 | `window_virtualmovenum_<number>` | Move currently focused window to the numbered virtual workspace and follow it. |
-| `window_virtualsendnum_<number>` | Move currently focused window to the numbered virtual workspace but stay on the current one. |
+| `window_virtualsendnum_<number>` | Move currently focused window to the numbered virtual workspace but stay on the current one unless no source neighbour remains. |
 
 
 **Example:**
