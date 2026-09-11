@@ -18,7 +18,12 @@ use crate::{
     ecs::{
         ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
         Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        ResizeMarker, Scrolling, Unmanaged, WidthRatio,
+        layout::LayoutStrip,
+        native_spaces::{
+            NativeSpaceCreatePending, NativeSpaceDestroyPending, NativeSpacePlacementPending,
+            SpaceMovePending,
+        },
         workspace::FollowSpacePending,
     },
     manager::{Application, Display, Origin, Size, Window},
@@ -238,12 +243,17 @@ pub struct FrameActivity<'w, 's> {
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     space_switch: Res<'w, InstantSpaceSwitch>,
     following: Query<'w, 's, (), With<FollowSpacePending>>,
+    creating: Query<'w, 's, (), With<NativeSpaceCreatePending>>,
+    placing: Query<'w, 's, (), With<NativeSpacePlacementPending>>,
+    destroying: Query<'w, 's, (), With<NativeSpaceDestroyPending>>,
+    moving: Query<'w, 's, (), With<SpaceMovePending>>,
 }
 
 impl FrameActivity<'_, '_> {
     /// Returns `true` while any window is being moved, resized or scrolled, a
-    /// flash message is on screen, or a native Space switch or follower move
-    /// is awaiting confirmation — i.e. while the pump must keep waking.
+    /// flash message is on screen, or a native Space switch, follower move,
+    /// Desktop creation/placement/destruction or explicit window move is
+    /// awaiting confirmation — i.e. while the pump must keep waking.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
@@ -251,6 +261,10 @@ impl FrameActivity<'_, '_> {
             || !self.flash_messages.is_empty()
             || self.space_switch.is_pending()
             || !self.following.is_empty()
+            || !self.creating.is_empty()
+            || !self.placing.is_empty()
+            || !self.destroying.is_empty()
+            || !self.moving.is_empty()
     }
 }
 

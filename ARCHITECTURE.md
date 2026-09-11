@@ -38,6 +38,19 @@ The embedded scripting runtime is the one deliberate exception to "everything in
 
 This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches the world only through an `extract` callback, which on the main thread is a direct query and on the worker is that round-trip.
 
+### Native Space Requests
+
+Desktop creation and destruction and explicit window moves between native Spaces (`space create` / `space destroy` / `window spacemove` / `window spacesend`) cross the same boundary in the other direction, and the window server applies them asynchronously. The design keeps that asynchrony visible instead of papering over it:
+
+- **Main-thread ABI bridge:** `src/manager/native_spaces.rs` drives the private SkyLight `WMBridge` operation objects. Every ABI is validated from the Objective-C method type encodings before a call, census reads fail closed on any structural surprise, and mutations run only on the process main thread in an unlocked console session. The module only *submits*: a failure after the first perform is reported as "may have applied", and the ID a synchronous create hands back is a receipt to confirm, not a confirmation.
+- **Small pending Components:** `src/ecs/native_spaces.rs` records each accepted request on its own entity or on the moving window (`NativeSpaceCreatePending`, `NativeSpaceDestroyPending`, `NativeSpacePlacementPending`, `SpaceMovePending`). One native request is in flight at a time; a new one is refused, not queued, while any of them is still being confirmed.
+- **Asynchronous confirmation:** `Update` systems observe each pending on `Time` every `NATIVE_CHECK_INTERVAL` (50 ms) against a fresh Space census and per-window membership reads, bounded by `NATIVE_REQUEST_TIMEOUT` (2 s). The layout is rewritten only once the native state shows the request applied; a move is confirmed only when its whole batch (native tab group and associated windows) has landed.
+- **Truthful partial results:** a request that fails or times out after submission is reconciled against what the window server actually reports rather than assumed unmoved, and is never treated as complete or resubmitted. What could not be observed keeps its last known layout; nothing is floated, rowed or focused by guess, and a failed census read says nothing either way.
+- **Actual display ownership:** a new Desktop's row 0 is spawned under the display the census says owns it, never under the active display by assumption. The OS `SpaceCreated`/`SpaceDestroyed` notifications go through the same observers, so a Space the census cannot vouch for yet waits (bounded) instead of being placed by guess.
+- **Change-driven cleanup:** a row a destroyed Space keeps for windows whose new Space was never observed is tagged `DestroyedSpaceMarker` and reaped by `reap_destroyed_space_rows` only when such a row is added or its `LayoutStrip` changes — never by a periodic scan.
+
+The public `send-cmd` path is fire-and-forget: an accepted dispatch is not native completion, and refused or partially applied requests are logged rather than surfaced to the client.
+
 ## 3. Crate & Module Map
 
 | Directory / Module | Responsibility Statement |
@@ -51,13 +64,15 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 | `src/ecs/scroll.rs` | Input handling for trackpad swipe gestures, inertia, and snapping. |
 | `src/ecs/focus.rs` | Focus management logic, including focus-follows-mouse and mouse-follows-focus. |
 | `src/ecs/state.rs` | Persistence of window layout and workspace state across restarts. |
+| `src/ecs/native_spaces.rs` | Native Desktop creation/destruction and explicit `spacemove`/`spacesend` moves: submits one request per tick, records it on a pending component, and confirms it against the native census before touching the layout; also reconciles OS `SpaceCreated`/`SpaceDestroyed` notifications. |
 | `src/manager/` | OS-agnostic traits (`WindowApi`, `ProcessApi`) and their macOS implementations (`WindowOS`). |
+| `src/manager/native_spaces.rs` | The main-thread SkyLight `WMBridge` bridge: ABI-validated create/destroy/move/activate submissions, fail-closed Space census and window-membership reads, and the `paneru query native-spaces` census. |
 | `src/platform/` | Low-level macOS FFI, event loop integration, and workspace/input hooks. |
 | `src/config/` | Configuration parsing, validation, and hot-reloading logic. |
 | `src/commands.rs` | Implementation of CLI subcommands. |
 | `src/client.rs` | The CLI side of the IPC protocol, and the only place JSON is produced. |
 | `src/reader.rs` | The daemon side: owns the Mach service and turns requests into events. |
-| `crates/mach_ipc` | Typed channels over Mach ports; the transport itself. Async and blocking spellings of each operation, on `SendPort`/`RecvPort`. |
+| `crates/shared_types` | The wire protocol (`wire.rs`: `Request`, `Response`, `QueryPayload`), command and state types shared by the daemon, the CLI and the Lua crate. The transport itself is the external `async-mach-ports` crate. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
 
 ## 4. Key Data Entities
@@ -74,6 +89,9 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 - **`NativeFullscreenMarker`**: Marks a window that is in macOS native fullscreen mode.
 - **`Unmanaged`:** An enum identifying windows that are `Floating`, `Minimized`, or `Hidden`.
 - **`RepositionMarker` / `ResizeMarker`**: Used to signal that a window needs to be moved or resized.
+- **`NativeSpaceCreatePending` / `NativeSpaceDestroyPending` / `NativeSpacePlacementPending`:** One submitted or OS-announced native Space change awaiting census confirmation, each on its own entity.
+- **`SpaceMovePending`:** An explicit native Space move in flight, carried by the leader window of the travelling tab group.
+- **`DestroyedSpaceMarker`:** A row of a Space the census no longer lists, kept only for windows whose new Space was not observed; reaped once empty.
 
 ### Resources
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
@@ -90,6 +108,7 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
 - **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
 - **Reactive Power Saving:** Systems should use Bevy's reactive scheduling to avoid CPU usage when no windows are moving or events are occurring.
+- **Native Requests Are Submissions:** A native Space create, destroy or move is confirmed from a later census or membership read, never from the submission's return value. Nothing is retried, rolled back, or laid out on the strength of an unobserved outcome.
 
 ## 6. Session Restore
 
@@ -130,7 +149,7 @@ graph TD
     F -->|Set RepositionMarker| E
     E -->|PostUpdate| G(commit_window_position)
     G -->|FFI Call| A
-    H[CommandReader] -->|Unix Socket| C
+    H[CommandReader] -->|Mach request / event channel| C
     S[PaneruState file] -->|Startup load| R(session restore)
     R -->|Rebuild saved strips| E
     E -->|Periodic / exit save| S
@@ -141,5 +160,6 @@ graph TD
 1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
 2.  **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
 3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers restore planning, missing-window compaction, startup grace behavior, config precedence, virtual workspace restoration, and multi-display fallback.
-4.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
-5.  **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.
+4.  **Native Space Tests:** `src/tests/native_spaces.rs` drives creation, destruction and explicit moves against the mock window server's outcome controls and a manual clock: late, lost or refused confirmations, partial batches, follower interplay, multi-display ownership, and the bounded waits. Multi-display behavior is verified only here; live verification has covered ordinary single-display Desktops.
+5.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
+6.  **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.

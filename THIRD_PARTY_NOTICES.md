@@ -26,8 +26,9 @@ SOFTWARE.
 
 ## native-space-kit
 
-Native Space movement and activation in `src/manager/native_spaces.rs` are ported
-from [native-space-kit](https://github.com/Fjx-dylanZ/native-space-kit).
+Native Space lifecycle, activation and window movement in
+`src/manager/native_spaces.rs` are ported from
+[native-space-kit](https://github.com/Fjx-dylanZ/native-space-kit).
 
 Copyright (c) 2026 native-space-kit contributors
 

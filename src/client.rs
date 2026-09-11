@@ -44,7 +44,22 @@ pub async fn send_command(argv: impl IntoIterator<Item = String>) -> Result<()> 
 ///
 /// If the daemon cannot be reached or answers with a failure.
 pub async fn query(kind: StateQueryKind) -> Result<String> {
-    let response: Response = connect()?.call(&Request::Query(kind)).await?;
+    query_json(&Request::Query(kind)).await
+}
+
+/// Asks for the native Space census and prints it as JSON.
+///
+/// # Errors
+///
+/// If the daemon cannot be reached or answers with a failure, including a
+/// census the daemon could not read from the OS.
+pub async fn native_spaces() -> Result<String> {
+    query_json(&Request::NativeSpaces).await
+}
+
+/// Sends a request answered with a [`QueryPayload`] and renders the answer.
+async fn query_json(request: &Request) -> Result<String> {
+    let response: Response = connect()?.call(request).await?;
 
     match response {
         Response::Query(payload) => render(&payload),
@@ -130,6 +145,10 @@ pub fn run(command: ClientCommand) -> Result<()> {
                 println!("{}", query(kind).await?);
                 Ok(())
             }
+            ClientCommand::NativeSpaces => {
+                println!("{}", native_spaces().await?);
+                Ok(())
+            }
             ClientCommand::ScriptState(request) => {
                 println!("{}", script_state(request).await?);
                 Ok(())
@@ -145,6 +164,8 @@ pub fn run(command: ClientCommand) -> Result<()> {
 pub enum ClientCommand {
     Send(Vec<String>),
     Query(StateQueryKind),
+    /// The native Space census, which is not part of the state document.
+    NativeSpaces,
     ScriptState(ScriptStateRequest),
     Subscribe,
 }

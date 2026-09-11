@@ -44,6 +44,7 @@ pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
 pub mod mouse;
+pub mod native_spaces;
 pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
@@ -96,6 +97,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
+    // Native Space lifecycle and explicit moves ride along here rather than
+    // in `setup_bevy_app` so the mock harness, which composes the same
+    // registration functions, drives them too.
+    app.add_plugins(native_spaces::NativeSpacesPlugin);
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 

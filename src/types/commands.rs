@@ -289,6 +289,13 @@ pub enum Operation {
     /// Copies a `[windows]` configuration rule for the focused window to the
     /// clipboard.
     CopyRule,
+    /// Moves the focused window (with its native tab group and associated
+    /// windows) to another native macOS Space. `Follow` activates the
+    /// destination Space and focuses the moved window once the move and the
+    /// activation are confirmed; `Stay` leaves the current Space active even
+    /// when the window was the last one on it. Tiled windows stay tiled and
+    /// floating windows stay floating.
+    SpaceMove(SpaceSelector, MoveFocus),
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -343,6 +350,17 @@ impl SpaceSelector {
 #[serde(rename_all = "snake_case")]
 pub enum SpaceOperation {
     Focus(SpaceSelector),
+    /// Creates one ordinary Desktop on the native bridge's default display
+    /// without switching to it.
+    Create,
+    /// Destroys the selected Desktop. Refused when it is active on any
+    /// display, the last Desktop on its display, not an ordinary Desktop, or
+    /// — unless `migrate` — still holds application windows. Migration is
+    /// delegated to macOS; no window is ever closed or moved by hand.
+    Destroy {
+        selector: SpaceSelector,
+        migrate: bool,
+    },
 }
 
 /// Represents a command that can be issued to the window manager.
