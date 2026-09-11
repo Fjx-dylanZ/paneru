@@ -16,6 +16,7 @@ use objc2_core_graphics::{
     CGGetActiveDisplayList, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo,
     CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
 };
+use paneru_shared_types::state::NativeSpaceState;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
@@ -128,6 +129,40 @@ pub trait WindowManagerApi: Send + Sync {
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
     /// Returns every native macOS Space in global Mission Control order.
     fn native_spaces(&self) -> Result<Vec<WorkspaceId>>;
+    /// Returns a fresh, validated census of every native macOS Space in
+    /// global Mission Control order, empty and fullscreen Spaces included,
+    /// with its owning display, per-display index, native type and whether
+    /// it is current on its own display. Never cached; a census that cannot
+    /// be read or parsed is an error, never an empty list.
+    fn native_space_info(&self) -> Result<Vec<NativeSpaceState>>;
+    /// Creates one ordinary Desktop on the native bridge's default display
+    /// without switching to it.
+    ///
+    /// `Ok(id)` is the ID the window server handed back for the new Desktop:
+    /// nonzero and absent from the census read before the call. It is a
+    /// receipt, not a confirmation: the Desktop appears in
+    /// [`Self::native_space_info`] later, which also tells which display owns
+    /// it. `Error::NativeSpaceRequest` reports whether a failed request may
+    /// nevertheless have created a Desktop; its `workspace_id` is `0` unless
+    /// a nonzero, new ID was read, so an existing ID is never called created.
+    fn create_native_space(&self) -> Result<WorkspaceId>;
+    /// Submits the destruction of the ordinary Desktop `workspace_id`.
+    ///
+    /// Refused, before anything is submitted, when the Space is current on
+    /// its display, is its display's last ordinary Desktop, is not a Desktop,
+    /// or, unless `migrate`, hosts any normal, floating or modal application
+    /// window (minimized included; a window whose metadata cannot be read
+    /// counts as present). `migrate` lifts only that occupancy guard: macOS
+    /// migrates the windows to the current Desktop itself; no window is moved
+    /// or closed here.
+    ///
+    /// `Ok(windows)` means the request was submitted, not applied, and
+    /// returns the application windows sampled on the Space by the preflight.
+    /// Callers confirm later that the Space is gone from
+    /// [`Self::native_space_info`] and that every sampled window still has a
+    /// membership through [`Self::window_workspaces`]. An error after
+    /// submission (`request_may_have_applied`) carries no sample.
+    fn destroy_native_space(&self, workspace_id: WorkspaceId, migrate: bool) -> Result<Vec<WinID>>;
     /// Requests that `workspace_id`, including an empty Space, becomes the
     /// current Space of its owning display.
     ///
@@ -487,6 +522,18 @@ impl WindowManagerApi for WindowManagerOS {
             ));
         }
         Ok(spaces)
+    }
+
+    fn native_space_info(&self) -> Result<Vec<NativeSpaceState>> {
+        native_spaces::native_space_info(self.main_cid)
+    }
+
+    fn create_native_space(&self) -> Result<WorkspaceId> {
+        native_spaces::create_workspace(self.main_cid)
+    }
+
+    fn destroy_native_space(&self, workspace_id: WorkspaceId, migrate: bool) -> Result<Vec<WinID>> {
+        native_spaces::destroy_workspace(self.main_cid, workspace_id, migrate)
     }
 
     fn focus_native_space(&self, workspace_id: WorkspaceId) -> Result<bool> {

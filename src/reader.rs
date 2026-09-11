@@ -98,6 +98,11 @@ impl CommandReader {
                     Event::WindowSetQuery { respond_to }
                 });
             }
+            Request::NativeSpaces => {
+                answer(events, reply, "native spaces query", |respond_to| {
+                    Event::NativeSpacesQuery { respond_to }
+                });
+            }
             Request::ScriptState(request) => {
                 answer(events, reply, "script state request", move |respond_to| {
                     Event::ScriptState {

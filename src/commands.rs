@@ -20,6 +20,7 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
+use crate::ecs::native_spaces::NativeInFlight;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::workspace::FollowSpacePending;
 use crate::ecs::{
@@ -136,7 +137,11 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
     })
 }
 
-fn resolve_native_space(
+/// Resolves a native Space selector against `spaces`, the global Mission
+/// Control order, relative to `current_workspace`. Relative selectors never
+/// wrap; `None` when the current Space is unknown or the selection runs off
+/// either end.
+pub(crate) fn resolve_native_space(
     spaces: &[WorkspaceId],
     current_workspace: WorkspaceId,
     selector: SpaceSelector,
@@ -161,13 +166,19 @@ fn resolve_native_space(
 /// manager only means the request went out (or a display-focus change is
 /// owed); it is recorded on [`InstantSpaceSwitch`] and confirmed later by
 /// `confirm_native_space_focus`, which also finishes the cross-display focus.
+/// A Desktop creation, destruction or explicit window move still being
+/// confirmed refuses the switch: the census it would resolve against is in
+/// flux, and a move-and-follow owns the switch it lands with. The native
+/// request handler is ordered after this system so a request in the same
+/// frame sees the switch recorded here and is refused in turn.
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all)]
-fn command_focus_native_space(
+pub(crate) fn command_focus_native_space(
     mut messages: MessageReader<Event>,
     window_manager: Res<WindowManager>,
     mission_control: Res<MissionControlActive>,
     time: Res<Time>,
+    in_flight: NativeInFlight,
     mut instant_space_switch: ResMut<InstantSpaceSwitch>,
 ) {
     for selector in messages.read().filter_map(|event| {
@@ -189,6 +200,10 @@ fn command_focus_native_space(
                 pending = instant_space_switch.pending_target(),
                 "native Space focus is still awaiting confirmation"
             );
+            continue;
+        }
+        if let Some(reason) = in_flight.blocker(&instant_space_switch) {
+            warn!(?selector, "native Space focus refused: {reason}");
             continue;
         }
 

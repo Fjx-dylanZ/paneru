@@ -12,7 +12,7 @@ consuming these commands' output sees exactly the shapes documented here.
 
 A client written in Rust can skip the JSON entirely by using the
 `paneru-shared-types` crate: its `wire::Request` and `wire::Response` are the
-protocol, and `paneru-mach-ipc` is the transport.
+protocol, and `async-mach-ports` is the transport.
 
 All query responses are a single JSON document. `subscribe` emits
 line-delimited JSON, with one complete event object per line.
@@ -23,6 +23,7 @@ line-delimited JSON, with one complete event object per line.
 paneru query state --json
 paneru query virtual-workspaces --json
 paneru query active --json
+paneru query native-spaces --json
 ```
 
 `--json` is accepted for clarity and is the only output format, so it may be
@@ -128,6 +129,64 @@ Returns only the active display, workspace, and focused-window state.
   "focused_window_title": "paneru"
 }
 ```
+
+### `paneru query native-spaces --json`
+
+Returns a fresh census of every native macOS Space, read from the OS at query
+time. It is a separate request (`wire::Request::NativeSpaces`, answered with
+`QueryPayload::NativeSpaces`), not a slice of the state document above: the
+state document is Paneru's virtual layout, while this census is the window
+server's own list, independent of Paneru's layout and of whatever
+reconciliation is in flight, so it always lists empty and fullscreen Spaces
+whether or not Paneru holds a row for them. The `state`,
+`virtual-workspaces` and `active` shapes are unchanged by it. The embedded Lua
+`paneru.query(kind)` / `paneru.query_*` functions serve the state document
+only; this census is not available through them.
+
+```json
+[
+  {
+    "id": 4,
+    "index": 1,
+    "display": "display-a",
+    "display_index": 1,
+    "type": 0,
+    "active": true
+  },
+  {
+    "id": 4294967303,
+    "index": 2,
+    "display": "display-a",
+    "display_index": 2,
+    "type": 0,
+    "active": false
+  },
+  {
+    "id": 4294967310,
+    "index": 3,
+    "display": "display-b",
+    "display_index": 1,
+    "type": 0,
+    "active": true
+  }
+]
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `id` | number | Native Space id, the same value `native_workspace_id` carries in the state document. Stable for the Space's lifetime; not a selector. |
+| `index` | number | One-based position in global Mission Control order across all displays. This is the number `space focus <n>`, `space destroy <n>`, `window spacemove <n>` and `window spacesend <n>` select by. It shifts whenever a Space is created, destroyed or reordered. |
+| `display` | string | Opaque identifier of the display that owns the Space (shown here as `display-a`/`display-b` for illustration; the real value is whatever the window server reports). Only useful for grouping and equality; it is not the numeric CoreGraphics `display_id`. |
+| `display_index` | number | One-based position in the owning display's native Space list, non-Desktop entries (fullscreen, system) included. Not necessarily the Desktop label Mission Control shows on that display. Shifts like `index`. |
+| `type` | number | Native Space type as reported by macOS. `0` is an ordinary Desktop; only Desktops can be destroyed or receive moved windows. Other values are fullscreen or system Spaces. |
+| `active` | boolean | Whether this Space is the one currently shown on **its own** display. With several displays, one entry per display is `true`. |
+
+The array is ordered by `index`. Because native requests complete
+asynchronously (see the
+[native Spaces section](./CONFIGURATION.md#native-macos-spaces-experimental)
+of the Configuration Guide), a census read immediately after
+`send-cmd space create` or `space destroy` may still show the previous state
+or fail transiently while macOS converges; query again once it has settled.
 
 ## Fields
 

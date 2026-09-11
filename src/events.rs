@@ -210,6 +210,12 @@ pub enum Event {
     /// `paneru.windows` handler is given inside the daemon.
     WindowSetQuery { respond_to: Reply },
 
+    /// A client has asked for the native Space census: every macOS Space the
+    /// bridge sees, in global Mission Control order. Read from the OS on the
+    /// main thread, not from the virtual-layout snapshot, which has no such
+    /// data.
+    NativeSpacesQuery { respond_to: Reply },
+
     /// A client has subscribed to state events. Carries the channel they are
     /// pushed to, which outlives the request that delivered it.
     StateSubscribe {

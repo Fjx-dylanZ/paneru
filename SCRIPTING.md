@@ -170,6 +170,8 @@ These are spelled exactly as in the loadable client module (`require("paneru")`,
 
 State is gathered on demand and at most once per callback, so handlers that never query cost nothing extra. Outside a callback there is no window-manager state to read, so calling one of these at script top level raises an error; call them inside a handler or keybinding callback.
 
+The native macOS Space census is not one of these documents: `paneru query native-spaces` is a separate CLI query with no `paneru.query*` alias (see [section 7](#7-issuing-commands-panerurun--typed-verbs)).
+
 ---
 
 ## 5. Persistent State (`paneru.state`)
@@ -268,7 +270,54 @@ ws:float(id, { x = 0.1, y = 0.05, width = 0.8, height = 0.5 })
 
 ---
 
-## 7. Example: Named Scratchpads
+## 7. Issuing Commands (`paneru.run` & typed verbs)
+
+Every command a keybinding accepts can be issued from a handler. `paneru.run(cmd)` (alias `paneru.command`) takes a command string, an argv table, or a structured table; the typed tables `paneru.window.*`, `paneru.workspace.*` and `paneru.space.*` build the same commands with their arguments checked at the call site, so an unknown direction or a mistyped flag raises an error instead of quietly doing nothing:
+
+```lua
+paneru.run("window balance")
+paneru.run({ "window", "focus", 3 })
+paneru.workspace.move_window({ number = 2, follow = false })
+paneru.space.create()
+```
+
+These are spelled exactly as in the loadable client module (`require("paneru")`, see [`crates/lua`](crates/lua)), so the same helper works in either host.
+
+**Dispatch is deferred.** A command call queues the command and returns `true`; inside `init.lua` the daemon drains that queue and executes the command a frame later, and from the client module it is written to the daemon and forgotten. The return value means "queued", never "done": the call does not wait for confirmation, and a command the daemon refuses (a Desktop that cannot be destroyed, a Space request while another one is still being confirmed) is logged by the daemon, not raised in Lua.
+
+### Virtual Workspaces vs Native Spaces
+
+Two different things carry the word "workspace":
+
+- **Virtual workspaces** are Paneru's own rows within one native Space: `paneru.workspace.select{ number = 2 }`, `paneru.workspace.move_window{ number = 2, follow = false }`, `paneru.workspace.add()`, and the `ws:view` / `ws:shift` window-set methods above.
+- **Native Spaces** are macOS Spaces shown in Mission Control: `paneru.space.*`. Each call submits a request; Paneru confirms its outcome against the native census and window memberships afterwards, with a bounded wait of about two seconds per confirmation phase. Layout reconciliation follows observed native state, including truthful partial results. Creation and destruction operate only on ordinary Desktops. The full behavior and safeguards are in [CONFIGURATION.md](CONFIGURATION.md#native-macos-spaces-experimental).
+
+The native census itself is not part of the state document and has no `paneru.query*` spelling; read it from a shell with `paneru query native-spaces --json` (format in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md#paneru-query-native-spaces---json)).
+
+### `paneru.space`
+
+Every `target` is the scalar `space focus` takes: `"next"`, `"prev"` (or `"previous"`), or a positive number in **global Mission Control order** across all displays (`3` or `"3"`) — the `index` that `paneru query native-spaces` reports, not a native Space ID. `next`/`prev` do not wrap and, for `move_window`, are relative to the Space the window is actually on, which need not be the one on screen. Selecting the Space a window is already on is a no-op.
+
+| Function | Command | Behavior |
+| --- | --- | --- |
+| `paneru.space.focus(target)` | `space focus <target>` | Switch to a native Space. |
+| `paneru.space.create()` | `space create` | Create a new Desktop without switching to it. |
+| `paneru.space.destroy(target[, migrate])` | `space destroy <target> [migrate]` | Destroy a Desktop. `migrate` defaults to `false`: a Desktop that still holds application windows is refused. `true` opts into macOS's native migration; Paneru reconciles the observed memberships without closing windows or issuing a manual migration loop. |
+| `paneru.space.move_window(target[, follow])` | `window spacemove <target>` / `window spacesend <target>` | Move the focused window, with its native tab group, to a Space. `follow` defaults to `true` (switch along with it); `false` stays where you are, even when it was the last window on the current Space. |
+
+The optional flags must be real booleans: `paneru.space.destroy(3, "migrate")` and `paneru.space.move_window(2, 0)` raise rather than being coerced by Lua truthiness into "yes". Destruction is refused for the Space currently shown on any display, the last Desktop of its display, and anything that is not an ordinary Desktop; `migrate` lifts only the occupancy guard. Hidden or sticky application windows can keep an apparently empty Desktop occupied, so know what is on it before reaching for `migrate`.
+
+```lua
+paneru.bind("ctrl + alt - n",         function() paneru.space.create() end)
+paneru.bind("ctrl + shift - right",   function() paneru.space.move_window("next") end)        -- move and follow
+paneru.bind("ctrl + alt - left",      function() paneru.space.move_window("prev", false) end) -- send, stay here
+paneru.bind("ctrl + alt - x",         function() paneru.space.destroy("next") end)            -- only when empty
+paneru.bind("ctrl + alt + shift - x", function() paneru.space.destroy("next", true) end)      -- let macOS migrate
+```
+
+---
+
+## 8. Example: Named Scratchpads
 
 A worked port of xmonad's `NamedScratchpad`. A scratchpad is a window you toggle in and out of view; when not wanted, it is parked on a workspace you never look at (`stash = 9`).
 

@@ -9,15 +9,14 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, MoveFocus, Operation, SpaceOperation, SpaceSelector};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::workspace::FollowSpacePending;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker,
-    Initializing, InstantSpaceSwitch, ManualStripOffset, MissionControlActive,
-    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
+    ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, Initializing,
+    InstantSpaceSwitch, ManualStripOffset, MissionControlActive, NativeFullscreenMarker, Position,
+    Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size, Window};
+use crate::manager::{Origin, Size, Window};
 use crate::platform::{Modifiers, WinID};
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
@@ -98,6 +97,72 @@ fn native_fullscreen_transition_removes_window_from_original_strip_without_focus
             Event::SpaceChanged,
             Event::SpaceDestroyed {
                 space_id: FULLSCREEN_WORKSPACE_ID,
+            },
+        ]);
+}
+
+/// The fullscreen exit as macOS actually reports it: the window is an
+/// ordinary window on its original Desktop again, the fullscreen Space is
+/// gone from the census, and the OS announces the switch back and then the
+/// destruction. The window still returns to the slot it left.
+#[test]
+fn native_fullscreen_exit_reported_by_the_os_restores_the_window_to_its_slot() {
+    const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |_world, state| {
+            state.update_window(0, |window| {
+                window.workspace_id = FULLSCREEN_WORKSPACE_ID;
+                window.is_full_screen = true;
+            });
+            state.activate_workspace(TEST_DISPLAY_ID, FULLSCREEN_WORKSPACE_ID, true);
+        })
+        .on_iteration(1, |world, state| {
+            let fullscreen_window = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, Option<&NativeFullscreenMarker>)>();
+            assert!(strips.iter(world).any(|(strip, marker)| {
+                strip.id() == FULLSCREEN_WORKSPACE_ID
+                    && marker.is_some()
+                    && strip.contains(fullscreen_window)
+            }));
+
+            state.update_window(0, |window| window.is_full_screen = false);
+            state.remove_workspace(TEST_DISPLAY_ID, FULLSCREEN_WORKSPACE_ID);
+        })
+        .on_iteration(2, |world, state| {
+            assert_eq!(state.active_workspace(TEST_DISPLAY_ID), TEST_WORKSPACE_ID);
+            let fullscreen_window = find_window_entity(0, world);
+            let sibling_window = find_window_entity(1, world);
+            let mut strips = world.query::<&LayoutStrip>();
+
+            let original_strip = strips
+                .iter(world)
+                .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+                .expect("original strip");
+            assert!(original_strip.contains(fullscreen_window));
+            assert!(original_strip.contains(sibling_window));
+            assert_eq!(
+                original_strip
+                    .index_of(fullscreen_window)
+                    .expect("restored fullscreen window index"),
+                0
+            );
+            assert!(
+                strips
+                    .iter(world)
+                    .all(|strip| strip.id() != FULLSCREEN_WORKSPACE_ID)
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+            // The OS's own SpaceChanged and SpaceDestroyed arrive from the
+            // virtual window server during this iteration.
+            Event::Command {
+                command: Command::PrintState,
             },
         ]);
 }
@@ -414,13 +479,6 @@ fn native_space_commands_are_rejected_during_mission_control() {
         }]);
 }
 
-/// Long enough for a 50ms confirmation check to land after the virtual
-/// window server applies a request, and for the resulting commands to flush.
-const NATIVE_REACTION: Duration = Duration::from_millis(200);
-
-/// Past the 2s confirmation deadline, measured from submission.
-const NATIVE_DEADLINE: Duration = Duration::from_millis(2200);
-
 /// A single-display harness whose one window is a configured follower and
 /// whose display offers `workspaces` for the user to switch between.
 fn follower_harness(workspaces: Vec<WorkspaceId>) -> TestHarness {
@@ -437,74 +495,10 @@ fn follower_harness(workspaces: Vec<WorkspaceId>) -> TestHarness {
         .with_windows(1)
 }
 
-/// The user switches the test display to `workspace_id`, and the OS
-/// notification arrives.
-fn user_switches_native_space(harness: &mut TestHarness, workspace_id: WorkspaceId) {
-    harness
-        .mock_state
-        .activate_workspace(TEST_DISPLAY_ID, workspace_id, false);
-    harness.world().write_message(Event::SpaceChanged);
-}
-
-fn follower_move_pending(world: &mut World, id: WinID) -> bool {
-    let entity = find_window_entity(id, world);
-    world.entity(entity).contains::<FollowSpacePending>()
-}
-
-fn native_switch_pending(world: &World) -> bool {
-    world.resource::<InstantSpaceSwitch>().is_pending()
-}
-
 /// How long the pending native switch has been waiting, as the ECS sees it.
 fn switch_waited(world: &World) -> Duration {
     let now = world.resource::<Time>().elapsed();
     world.resource::<InstantSpaceSwitch>().waited(now)
-}
-
-/// The display the ECS treats as active.
-fn ecs_active_display(world: &mut World) -> u32 {
-    world
-        .query_filtered::<&Display, With<ActiveDisplayMarker>>()
-        .single(world)
-        .expect("one active display")
-        .id()
-}
-
-/// The native Spaces whose strips the ECS treats as active.
-fn ecs_active_workspaces(world: &mut World) -> Vec<WorkspaceId> {
-    world
-        .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
-        .iter(world)
-        .map(LayoutStrip::id)
-        .collect()
-}
-
-/// Configuration with the native switch opt-in and nothing else.
-fn instant_switch_config() -> Config {
-    (
-        MainOptions {
-            skip_native_space_switch_animation: Some(true),
-            ..default()
-        },
-        vec![],
-    )
-        .into()
-}
-
-/// The external display, to the right of the test display.
-fn ext_display_bounds() -> IRect {
-    IRect::new(
-        TEST_DISPLAY_WIDTH,
-        0,
-        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
-        EXT_DISPLAY_HEIGHT,
-    )
-}
-
-/// Whether `frame` sits entirely on the test display.
-fn on_test_display(frame: IRect) -> bool {
-    let test_bounds = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
-    test_bounds.contains(frame.min) && frame.max.x <= TEST_DISPLAY_WIDTH
 }
 
 /// A two-display harness whose one window, 100, is a configured follower on
@@ -528,19 +522,6 @@ fn cross_display_follower_harness() -> TestHarness {
             window.frame.min.x += TEST_DISPLAY_WIDTH;
             window.frame.max.x += TEST_DISPLAY_WIDTH;
         })
-}
-
-/// Runs startup the way production does when windows sit on Spaces that are
-/// not showing: across several frames. Windows found while `Initializing`
-/// is still present are neither focused nor requested for a native switch,
-/// so the first request is the one the test makes.
-fn start_across_frames(harness: &mut TestHarness) {
-    harness.hold_initialization();
-    harness.advance(NATIVE_REACTION);
-    harness.release_initialization();
-    harness.run(vec![Event::Command {
-        command: Command::PrintState,
-    }]);
 }
 
 /// A started single-display harness with the native switch opt-in whose
@@ -2867,15 +2848,6 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
 /// `window_swap_*` on a focused floating window moves it by `float_move_step`
 /// of the viewport (`command_move_floating`) and clamps it to the viewport
 /// edges. The tiled strip is untouched.
-fn window_frame(world: &mut World, id: i32) -> IRect {
-    let mut query = world.query::<&Window>();
-    query
-        .iter(world)
-        .find(|w| w.id() == id)
-        .expect("window not found")
-        .frame()
-}
-
 #[test]
 fn test_swap_moves_focused_floating_window() {
     let commands = vec![

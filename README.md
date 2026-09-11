@@ -297,6 +297,10 @@ $ paneru send-cmd <command> [args...]
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
 | `space focus next\|prev`   | Focus the adjacent native macOS Space without wrapping |
 | `space focus <n>`          | Focus a native Space by global Mission Control number |
+| `space create`             | Create a new native Desktop without switching to it |
+| `space destroy <next\|prev\|n> [migrate]` | Destroy an inactive, non-last native Desktop; `migrate` lets macOS move its windows |
+| `window spacemove <next\|prev\|n>` | Move the focused window to a native Space and follow it |
+| `window spacesend <next\|prev\|n>` | Send the focused window to a native Space but stay here |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
 | `printstate`               | Print the internal ECS state to the debug log    |
@@ -304,7 +308,11 @@ $ paneru send-cmd <command> [args...]
 | `restart`                  | Restart the Paneru service                         |
 
 Where `<direction>` is one of: `west`, `east`, `north`, `south`, `first`, `last`.
-Window numbers are 1-based and count columns from left to right.
+Window numbers are 1-based and count columns from left to right. Native Space
+numbers are 1-based global Mission Control order across all displays (not
+native Space ids); `next`/`prev` do not wrap. See the
+[native Spaces section](./CONFIGURATION.md#native-macos-spaces-experimental)
+of the Configuration Guide for the safeguards these commands apply.
 
 #### Examples
 
@@ -344,6 +352,25 @@ $ paneru send-cmd space focus next
 # Switch instantly to native macOS Space 3.
 $ paneru send-cmd space focus 3
 
+# Create a new native Desktop; focus stays where it is.
+$ paneru send-cmd space create
+
+# Move the focused window to native Space 2 and follow it there.
+$ paneru send-cmd window spacemove 2
+
+# Send the focused window to the previous native Space and stay here,
+# even if it was the last window on this Space.
+$ paneru send-cmd window spacesend prev
+
+# Destroy native Space 3 once it is empty and not shown on any display...
+$ paneru send-cmd space destroy 3
+
+# ...or let macOS migrate its remaining windows itself.
+$ paneru send-cmd space destroy 3 migrate
+
+# send-cmd only reports that the daemon accepted the request; confirm the
+# native result with the census query.
+$ paneru query native-spaces --json
 ```
 
 ### Querying and Subscribing to State
@@ -354,6 +381,7 @@ Paneru also exposes structured JSON state for scripts and status bars:
 $ paneru query state --json
 $ paneru query virtual-workspaces --json
 $ paneru query active --json
+$ paneru query native-spaces --json
 $ paneru subscribe --json
 ```
 

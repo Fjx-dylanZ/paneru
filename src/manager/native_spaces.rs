@@ -33,12 +33,16 @@
 //! Guarantees kept from the original:
 //!
 //! * every private ABI is validated from the Objective-C method type
-//!   encodings (class, initializer arguments, `void` perform) before a call;
+//!   encodings (class, initializer arguments, perform return, and the
+//!   `spaceID` getter of a synchronous result) before a call;
 //! * census reads fail closed on any structural surprise;
 //! * mutations run on the process main thread in an unlocked, logged-in
 //!   console session, prepare every operation object before the first write,
-//!   and only *submit* asynchronous requests. Nothing here polls or blocks:
-//!   confirmation belongs to the caller, which observes the census later;
+//!   and only *submit* requests; callers observe the census later. There is
+//!   no confirmation polling or run-loop pumping here. Desktop creation's
+//!   verified synchronous perform returns an object carrying the new ID, but
+//!   the Desktop may appear in the census later: that ID is a receipt to
+//!   confirm, not a confirmation.
 //! * native exceptions are caught at this boundary and reported as errors:
 //!   private class lookups (which may run `+resolveInstanceMethod:`),
 //!   initializers and performs all run under it.
@@ -61,21 +65,37 @@ use objc2_core_graphics::{
 };
 use tracing::trace;
 
+use paneru_shared_types::state::NativeSpaceState;
+
 use crate::errors::{Error, Result};
 use crate::platform::{ConnID, WinID, WorkspaceId};
 use crate::util::create_array;
 
-use super::skylight::{SLSCopyManagedDisplaySpaces, SLSCopySpacesForWindows};
+use super::skylight::{
+    SLSCopyManagedDisplaySpaces, SLSCopySpacesForWindows, SLSCopyWindowsWithOptionsAndTags,
+};
 
-/// The dispatch selector shared by every bridged operation. The asynchronous
-/// operations used here return `void` from it.
+/// The dispatch selector shared by every bridged operation. Asynchronous
+/// operations return `void` from it; the synchronous create returns its
+/// result object.
 const PERFORM: &CStr = c"performWithWMBridgeDelegate";
+
+/// Getter of the new Space ID on the object a synchronous create returns.
+const SPACE_ID_GETTER: &CStr = c"spaceID";
+
+/// Perform encodings: asynchronous (`void`) and synchronous (result object).
+const ASYNC: &[u8] = b"v";
+const SYNC: &[u8] = b"@";
 
 /// Native Space type of an ordinary Desktop.
 const DESKTOP: i64 = 0;
 
 /// `SLSCopySpacesForWindows` selector including parked and minimized windows.
 const WINDOW_SPACES_SELECTOR: i32 = 0x7;
+
+/// `SLSCopyWindowsWithOptionsAndTags` options listing every window on a
+/// Space, minimized and parked included.
+const SPACE_WINDOWS_OPTIONS: i32 = 0x7;
 
 const DISPLAY_IDENTIFIER_KEY: &str = "Display Identifier";
 const SPACES_KEY: &str = "Spaces";
@@ -90,33 +110,50 @@ const SESSION_SCREEN_LOCKED_KEY: &str = "CGSSessionScreenIsLocked";
 
 /// A verified `WMBridge` operation ABI. `arguments` holds one Objective-C type
 /// code per initializer argument; the initializer returns `@` and the
-/// perform selector returns `v`.
+/// perform selector returns `perform` ([`ASYNC`] or [`SYNC`]).
 #[derive(Clone, Copy)]
 struct OperationAbi {
     class: &'static CStr,
     init: &'static CStr,
     arguments: &'static [u8],
+    perform: &'static [u8],
 }
 
+const CREATE_SPACE: OperationAbi = OperationAbi {
+    class: c"SLSBridgedSpaceCreateOperation",
+    init: c"initWithOptions:values:",
+    arguments: b"I@",
+    perform: SYNC,
+};
+const DESTROY_SPACE: OperationAbi = OperationAbi {
+    class: c"SLSBridgedSpaceDestroyOperation",
+    init: c"initWithSpaceID:",
+    arguments: b"Q",
+    perform: ASYNC,
+};
 const SHOW_SPACES: OperationAbi = OperationAbi {
     class: c"SLSBridgedShowSpacesOperation",
     init: c"initWithSpaces:",
     arguments: b"@",
+    perform: ASYNC,
 };
 const HIDE_SPACES: OperationAbi = OperationAbi {
     class: c"SLSBridgedHideSpacesOperation",
     init: c"initWithSpaces:",
     arguments: b"@",
+    perform: ASYNC,
 };
 const SET_CURRENT_SPACE: OperationAbi = OperationAbi {
     class: c"SLSBridgedManagedDisplaySetCurrentSpaceOperation",
     init: c"initWithDisplayIdentifier:spaceID:",
     arguments: b"@Q",
+    perform: ASYNC,
 };
 const MOVE_WINDOWS: OperationAbi = OperationAbi {
     class: c"SLSBridgedMoveWindowsToManagedSpaceOperation",
     init: c"initWithWindows:spaceID:",
     arguments: b"@Q",
+    perform: ASYNC,
 };
 
 /// One managed Space from the `SLSCopyManagedDisplaySpaces` census.
@@ -133,11 +170,13 @@ struct SpaceRecord {
 }
 
 /// Initializer arguments for the verified operation shapes. Objects are
-/// toll-free bridged `CoreFoundation` arrays or strings.
+/// toll-free bridged `CoreFoundation` arrays, strings or dictionaries.
 #[derive(Clone, Copy)]
 enum InitArguments<'a> {
     Object(&'a CFType),
     ObjectAndSpace(&'a CFType, WorkspaceId),
+    OptionsAndValues(u32, &'a CFType),
+    Space(WorkspaceId),
 }
 
 impl InitArguments<'_> {
@@ -145,6 +184,8 @@ impl InitArguments<'_> {
         match self {
             InitArguments::Object(_) => b"@",
             InitArguments::ObjectAndSpace(..) => b"@Q",
+            InitArguments::OptionsAndValues(..) => b"I@",
+            InitArguments::Space(_) => b"Q",
         }
     }
 }
@@ -157,7 +198,13 @@ type InitWithObjectAndSpace = unsafe extern "C-unwind" fn(
     *const AnyObject,
     WorkspaceId,
 ) -> *mut AnyObject;
+type InitWithOptionsAndValues =
+    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, u32, *const AnyObject) -> *mut AnyObject;
+type InitWithSpace =
+    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, WorkspaceId) -> *mut AnyObject;
 type Perform = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
+type PerformSync = unsafe extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut AnyObject;
+type SpaceIdGetter = unsafe extern "C-unwind" fn(*mut AnyObject, Sel) -> WorkspaceId;
 
 // MARK: - Runtime ABI validation and dispatch
 
@@ -178,14 +225,14 @@ fn method_matches(class: &AnyClass, selector: Sel, result: &[u8], arguments: &[u
         })
 }
 
-/// Resolves the operation class only when both its initializer and the
-/// asynchronous perform selector match the verified ABI. Looking the methods
-/// up may run the private class's `+resolveInstanceMethod:`, so callers run
-/// this inside [`preflight`].
+/// Resolves the operation class only when both its initializer and its
+/// perform selector match the verified ABI. Looking the methods up may run
+/// the private class's `+resolveInstanceMethod:`, so callers run this inside
+/// [`preflight`].
 fn resolve_operation(abi: OperationAbi) -> Option<&'static AnyClass> {
     let class = AnyClass::get(abi.class)?;
     (method_matches(class, Sel::register(abi.init), b"@", abi.arguments)
-        && method_matches(class, Sel::register(PERFORM), b"v", b""))
+        && method_matches(class, Sel::register(PERFORM), abi.perform, b""))
     .then_some(class)
 }
 
@@ -227,6 +274,17 @@ unsafe fn init_operation(
             };
             unsafe { init(allocated, selector, object_ptr(object), space) }
         }
+        InitArguments::OptionsAndValues(options, values) => {
+            let init = unsafe {
+                std::mem::transmute::<Imp, InitWithOptionsAndValues>(objc2::ffi::objc_msgSend)
+            };
+            unsafe { init(allocated, selector, options, object_ptr(values)) }
+        }
+        InitArguments::Space(space) => {
+            let init =
+                unsafe { std::mem::transmute::<Imp, InitWithSpace>(objc2::ffi::objc_msgSend) };
+            unsafe { init(allocated, selector, space) }
+        }
     };
     // SAFETY: `init` returns a +1 reference or nil.
     unsafe { Retained::from_raw(initialized) }
@@ -251,9 +309,9 @@ fn preflight<T>(
         .ok_or_else(|| request_error(workspace_id, false, refusal.to_string()))
 }
 
-/// Performs the prepared operations in order. From the first perform on, the
-/// request may have reached the window server, so every later failure is
-/// reported with `request_may_have_applied`.
+/// Performs the prepared asynchronous operations in order. From the first
+/// perform on, the request may have reached the window server, so every later
+/// failure is reported with `request_may_have_applied`.
 fn submit(workspace_id: WorkspaceId, operations: &[Retained<AnyObject>]) -> Result<()> {
     let selector = Sel::register(PERFORM);
     // SAFETY: `resolve_operation` verified the perform selector returns void
@@ -267,6 +325,52 @@ fn submit(workspace_id: WorkspaceId, operations: &[Retained<AnyObject>]) -> Resu
         }))
     })
     .map_err(|exception| request_error(workspace_id, true, exception_message(exception)))
+}
+
+/// The `spaceID` of a synchronous create result, read only when the result's
+/// class implements the verified `Q` getter; anything else is no usable ID.
+///
+/// # Safety
+///
+/// `result` must be null or point to a live object.
+unsafe fn result_space_id(result: *mut AnyObject) -> Option<WorkspaceId> {
+    // SAFETY: the caller guarantees a null or live object pointer.
+    let class = unsafe { result.as_ref() }?.class();
+    let getter = Sel::register(SPACE_ID_GETTER);
+    if !method_matches(class, getter, b"Q", b"") {
+        return None;
+    }
+    // SAFETY: the getter encoding was validated as `Q` with no arguments.
+    let read = unsafe { std::mem::transmute::<Imp, SpaceIdGetter>(objc2::ffi::objc_msgSend) };
+    Some(unsafe { read(result, getter) })
+}
+
+/// Performs the prepared synchronous create and reads its result's Space ID
+/// inside the same autorelease pool: the result is a +0 return that the pool
+/// owns, so nothing is retained past this call. From the perform on, a
+/// Desktop may have been created; a thrown exception or an unusable result
+/// is reported as possibly applied with no known ID.
+fn submit_create(operation: &Retained<AnyObject>) -> Result<WorkspaceId> {
+    let selector = Sel::register(PERFORM);
+    // SAFETY: `resolve_operation` verified the perform selector returns an
+    // object and takes no arguments on the create operation's class.
+    let perform = unsafe { std::mem::transmute::<Imp, PerformSync>(objc2::ffi::objc_msgSend) };
+    autoreleasepool(|_| {
+        catch(AssertUnwindSafe(|| {
+            let result = unsafe { perform(Retained::as_ptr(operation).cast_mut(), selector) };
+            // SAFETY: the perform returned null or an autoreleased object that
+            // stays alive until this pool drains.
+            unsafe { result_space_id(result) }
+        }))
+    })
+    .map_err(|exception| request_error(0, true, exception_message(exception)))?
+    .ok_or_else(|| {
+        request_error(
+            0,
+            true,
+            "the native create operation returned no usable Space ID".to_string(),
+        )
+    })
 }
 
 fn request_error(
@@ -450,6 +554,29 @@ fn missing_space(workspace_id: WorkspaceId) -> Error {
     ))
 }
 
+/// Numbers a validated census for callers: 1-based global Mission Control
+/// index and 1-based index within the owning display, in census order.
+fn census_states(census: Vec<SpaceRecord>) -> Vec<NativeSpaceState> {
+    let mut states: Vec<NativeSpaceState> = Vec::with_capacity(census.len());
+    for space in census {
+        let index = states.len() + 1;
+        let display_index = states
+            .iter()
+            .filter(|state| state.display == space.display)
+            .count()
+            + 1;
+        states.push(NativeSpaceState {
+            id: space.id,
+            index,
+            display: space.display,
+            display_index,
+            kind: space.kind,
+            active: space.active,
+        });
+    }
+    states
+}
+
 // MARK: - Window model
 
 /// Native Space IDs the window belongs to. Fails closed on a null list or on
@@ -534,6 +661,76 @@ fn application_layer(layer: i64) -> bool {
     matches!(layer, 0 | 3 | 8)
 }
 
+/// Window IDs from a `SkyLight` window list. `None` on any member that is
+/// not a positive 32-bit integer, so a broken list is never mistaken for an
+/// empty Space.
+fn parse_window_ids(windows: &CFArray<CFType>) -> Option<Vec<WinID>> {
+    windows
+        .iter()
+        .map(|window| {
+            WinID::try_from(integer(&window)?)
+                .ok()
+                .filter(|window| *window > 0)
+        })
+        .collect()
+}
+
+/// Every window the window server lists on `workspace_id`, minimized and
+/// parked included. A null list is an error, not an empty Space.
+fn space_windows(connection: ConnID, workspace_id: WorkspaceId) -> Result<Vec<WinID>> {
+    let spaces = create_array(&[workspace_id], CFNumberType::SInt64Type)?;
+    let mut set_tags = 0i64;
+    let mut clear_tags = 0i64;
+    let windows = NonNull::new(unsafe {
+        SLSCopyWindowsWithOptionsAndTags(
+            connection,
+            0,
+            &raw const *spaces,
+            SPACE_WINDOWS_OPTIONS,
+            &mut set_tags,
+            &mut clear_tags,
+        )
+    })
+    .map(|windows| unsafe { CFRetained::from_raw(windows) })
+    .ok_or_else(|| {
+        Error::Generic(format!(
+            "could not inspect the windows on native Space {workspace_id}"
+        ))
+    })?;
+    // SAFETY: elements of any CF array are `CFType`s; each is type-checked.
+    parse_window_ids(unsafe { windows.cast_unchecked::<CFType>() }).ok_or_else(|| {
+        Error::Generic(format!(
+            "the window list of native Space {workspace_id} is malformed"
+        ))
+    })
+}
+
+/// The application windows (levels 0, 3, 8) among `windows`, given their
+/// levels in the same order. Missing metadata fails closed: a window that
+/// cannot be classified is never treated as absent.
+fn application_windows(windows: &[WinID], layers: &[Option<i64>]) -> Result<Vec<WinID>> {
+    let mut sampled = Vec::with_capacity(windows.len());
+    for (window_id, layer) in windows.iter().copied().zip(layers) {
+        let layer = layer.ok_or_else(|| {
+            Error::Generic(format!(
+                "window {window_id} has no window metadata; refusing to classify its native Space"
+            ))
+        })?;
+        if application_layer(layer) {
+            sampled.push(window_id);
+        }
+    }
+    Ok(sampled)
+}
+
+/// Fresh sample of the normal, floating and modal windows on `workspace_id`,
+/// minimized included.
+fn space_application_windows(connection: ConnID, workspace_id: WorkspaceId) -> Result<Vec<WinID>> {
+    let windows = space_windows(connection, workspace_id)?;
+    let layers = window_layers(&windows)?;
+    application_windows(&windows, &layers)
+}
+
 // MARK: - Operations
 
 /// Submits the verified activation sequence for `workspace_id` on the display
@@ -608,6 +805,145 @@ pub(super) fn workspace_is_active(connection: ConnID, workspace_id: WorkspaceId)
     find_space(&census, workspace_id)
         .map(|space| space.active)
         .ok_or_else(|| missing_space(workspace_id))
+}
+
+/// Fresh, validated census of every native Space in global Mission Control
+/// order, empty and fullscreen Spaces included. Never cached.
+pub(super) fn native_space_info(connection: ConnID) -> Result<Vec<NativeSpaceState>> {
+    require_main_thread("native Space queries")?;
+    read_census(connection).map(census_states)
+}
+
+/// Creates one ordinary Desktop on the bridge's default display without
+/// switching to it, through the verified synchronous create operation.
+///
+/// `Ok(id)` is the receipt the window server handed back: a nonzero ID absent
+/// from the census read before the call. The Desktop itself appears in the
+/// census later, so the caller confirms it from a later census, along with
+/// which display actually owns it. Errors after the perform report
+/// `request_may_have_applied` and never label a pre-existing ID as created:
+/// their `workspace_id` is `0` unless the returned ID was nonzero and new.
+pub(super) fn create_workspace(connection: ConnID) -> Result<WorkspaceId> {
+    require_main_thread("native Space creation")?;
+    require_unlocked_session()?;
+    let before = read_census(connection)?;
+    let class = preflight(
+        0,
+        "native Space creation is unavailable or its ABI changed",
+        || resolve_operation(CREATE_SPACE),
+    )?;
+    let values = CFDictionary::<CFString, CFType>::empty();
+    let operation = preflight(
+        0,
+        "could not initialize the native create operation",
+        || unsafe {
+            init_operation(
+                class,
+                CREATE_SPACE,
+                InitArguments::OptionsAndValues(0, &values),
+            )
+        },
+    )?;
+    let created = submit_create(&operation)?;
+    if created == 0 {
+        return Err(request_error(
+            0,
+            true,
+            "the native create operation returned Space ID 0".to_string(),
+        ));
+    }
+    if find_space(&before, created).is_some() {
+        return Err(request_error(
+            0,
+            true,
+            format!(
+                "the native create operation returned Space ID {created}, which already existed"
+            ),
+        ));
+    }
+    trace!(workspace_id = created, "submitted native Space creation");
+    Ok(created)
+}
+
+/// Submits the asynchronous destruction of the ordinary Desktop
+/// `workspace_id`. Refused before anything is submitted when the Space is
+/// current on its display, the last ordinary Desktop of its display, not a
+/// Desktop, or, unless `migrate`, hosts any normal, floating or modal window
+/// (minimized included; a window without metadata counts as present).
+/// `migrate` lifts only that occupancy guard: macOS moves the windows to the
+/// current Desktop itself; nothing here moves or closes a window.
+///
+/// `Ok(windows)` is the sample of application windows taken by the preflight,
+/// which the caller confirms later: the Space gone from the census and every
+/// sampled window a member of some other Space. It is a submission, never a
+/// confirmation. An error after the perform reports
+/// `request_may_have_applied` and carries no sample.
+pub(super) fn destroy_workspace(
+    connection: ConnID,
+    workspace_id: WorkspaceId,
+    migrate: bool,
+) -> Result<Vec<WinID>> {
+    require_main_thread("native Space destruction")?;
+    if workspace_id == 0 {
+        return Err(Error::InvalidInput(
+            "native Space ID must be nonzero".to_string(),
+        ));
+    }
+    require_unlocked_session()?;
+    let census = read_census(connection)?;
+    let target = find_space(&census, workspace_id).ok_or_else(|| missing_space(workspace_id))?;
+    if target.kind != DESKTOP {
+        return Err(Error::InvalidInput(format!(
+            "native Space {workspace_id} is not an ordinary Desktop; only Desktops may be destroyed"
+        )));
+    }
+    let desktops = census
+        .iter()
+        .filter(|space| space.display == target.display && space.kind == DESKTOP)
+        .count();
+    if desktops < 2 {
+        return Err(Error::InvalidInput(format!(
+            "native Space {workspace_id} is the last ordinary Desktop of its display; refusing to remove it"
+        )));
+    }
+    if target.active {
+        return Err(Error::InvalidInput(format!(
+            "native Space {workspace_id} is current on its display; switch to another Desktop before destroying it"
+        )));
+    }
+    let class = preflight(
+        workspace_id,
+        "native Space destruction is unavailable or its ABI changed",
+        || resolve_operation(DESTROY_SPACE),
+    )?;
+    let windows = space_application_windows(connection, workspace_id)?;
+    if !migrate && !windows.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "native Space {workspace_id} hosts {} application window(s), e.g. window {}; move them elsewhere or request migration",
+            windows.len(),
+            windows[0]
+        )));
+    }
+    let operations = preflight(
+        workspace_id,
+        "could not initialize the native destroy operation",
+        || unsafe {
+            Some([init_operation(
+                class,
+                DESTROY_SPACE,
+                InitArguments::Space(workspace_id),
+            )?])
+        },
+    )?;
+    submit(workspace_id, &operations)?;
+    trace!(
+        workspace_id,
+        display = %target.display,
+        migrate,
+        ?windows,
+        "submitted native Space destruction"
+    );
+    Ok(windows)
 }
 
 /// The single ordinary Desktop hosting `window_id`, once the window has proven
@@ -832,6 +1168,28 @@ mod tests {
     }
 
     #[test]
+    fn create_submission_never_reports_an_id_it_did_not_read() {
+        // `NSObject` does not implement the perform selector: the perform
+        // throws, so a Desktop may have been requested but no ID is known.
+        let stranger = NSObject::new().into_super();
+        let error = submit_create(&stranger).expect_err("the exception must be caught");
+        assert!(matches!(
+            error,
+            Error::NativeSpaceRequest {
+                workspace_id: 0,
+                request_may_have_applied: true,
+                ..
+            }
+        ));
+
+        // A result without the verified `spaceID` getter, or no result at
+        // all, yields no ID rather than a garbage read.
+        let plain = NSObject::new();
+        assert!(unsafe { result_space_id(Retained::as_ptr(&plain).cast_mut().cast()) }.is_none());
+        assert!(unsafe { result_space_id(std::ptr::null_mut()) }.is_none());
+    }
+
+    #[test]
     fn method_matches_requires_exact_count_return_and_argument_encodings() {
         let object = AnyClass::get(c"NSObject").expect("NSObject");
         assert!(method_matches(object, sel!(init), b"@", b""));
@@ -850,6 +1208,7 @@ mod tests {
                 class: c"PaneruMissingOperation",
                 init: c"initWithSpaces:",
                 arguments: b"@",
+                perform: ASYNC,
             })
             .is_none()
         );
@@ -985,6 +1344,76 @@ mod tests {
             ])
         };
         assert!(census(&[no_spaces]).is_none(), "missing Spaces list");
+    }
+
+    #[test]
+    fn census_states_number_spaces_globally_and_per_owning_display() {
+        let fullscreen = space(&CFNumber::new_i64(30), 4);
+        let parsed = census(&[
+            display("A", 20, &[desktop(10), desktop(20)]),
+            display("B", 30, &[fullscreen, desktop(40)]),
+        ])
+        .expect("well-formed census");
+        let states = census_states(parsed);
+        let numbered = states
+            .iter()
+            .map(|state| {
+                (
+                    state.id,
+                    state.index,
+                    state.display.as_str(),
+                    state.display_index,
+                    state.kind,
+                    state.active,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            numbered,
+            vec![
+                (10, 1, "A", 1, DESKTOP, false),
+                (20, 2, "A", 2, DESKTOP, true),
+                (30, 3, "B", 1, 4, true),
+                (40, 4, "B", 2, DESKTOP, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn space_window_sample_keeps_application_levels_and_fails_closed_without_metadata() {
+        assert_eq!(
+            application_windows(&[5, 6, 7, 8], &[Some(0), Some(25), Some(3), Some(8)])
+                .expect("classified"),
+            vec![5, 7, 8],
+            "only normal, floating and modal levels are sampled"
+        );
+        assert!(
+            application_windows(&[], &[]).expect("empty").is_empty(),
+            "an empty Space samples nothing"
+        );
+        assert!(
+            application_windows(&[5, 6], &[Some(0), None]).is_err(),
+            "a window without metadata is never treated as absent"
+        );
+
+        let numbers = [CFNumber::new_i64(5), CFNumber::new_i64(6)];
+        let numbers = numbers.iter().map(|n| &***n).collect::<Vec<&CFType>>();
+        assert_eq!(
+            parse_window_ids(&CFArray::<CFType>::from_objects(&numbers)),
+            Some(vec![5, 6])
+        );
+        let zero = CFNumber::new_i64(0);
+        let zero: &CFType = &zero;
+        assert!(
+            parse_window_ids(&CFArray::<CFType>::from_objects(&[zero])).is_none(),
+            "a zero window ID is malformed, not an empty Space"
+        );
+        let text = CFString::from_static_str("5");
+        let text: &CFType = &text;
+        assert!(
+            parse_window_ids(&CFArray::<CFType>::from_objects(&[text])).is_none(),
+            "a non-numeric member is malformed"
+        );
     }
 
     fn window_entry(number: &CFType) -> CFRetained<CFDictionary<CFString, CFType>> {

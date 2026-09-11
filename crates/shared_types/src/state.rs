@@ -129,6 +129,30 @@ pub struct WindowState {
     pub visible: bool,
 }
 
+/// One native macOS Space as reported by `paneru query native-spaces`.
+///
+/// A fresh census straight from the OS — including empty and fullscreen
+/// Spaces that carry no virtual rows — so it is answered separately from the
+/// virtual-layout snapshot in [`QueryState`] rather than projected out of it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeSpaceState {
+    /// The native Space identifier.
+    pub id: u64,
+    /// 1-based position in global Mission Control order, the same order
+    /// `space focus <n>` and `window spacemove <n>` count in.
+    pub index: usize,
+    /// Opaque identifier of the display that owns the Space.
+    pub display: String,
+    /// 1-based position of the Space among the Spaces of its own display —
+    /// the number Mission Control shows for it on that display.
+    pub display_index: usize,
+    /// The native Space type as reported by the OS; `0` is an ordinary Desktop.
+    #[serde(rename = "type")]
+    pub kind: i64,
+    /// Whether this Space is the one currently shown on its own display.
+    pub active: bool,
+}
+
 impl QueryState {
     /// The windows currently on screen, left to right per display. Drawn from
     /// the same rows as the rest of the document — there is no separate

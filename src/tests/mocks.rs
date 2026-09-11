@@ -14,6 +14,7 @@ use crate::manager::{
     Window, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
+use paneru_shared_types::state::NativeSpaceState;
 
 use super::*;
 
@@ -95,6 +96,15 @@ pub(crate) enum NativeRequestOutcome {
     Uncertain { applies: bool },
 }
 
+/// The native Space type `SLSSpaceGetType` reports for an ordinary Desktop.
+pub(crate) const NATIVE_DESKTOP_KIND: i64 = 0;
+/// The type of a native fullscreen Space.
+pub(crate) const NATIVE_FULLSCREEN_KIND: i64 = 4;
+
+/// Where the virtual window server starts numbering the Desktops it creates,
+/// well clear of the ids tests hand their displays.
+const FIRST_CREATED_SPACE_ID: WorkspaceId = 1000;
+
 /// A submitted native request the virtual window server has not applied yet.
 enum PendingNativeRequest {
     Move {
@@ -104,6 +114,41 @@ enum PendingNativeRequest {
     Activate {
         workspace_id: WorkspaceId,
     },
+    /// A Desktop the bridge already handed out an id for, but which the
+    /// census does not show yet.
+    Create {
+        workspace_id: WorkspaceId,
+        display_id: u32,
+    },
+    Destroy {
+        workspace_id: WorkspaceId,
+    },
+}
+
+/// Topology the window server has already announced but does not report
+/// yet: the `SLSCopyManagedDisplaySpaces` and `SLSCopySpacesForWindows`
+/// readers can lag the notification that made the change.
+enum LaggedTopology {
+    /// A Desktop announced with `SpaceCreated` that no display lists yet.
+    Listed {
+        workspace_id: WorkspaceId,
+        display_id: u32,
+    },
+    /// Windows a destroyed Desktop carried off that still report it.
+    Migrated {
+        windows: Vec<WinID>,
+        workspace_id: WorkspaceId,
+    },
+}
+
+struct NativeNotifications {
+    /// Whether an applied activation is announced with `SpaceChanged`, as
+    /// the OS normally does. Off, the manager only learns of the switch by
+    /// asking.
+    activation: bool,
+    /// Whether an applied creation or destruction is announced with
+    /// `SpaceCreated` / `SpaceDestroyed`. Off, only a fresh census shows it.
+    lifecycle: bool,
 }
 
 /// The internal state of our "Virtual macOS".
@@ -140,11 +185,33 @@ struct MockStateInner {
     native_space_focus_completions: Vec<WorkspaceId>,
     native_move_outcome: NativeRequestOutcome,
     native_activation_outcome: NativeRequestOutcome,
-    /// Whether an applied activation is announced with `SpaceChanged`, as
-    /// the OS normally does. Off, the manager only learns of the switch by
-    /// asking.
-    activation_notifies: bool,
+    native_create_outcome: NativeRequestOutcome,
+    native_destroy_outcome: NativeRequestOutcome,
+    notifications: NativeNotifications,
+    /// Whether the fresh census query fails outright.
+    census_failing: bool,
+    /// Native types of Spaces that are neither Desktops nor fullscreen.
+    space_kinds: HashMap<WorkspaceId, i64>,
+    /// The display the bridge creates Desktops on; the lowest-numbered one
+    /// when unset, which need not be the active display.
+    native_create_display: Option<u32>,
+    next_created_space_id: WorkspaceId,
+    /// The id handed out for every creation the window server accepted for
+    /// submission, whether it later applied it or not.
+    native_space_creations: Vec<WorkspaceId>,
+    /// Every destruction that passed preflight and was submitted, with its
+    /// migration flag.
+    native_space_destroys: Vec<(WorkspaceId, bool)>,
     pending_native_requests: Vec<PendingNativeRequest>,
+    /// Whether a creation is announced before the census lists the Desktop,
+    /// and a destruction before the windows it carried off report their new
+    /// Space. Off, every reader reflects a change as soon as it is announced.
+    topology_lags: bool,
+    lagged_topology: Vec<LaggedTopology>,
+    /// Displays the window server already routes Spaces to, but leaves out
+    /// of its display list for now: the managed-display listing can lag a
+    /// hot-plug behind the Space census and the windows' memberships.
+    unlisted_displays: HashSet<u32>,
 }
 
 impl MockStateInner {
@@ -182,11 +249,265 @@ impl MockStateInner {
                     .get_mut(&display_id)
                     .expect("finding owning display")
                     .active_workspace = workspace_id;
-                if self.activation_notifies {
+                if self.notifications.activation {
                     self.event_queue.push_back(Event::SpaceChanged);
                 }
             }
+            PendingNativeRequest::Create {
+                workspace_id,
+                display_id,
+            } => {
+                if !self.displays.contains_key(&display_id) || self.lists(workspace_id) {
+                    return;
+                }
+                if self.topology_lags {
+                    self.lagged_topology.push(LaggedTopology::Listed {
+                        workspace_id,
+                        display_id,
+                    });
+                } else {
+                    self.list(workspace_id, display_id);
+                }
+                if self.notifications.lifecycle {
+                    self.event_queue.push_back(Event::SpaceCreated {
+                        space_id: workspace_id,
+                    });
+                }
+            }
+            PendingNativeRequest::Destroy { workspace_id } => {
+                let announced = (self.notifications.activation, self.notifications.lifecycle);
+                self.destroy(workspace_id, announced);
+            }
         }
+    }
+
+    /// Takes `workspace_id` off its display, the way macOS does whether the
+    /// bridge or the user asked: the display falls back to its first Space
+    /// when it was showing the doomed one, and whatever the Desktop still
+    /// held is carried over to the display's current Space, wherever that
+    /// sits in the order. `announced` says whether the fallback switch and
+    /// the destruction are reported with `SpaceChanged` / `SpaceDestroyed`.
+    /// A Space that already vanished has nothing left to destroy.
+    fn destroy(&mut self, workspace_id: WorkspaceId, announced: (bool, bool)) {
+        let (announce_switch, announce_destruction) = announced;
+        let Some(display_id) = self.owning_display(workspace_id) else {
+            return;
+        };
+        let display = self
+            .displays
+            .get_mut(&display_id)
+            .expect("finding owning display");
+        display.workspaces.retain(|id| *id != workspace_id);
+        let fell_back = display.active_workspace == workspace_id;
+        if fell_back {
+            display.active_workspace = display.workspaces.first().copied().unwrap_or_default();
+        }
+        let survivor = display.active_workspace;
+        let carried = self
+            .windows
+            .values()
+            .filter(|window| window.workspace_id == workspace_id)
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+        if self.topology_lags {
+            self.lagged_topology.push(LaggedTopology::Migrated {
+                windows: carried,
+                workspace_id: survivor,
+            });
+        } else {
+            self.migrate(&carried, survivor);
+        }
+        self.fullscreen_spaces.remove(&workspace_id);
+        self.space_kinds.remove(&workspace_id);
+        if fell_back && announce_switch {
+            self.event_queue.push_back(Event::SpaceChanged);
+        }
+        if announce_destruction {
+            self.event_queue.push_back(Event::SpaceDestroyed {
+                space_id: workspace_id,
+            });
+        }
+    }
+
+    /// Whether any display lists `workspace_id`, or is about to once the
+    /// lagging census catches up.
+    fn lists(&self, workspace_id: WorkspaceId) -> bool {
+        self.owning_display(workspace_id).is_some()
+            || self.lagged_topology.iter().any(|lagged| {
+                matches!(
+                    lagged,
+                    LaggedTopology::Listed { workspace_id: listed, .. } if *listed == workspace_id
+                )
+            })
+    }
+
+    /// Lists `workspace_id` last on `display_id`, as the census would.
+    fn list(&mut self, workspace_id: WorkspaceId, display_id: u32) {
+        if let Some(display) = self.displays.get_mut(&display_id)
+            && !display.workspaces.contains(&workspace_id)
+        {
+            display.workspaces.push(workspace_id);
+        }
+    }
+
+    /// Reports `windows` on `workspace_id` from now on.
+    fn migrate(&mut self, windows: &[WinID], workspace_id: WorkspaceId) {
+        for window_id in windows {
+            if let Some(window) = self.windows.get_mut(window_id) {
+                window.workspace_id = workspace_id;
+            }
+        }
+    }
+
+    /// Lets every lagging reader catch up with what was announced.
+    fn settle_topology(&mut self) {
+        for lagged in std::mem::take(&mut self.lagged_topology) {
+            match lagged {
+                LaggedTopology::Listed {
+                    workspace_id,
+                    display_id,
+                } => self.list(workspace_id, display_id),
+                LaggedTopology::Migrated {
+                    windows,
+                    workspace_id,
+                } => self.migrate(&windows, workspace_id),
+            }
+        }
+    }
+
+    fn space_kind(&self, workspace_id: WorkspaceId) -> i64 {
+        if self.fullscreen_spaces.contains(&workspace_id) {
+            return NATIVE_FULLSCREEN_KIND;
+        }
+        self.space_kinds
+            .get(&workspace_id)
+            .copied()
+            .unwrap_or(NATIVE_DESKTOP_KIND)
+    }
+
+    /// Displays in the order the window server lists them, which is also
+    /// the order Mission Control numbers their Spaces in.
+    fn ordered_displays(&self) -> Vec<&MockDisplayData> {
+        let mut displays = self.displays.values().collect::<Vec<_>>();
+        displays.sort_unstable_by_key(|display| display.id);
+        displays
+    }
+
+    /// The fresh census, read the way the bridge reads it: every Space of
+    /// every display in global order, including empty and fullscreen ones.
+    /// `index` counts globally, `display_index` within the owning display.
+    fn native_space_info(&self) -> crate::errors::Result<Vec<NativeSpaceState>> {
+        if self.census_failing {
+            return Err(Error::Generic(
+                "the virtual window server could not list its Spaces".to_string(),
+            ));
+        }
+        let mut index = 0;
+        Ok(self
+            .ordered_displays()
+            .into_iter()
+            .flat_map(|display| {
+                display
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .map(move |(position, &id)| (display, position, id))
+            })
+            .map(|(display, position, id)| {
+                index += 1;
+                NativeSpaceState {
+                    id,
+                    index,
+                    display: format!("display-{}", display.id),
+                    display_index: position + 1,
+                    kind: self.space_kind(id),
+                    active: display.active_workspace == id,
+                }
+            })
+            .collect())
+    }
+
+    /// Ordinary application windows the window server would have to carry
+    /// off `workspace_id` before destroying it: everything on that Space
+    /// that is not somebody's attached child, plus the windows that sit on
+    /// every Space at once.
+    fn destroy_occupants(&self, workspace_id: WorkspaceId) -> Vec<WinID> {
+        let mut occupants = self
+            .windows
+            .values()
+            .filter(|window| {
+                (window.workspace_id == workspace_id || self.sticky_windows.contains(&window.id))
+                    && !self.is_associated_child(window.id)
+            })
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+        occupants.sort_unstable();
+        occupants
+    }
+
+    /// The bridge's destruction preflight: every guard but occupancy holds
+    /// regardless of `migrate`. Returns the sampled occupants a successful
+    /// destruction owes confirmation for.
+    fn check_destroy(
+        &self,
+        workspace_id: WorkspaceId,
+        migrate: bool,
+    ) -> crate::errors::Result<Vec<WinID>> {
+        let display_id = self.owning_display(workspace_id).ok_or_else(|| {
+            Error::NotFound(format!("no display owns native Space {workspace_id}"))
+        })?;
+        let display = &self.displays[&display_id];
+        if display.active_workspace == workspace_id {
+            return Err(Error::InvalidInput(format!(
+                "native Space {workspace_id} is current on display {display_id}"
+            )));
+        }
+        if self.space_kind(workspace_id) != NATIVE_DESKTOP_KIND {
+            return Err(Error::InvalidInput(format!(
+                "native Space {workspace_id} is not a Desktop"
+            )));
+        }
+        let desktops = display
+            .workspaces
+            .iter()
+            .filter(|&&id| self.space_kind(id) == NATIVE_DESKTOP_KIND)
+            .count();
+        if desktops <= 1 {
+            return Err(Error::InvalidInput(format!(
+                "native Space {workspace_id} is the last Desktop on display {display_id}"
+            )));
+        }
+        let occupants = self.destroy_occupants(workspace_id);
+        if !occupants.is_empty() && !migrate {
+            return Err(Error::InvalidInput(format!(
+                "native Space {workspace_id} still holds {} application windows",
+                occupants.len()
+            )));
+        }
+        Ok(occupants)
+    }
+
+    /// A Desktop id no present, announced or pending Space uses.
+    fn allocate_space_id(&mut self) -> WorkspaceId {
+        loop {
+            let candidate = self.next_created_space_id;
+            self.next_created_space_id += 1;
+            let taken = self.lists(candidate)
+                || self.pending_native_requests.iter().any(|request| {
+                    matches!(
+                        request,
+                        PendingNativeRequest::Create { workspace_id, .. } if *workspace_id == candidate
+                    )
+                });
+            if !taken {
+                return candidate;
+            }
+        }
+    }
+
+    fn create_display(&self) -> Option<u32> {
+        self.native_create_display
+            .or_else(|| self.displays.keys().copied().min())
     }
 
     /// Routes a submitted request through the configured outcome.
@@ -312,8 +633,22 @@ impl MockState {
                 native_space_focus_completions: Vec::new(),
                 native_move_outcome: NativeRequestOutcome::default(),
                 native_activation_outcome: NativeRequestOutcome::default(),
-                activation_notifies: true,
+                native_create_outcome: NativeRequestOutcome::default(),
+                native_destroy_outcome: NativeRequestOutcome::default(),
+                notifications: NativeNotifications {
+                    activation: true,
+                    lifecycle: true,
+                },
+                census_failing: false,
+                space_kinds: HashMap::new(),
+                native_create_display: None,
+                next_created_space_id: FIRST_CREATED_SPACE_ID,
+                native_space_creations: Vec::new(),
+                native_space_destroys: Vec::new(),
                 pending_native_requests: Vec::new(),
+                topology_lags: false,
+                lagged_topology: Vec::new(),
+                unlisted_displays: HashSet::new(),
             })),
         }
     }
@@ -502,7 +837,65 @@ impl MockState {
     /// `SpaceChanged`. Off, a confirmed switch is only visible to whoever
     /// asks the window server.
     pub(crate) fn set_native_activation_notifies(&self, notifies: bool) {
-        self.inner.force_write().activation_notifies = notifies;
+        self.inner.force_write().notifications.activation = notifies;
+    }
+
+    pub(crate) fn set_native_create_outcome(&self, outcome: NativeRequestOutcome) {
+        self.inner.force_write().native_create_outcome = outcome;
+    }
+
+    pub(crate) fn set_native_destroy_outcome(&self, outcome: NativeRequestOutcome) {
+        self.inner.force_write().native_destroy_outcome = outcome;
+    }
+
+    /// Whether the window server announces an applied creation or
+    /// destruction with `SpaceCreated` / `SpaceDestroyed`. Off, the change
+    /// only shows to whoever takes a fresh census.
+    pub(crate) fn set_native_lifecycle_notifies(&self, notifies: bool) {
+        self.inner.force_write().notifications.lifecycle = notifies;
+    }
+
+    /// Makes the fresh census query fail outright. A failed census is
+    /// neither presence nor absence of any Space.
+    pub(crate) fn set_native_census_failing(&self, failing: bool) {
+        self.inner.force_write().census_failing = failing;
+    }
+
+    /// Gives `workspace_id` a native type other than Desktop or fullscreen,
+    /// the way a system Space shows up in the census.
+    pub(crate) fn set_native_space_kind(&self, workspace_id: WorkspaceId, kind: i64) {
+        let mut inner = self.inner.force_write();
+        if kind == NATIVE_DESKTOP_KIND {
+            inner.space_kinds.remove(&workspace_id);
+        } else {
+            inner.space_kinds.insert(workspace_id, kind);
+        }
+    }
+
+    /// The display the bridge puts new Desktops on. The bridge's choice is
+    /// its own; it need not be the active display.
+    pub(crate) fn set_native_create_display(&self, display_id: u32) {
+        self.inner.force_write().native_create_display = Some(display_id);
+    }
+
+    /// The ids handed out for every creation submitted so far.
+    pub(crate) fn native_space_creations(&self) -> Vec<WorkspaceId> {
+        self.inner.force_read().native_space_creations.clone()
+    }
+
+    /// Every destruction submitted past preflight, with its migration flag.
+    pub(crate) fn native_space_destroys(&self) -> Vec<(WorkspaceId, bool)> {
+        self.inner.force_read().native_space_destroys.clone()
+    }
+
+    /// The Spaces `display_id` currently owns, in Mission Control order.
+    pub(crate) fn display_workspaces(&self, display_id: u32) -> Vec<WorkspaceId> {
+        self.inner
+            .force_read()
+            .displays
+            .get(&display_id)
+            .map(|display| display.workspaces.clone())
+            .expect("finding display")
     }
 
     /// Spawns `child` attached to `parent` the way a sheet or an attached
@@ -574,28 +967,61 @@ impl MockState {
         }
     }
 
+    /// Whether the readers lag the notifications: a creation is announced
+    /// before the census lists the Desktop, and a destruction before the
+    /// windows it carried off report their new Space, until
+    /// [`Self::settle_native_topology`]. Off, every reader reflects a change
+    /// the moment it is announced.
+    pub(crate) fn set_native_topology_lagging(&self, lagging: bool) {
+        self.inner.force_write().topology_lags = lagging;
+    }
+
+    /// Lets every lagging reader catch up with what has been announced:
+    /// announced Desktops are listed, carried-off windows report their new
+    /// Space. No notification accompanies it; the announcement already went
+    /// out.
+    pub(crate) fn settle_native_topology(&self) {
+        self.inner.force_write().settle_topology();
+    }
+
+    /// Whether the display list leaves `display_id` out while the Space
+    /// census, window memberships and the moves themselves already know it:
+    /// the managed-display listing can lag a hot-plug. Off, the display is
+    /// listed like any other.
+    pub(crate) fn set_display_listing_lagging(&self, display_id: u32, lagging: bool) {
+        let mut inner = self.inner.force_write();
+        if lagging {
+            inner.unlisted_displays.insert(display_id);
+        } else {
+            inner.unlisted_displays.remove(&display_id);
+        }
+    }
+
+    /// Adds a Desktop to `display_id`, as when the user adds one in Mission
+    /// Control: nothing was requested through the bridge, only the
+    /// announcement and the census show it.
+    pub(crate) fn add_workspace(&self, display_id: u32, workspace_id: WorkspaceId) {
+        self.inner
+            .force_write()
+            .apply(PendingNativeRequest::Create {
+                workspace_id,
+                display_id,
+            });
+    }
+
     /// Removes a Space from its display, as when the user closes a Desktop
     /// in Mission Control, reporting it the way macOS does: the Space change
     /// first when the current Space vanished, then the destruction. Windows
-    /// keep their stale membership until an explicit move, which is what the
-    /// window server reports for a Space that no longer exists.
+    /// it held are carried to the display's current Space — after the
+    /// announcement, when the topology lags.
     pub(crate) fn remove_workspace(&self, display_id: u32, workspace_id: WorkspaceId) {
         let mut inner = self.inner.force_write();
-        let display = inner
-            .displays
-            .get_mut(&display_id)
-            .expect("finding display");
-        display.workspaces.retain(|id| *id != workspace_id);
-        let fell_back = display.active_workspace == workspace_id;
-        if fell_back {
-            display.active_workspace = display.workspaces.first().copied().unwrap_or_default();
-        }
-        if fell_back {
-            inner.event_queue.push_back(Event::SpaceChanged);
-        }
-        inner.event_queue.push_back(Event::SpaceDestroyed {
-            space_id: workspace_id,
-        });
+        assert_eq!(
+            inner.owning_display(workspace_id),
+            Some(display_id),
+            "display {display_id} does not own native Space {workspace_id}"
+        );
+        inner.destroy(workspace_id, (true, true));
     }
 
     // --- State Mutation Methods ---
@@ -1071,13 +1497,97 @@ impl MockState {
         let s = self.clone();
         wm.expect_native_spaces().returning(move || {
             let inner = s.inner.force_read();
-            let mut displays = inner.displays.values().collect::<Vec<_>>();
-            displays.sort_unstable_by_key(|display| display.id);
-            Ok(displays
+            Ok(inner
+                .ordered_displays()
                 .into_iter()
                 .flat_map(|display| display.workspaces.iter().copied())
                 .collect())
         });
+
+        let s = self.clone();
+        wm.expect_native_space_info()
+            .returning(move || s.inner.force_read().native_space_info());
+
+        // The bridge's creation is synchronous as far as the id goes: a
+        // successful call always names the new Desktop. Whether the census
+        // already shows it is a separate matter, decided by the outcome.
+        let s = self.clone();
+        wm.expect_create_native_space().returning(move || {
+            let mut inner = s.inner.force_write();
+            let display_id = inner.create_display().ok_or_else(|| {
+                Error::NotFound("the virtual window server has no display".to_string())
+            })?;
+            let outcome = inner.native_create_outcome;
+            match outcome {
+                NativeRequestOutcome::Rejected => Err(Error::NativeSpaceRequest {
+                    workspace_id: 0,
+                    request_may_have_applied: false,
+                    message: "the virtual window server refused to create a Desktop".to_string(),
+                }),
+                NativeRequestOutcome::Immediate => {
+                    let workspace_id = inner.allocate_space_id();
+                    inner.native_space_creations.push(workspace_id);
+                    inner.apply(PendingNativeRequest::Create {
+                        workspace_id,
+                        display_id,
+                    });
+                    Ok(workspace_id)
+                }
+                NativeRequestOutcome::Deferred => {
+                    let workspace_id = inner.allocate_space_id();
+                    inner.native_space_creations.push(workspace_id);
+                    inner
+                        .pending_native_requests
+                        .push(PendingNativeRequest::Create {
+                            workspace_id,
+                            display_id,
+                        });
+                    Ok(workspace_id)
+                }
+                // The reply was lost, so the caller never learns which id
+                // the window server may have handed out.
+                NativeRequestOutcome::Uncertain { applies } => {
+                    let workspace_id = inner.allocate_space_id();
+                    inner.native_space_creations.push(workspace_id);
+                    if applies {
+                        inner
+                            .pending_native_requests
+                            .push(PendingNativeRequest::Create {
+                                workspace_id,
+                                display_id,
+                            });
+                    }
+                    Err(Error::NativeSpaceRequest {
+                        workspace_id: 0,
+                        request_may_have_applied: true,
+                        message: "the virtual window server lost the creation reply".to_string(),
+                    })
+                }
+            }
+        });
+
+        let s = self.clone();
+        wm.expect_destroy_native_space()
+            .returning(move |workspace_id, migrate| {
+                let mut inner = s.inner.force_write();
+                let occupants = inner.check_destroy(workspace_id, migrate)?;
+                let outcome = inner.native_destroy_outcome;
+                if outcome == NativeRequestOutcome::Rejected {
+                    return Err(Error::NativeSpaceRequest {
+                        workspace_id,
+                        request_may_have_applied: false,
+                        message: "the virtual window server refused to destroy the Desktop"
+                            .to_string(),
+                    });
+                }
+                inner.native_space_destroys.push((workspace_id, migrate));
+                inner.submit(
+                    outcome,
+                    workspace_id,
+                    PendingNativeRequest::Destroy { workspace_id },
+                )?;
+                Ok(occupants)
+            });
 
         let s = self.clone();
         wm.expect_focus_native_space()
@@ -1180,10 +1690,11 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_present_displays().returning(move || {
-            s.inner
-                .force_read()
+            let inner = s.inner.force_read();
+            inner
                 .displays
                 .values()
+                .filter(|d| !inner.unlisted_displays.contains(&d.id))
                 .map(|d| {
                     (
                         Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT),

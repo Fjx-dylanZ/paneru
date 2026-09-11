@@ -32,7 +32,9 @@ pub use crate::script_state::WriteOutcome;
 
 use crate::script_state::ScriptStateWrite;
 use crate::script_value::ScriptValue;
-use crate::state::{ActiveState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState};
+use crate::state::{
+    ActiveState, NativeSpaceState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState,
+};
 use crate::windowset::{LayoutOp, WindowSet};
 
 /// Something a client asks the daemon to do.
@@ -54,6 +56,10 @@ pub enum Request {
     ScriptState(ScriptStateRequest),
     /// Ask for state events to be pushed as they happen.
     Subscribe,
+    /// Read a fresh census of native macOS Spaces. Answered with
+    /// [`QueryPayload::NativeSpaces`]; like [`Request::WindowSet`] it is a
+    /// separate request because the answer is not part of the state document.
+    NativeSpaces,
 }
 
 /// What a client wants of the script-state store.
@@ -77,13 +83,17 @@ pub enum Response {
     Error(String),
 }
 
-/// The answer to a [`Request::Query`], one variant per [`StateQueryKind`].
+/// The answer to a [`Request::Query`], one variant per [`StateQueryKind`],
+/// plus the answer to [`Request::NativeSpaces`], which shares the JSON
+/// rendering path but not the state document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum QueryPayload {
     State(Box<QueryState>),
     VirtualWorkspaces(Vec<VirtualWorkspaceState>),
     Active(Box<ActiveState>),
     OnScreen(Vec<WindowState>),
+    /// Every native Space in global Mission Control order.
+    NativeSpaces(Vec<NativeSpaceState>),
 }
 
 impl QueryPayload {
@@ -99,6 +109,7 @@ impl QueryPayload {
             Self::VirtualWorkspaces(rows) => serde_json::to_value(rows),
             Self::Active(active) => serde_json::to_value(active),
             Self::OnScreen(windows) => serde_json::to_value(windows),
+            Self::NativeSpaces(spaces) => serde_json::to_value(spaces),
         }
     }
 }
@@ -143,6 +154,7 @@ mod tests {
         round_trip(&Request::ScriptState(ScriptStateRequest::Write(
             ScriptStateWrite::set("count".to_string(), ScriptValue::Int(7)),
         )));
+        round_trip(&Request::NativeSpaces);
     }
 
     #[test]
@@ -152,6 +164,16 @@ mod tests {
             QueryPayload::VirtualWorkspaces(Vec::new()),
         ));
         round_trip(&Response::Query(QueryPayload::OnScreen(Vec::new())));
+        round_trip(&Response::Query(QueryPayload::NativeSpaces(vec![
+            NativeSpaceState {
+                id: 0x1_0000_0007,
+                index: 2,
+                display: "37D8832A-2D66-02CA-B9F7-8F30A301B230".to_string(),
+                display_index: 1,
+                kind: 0,
+                active: true,
+            },
+        ])));
         round_trip(&Response::ScriptState(ScriptStateResponse::Value(Some(
             ScriptValue::Str("hello".to_string()),
         ))));
@@ -159,6 +181,33 @@ mod tests {
             WriteOutcome::Applied { changed: true },
         )));
         round_trip(&Response::Error("no such window".to_string()));
+    }
+
+    /// The census is a JSON array whose objects carry the native type under
+    /// `type`, the name scripts and the CLI documentation agree on, rather
+    /// than the Rust field name.
+    #[test]
+    fn native_spaces_render_as_a_json_array() {
+        let payload = QueryPayload::NativeSpaces(vec![NativeSpaceState {
+            id: 5,
+            index: 1,
+            display: "main".to_string(),
+            display_index: 1,
+            kind: 4,
+            active: false,
+        }]);
+        let json = payload.to_json().expect("renders");
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "id": 5,
+                "index": 1,
+                "display": "main",
+                "display_index": 1,
+                "type": 4,
+                "active": false,
+            }])
+        );
     }
 
     /// The layout tree is the largest thing that crosses the wire, and the one

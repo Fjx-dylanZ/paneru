@@ -4,8 +4,9 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Added;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
-use bevy::ecs::system::{Query, Res, ResMut};
+use bevy::ecs::system::{NonSend, Query, Res, ResMut};
 use std::collections::{BTreeMap, BTreeSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
@@ -17,9 +18,10 @@ use crate::ecs::state::{
     QueryStateParams, StateEvent,
 };
 use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged};
-use crate::events::Event;
-use crate::platform::WinID;
-use paneru_shared_types::wire::Response;
+use crate::events::{Event, Reply};
+use crate::manager::WindowManager;
+use crate::platform::{PlatformCallbacks, WinID};
+use paneru_shared_types::wire::{QueryPayload, Response};
 
 /// One connected `paneru subscribe` client.
 ///
@@ -193,11 +195,25 @@ pub(super) fn register_query_commands(app: &mut App) {
 
     app.init_resource::<StateSubscribers>();
     app.init_resource::<StateBroadcastCache>();
-    app.add_systems(PreUpdate, (state_subscribe_handler, state_query_handler));
+    app.add_systems(
+        PreUpdate,
+        (
+            state_subscribe_handler,
+            state_query_handler,
+            native_spaces_query_handler,
+        ),
+    );
     app.add_systems(
         PostUpdate,
         state_event_broadcast_handler.run_if(active_subscribers),
     );
+}
+
+/// Sends a client its answer without ever waiting for it to be taken. The
+/// reply channel holds one message and exactly one is sent, so this cannot
+/// fill; a client that hung up in the meantime is simply gone.
+fn reply(respond_to: &Reply, answer: Result<Response, String>) {
+    _ = respond_to.try_send(answer.unwrap_or_else(Response::Error));
 }
 
 /// Answers socket queries that read the world: state documents and the window
@@ -205,13 +221,6 @@ pub(super) fn register_query_commands(app: &mut App) {
 /// world access. The window set is a separate variant rather than folded into
 /// [`StateQueryKind`] since it projects a different value (the layout tree).
 fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStateParams) {
-    /// Sends an answer without ever waiting for it to be taken. The reply
-    /// channel holds one message and exactly one is sent, so this cannot fill;
-    /// a client that hung up in the meantime is simply gone.
-    fn reply(respond_to: &crate::events::Reply, answer: Result<Response, String>) {
-        _ = respond_to.try_send(answer.unwrap_or_else(Response::Error));
-    }
-
     for event in messages.read() {
         match event {
             Event::StateQuery { kind, respond_to } => reply(
@@ -230,6 +239,33 @@ fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStatePara
             ),
             _ => {}
         }
+    }
+}
+
+/// Answers native Space census queries straight from the OS. Kept apart from
+/// [`state_query_handler`]: the census is not part of the virtual-layout
+/// snapshot, so it neither needs [`QueryStateParams`]'s world access nor
+/// should it fail when that snapshot cannot be built. The census is read
+/// fresh on every query, on the main thread the bridge requires. A failed
+/// read is reported as the failure it is; "no Spaces" is never true, so an
+/// empty list would only mislead.
+#[allow(clippy::needless_pass_by_value)]
+fn native_spaces_query_handler(
+    mut messages: MessageReader<Event>,
+    window_manager: Res<WindowManager>,
+    _platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
+) {
+    for event in messages.read() {
+        let Event::NativeSpacesQuery { respond_to } = event else {
+            continue;
+        };
+        reply(
+            respond_to,
+            window_manager
+                .native_space_info()
+                .map_err(|err| err.to_string())
+                .map(|spaces| Response::Query(QueryPayload::NativeSpaces(spaces))),
+        );
     }
 }
 

@@ -19,6 +19,10 @@
 //! paneru.workspace.select({ number = 2 })       -- switch virtual workspace
 //! paneru.workspace.move_window({ number = 2, follow = false })
 //! paneru.workspace.add()                        -- create + switch to a new virtual workspace
+//! paneru.space.focus("next")                    -- native macOS Space
+//! paneru.space.create()                         -- new Desktop, no switch
+//! paneru.space.destroy(3, true)                 -- migrate = true; false by default
+//! paneru.space.move_window("next", false)       -- follow = false; true by default
 //! paneru.quit()
 //!
 //! for _, window in ipairs(paneru.query_on_screen()) do  -- actually visible
@@ -264,20 +268,76 @@ fn workspace_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     Ok(workspace)
 }
 
-/// Builds the `paneru.space` sub-table.
+/// Builds the `paneru.space` sub-table: native macOS Space verbs. Every
+/// target is the same scalar `space focus` takes — `"next"`, `"prev"` or a
+/// 1-based Mission Control number.
 fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let space = lua.create_table()?;
-    let dispatch = Rc::clone(dispatch);
-    space.set(
-        "focus",
-        lua.create_function(move |lua, value: Value| {
-            let token = scalar_token(&value)?;
-            let selector = SpaceSelector::parse(&token)
-                .map_err(|err| mlua::Error::RuntimeError(err.to_string()))?;
+
+    let focus = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, target: Value| {
+            let selector = space_selector(&target)?;
             dispatch(lua, Command::Space(SpaceOperation::Focus(selector)))
-        })?,
+        })?
+    };
+    space.set("focus", focus)?;
+
+    space.set(
+        "create",
+        verb(lua, dispatch, Command::Space(SpaceOperation::Create))?,
     )?;
+
+    // paneru.space.destroy(target, migrate) — migration is opt-in and must be
+    // a real boolean: Lua's truthiness would turn a stray string into "yes".
+    let destroy = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, (target, migrate): (Value, Value)| {
+            let selector = space_selector(&target)?;
+            let migrate = optional_flag("space.destroy", "migrate", &migrate, false)?;
+            dispatch(
+                lua,
+                Command::Space(SpaceOperation::Destroy { selector, migrate }),
+            )
+        })?
+    };
+    space.set("destroy", destroy)?;
+
+    // paneru.space.move_window(target, follow) — follows by default, like
+    // every other move verb.
+    let move_window = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, (target, follow): (Value, Value)| {
+            let selector = space_selector(&target)?;
+            let follow = optional_flag("space.move_window", "follow", &follow, true)?;
+            dispatch(
+                lua,
+                Command::Window(Operation::SpaceMove(selector, MoveFocus::follows(follow))),
+            )
+        })?
+    };
+    space.set("move_window", move_window)?;
+
     Ok(space)
+}
+
+/// Parses a native Space target given as a bare scalar (`"next"`, `3`).
+fn space_selector(value: &Value) -> Result<SpaceSelector> {
+    let token = scalar_token(value)?;
+    SpaceSelector::parse(&token).map_err(|err| mlua::Error::RuntimeError(err.to_string()))
+}
+
+/// An optional trailing boolean argument. Absent means `default`; anything
+/// that is not a boolean is an error rather than coerced by Lua truthiness.
+fn optional_flag(what: &str, name: &str, value: &Value, default: bool) -> Result<bool> {
+    match value {
+        Value::Nil => Ok(default),
+        Value::Boolean(flag) => Ok(*flag),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "{what} expects {name} to be a boolean, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// Virtual-workspace verbs come in two shapes: a position selects a numbered
@@ -605,5 +665,71 @@ mod tests {
                 Command::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
             ])
         );
+    }
+
+    /// Native Space lifecycle and moves: migration is opt-in, following is
+    /// the default, and both honour an explicit boolean either way.
+    #[test]
+    fn space_verbs_default_to_no_migration_and_following() {
+        let commands = run(r#"
+            paneru.space.create()
+            paneru.space.destroy(3)
+            paneru.space.destroy("prev", false)
+            paneru.space.destroy("next", true)
+            paneru.space.move_window(2)
+            paneru.space.move_window("next", true)
+            paneru.space.move_window("previous", false)
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Space(SpaceOperation::Create),
+                Command::Space(SpaceOperation::Destroy {
+                    selector: SpaceSelector::Number(3),
+                    migrate: false,
+                }),
+                Command::Space(SpaceOperation::Destroy {
+                    selector: SpaceSelector::Previous,
+                    migrate: false,
+                }),
+                Command::Space(SpaceOperation::Destroy {
+                    selector: SpaceSelector::Next,
+                    migrate: true,
+                }),
+                Command::Window(Operation::SpaceMove(
+                    SpaceSelector::Number(2),
+                    MoveFocus::Follow
+                )),
+                Command::Window(Operation::SpaceMove(SpaceSelector::Next, MoveFocus::Follow)),
+                Command::Window(Operation::SpaceMove(
+                    SpaceSelector::Previous,
+                    MoveFocus::Stay
+                )),
+            ])
+        );
+    }
+
+    /// A destroy or move with a bad target or a non-boolean flag must fail at
+    /// the call site: Lua truthiness must never turn a stray value into
+    /// "migrate" or "stay".
+    #[test]
+    fn space_verbs_reject_bad_targets_and_flags() {
+        for source in [
+            "paneru.space.destroy()",
+            "paneru.space.destroy(0)",
+            r#"paneru.space.destroy("current")"#,
+            r#"paneru.space.destroy(3, "migrate")"#,
+            "paneru.space.destroy(3, 1)",
+            "paneru.space.move_window()",
+            "paneru.space.move_window(0)",
+            r#"paneru.space.move_window("east")"#,
+            r#"paneru.space.move_window("next", "stay")"#,
+            "paneru.space.move_window(2, 0)",
+            r#"paneru.space.focus("up")"#,
+        ] {
+            assert!(run(source).is_err(), "{source} should fail");
+        }
     }
 }

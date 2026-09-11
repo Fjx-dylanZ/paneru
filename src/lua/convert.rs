@@ -253,6 +253,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::WindowCreated { .. }
             | Event::Command { .. }
             | Event::StateQuery { .. }
+            | Event::NativeSpacesQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
             | Event::ScriptState { .. } => return Err(NotMarshallable),

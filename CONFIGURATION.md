@@ -234,11 +234,25 @@ window_resize = ["alt - r", "ctrl - r"]
 
 ### Native macOS Spaces (Experimental)
 
-Native Spaces use their one-based global Mission Control order across all
-displays. Relative selection does not wrap: `next` on the last Space and
-`prev` on the first Space do nothing. These explicit commands always use the
-instant native Space transition, independently of
-`skip_native_space_switch_animation`. They also support empty Spaces.
+Native Spaces are selected by their one-based global Mission Control order
+across all displays — the same numbers `paneru query native-spaces` reports as
+`index`, not native Space ids. Relative selection does not wrap: `next` on the
+last Space and `prev` on the first Space do nothing. Empty Spaces are valid
+targets.
+
+Five kinds of native Space command exist, and only two of them switch Spaces:
+
+- `space_focus_*` switches to a Space.
+- `space_create` creates a new Desktop and does **not** switch to it.
+- `space_destroy_*` removes an inactive Desktop and does **not** switch.
+- `window_spacemove_*` moves the focused window to a Space and follows it.
+- `window_spacesend_*` moves the focused window and stays where you are,
+  even when it was the last window on the current Space.
+
+#### Focusing
+
+`space_focus_*` commands always use the instant native Space transition,
+independently of `skip_native_space_switch_animation`.
 
 Paneru requests the native show/hide/set-current sequence on the target's owning
 display, then confirms it without blocking the event loop. Cursor and display
@@ -246,16 +260,86 @@ focus changes happen only after that confirmation. A Space already current on
 another display only needs the display-focus step. Commands are ignored while
 Mission Control is open or a prior instant transition is still pending.
 
-Private API availability and method signatures are checked at runtime. An
-unconfirmed request expires after two seconds; a timeout or partial failure does
-not prove that macOS applied nothing. Paneru logs the outcome and does not inject
-a fallback gesture or repeatedly resubmit a pending request.
+#### Creating and destroying Desktops
+
+`space_create` asks macOS for one new ordinary Desktop on the native bridge's
+default display; Paneru discovers which display actually received it from the
+census afterwards. There is no display selector.
+
+`space_destroy_<target>` removes an ordinary Desktop. It is refused when the
+target is:
+
+- the Space currently shown on **any** display,
+- the last Desktop on its display,
+- not an ordinary Desktop (fullscreen or system Spaces),
+- still hosting application windows, minimized ones included.
+
+Appending `_migrate` lifts only the last guard: macOS itself relocates the
+remaining windows and chooses where they go; Paneru only observes the
+memberships they end up with and reconciles its layout to what it saw. On the
+single-display setups this has been exercised on, macOS moved them to the
+current Desktop; no particular destination is promised beyond that. Paneru
+never closes a window or moves windows by hand as part of destruction, and
+the guards above still apply. A Space that looks empty in Mission Control may
+still be refused because a hidden or sticky application window counts as
+present; inspect what is there before reaching for `_migrate`.
+
+#### Moving windows between Spaces
+
+`window_spacemove_<target>` and `window_spacesend_<target>` move the focused
+window to another Desktop. `next`/`prev` are relative to the Space the window
+is actually on, which need not be the Space you are looking at. Selecting the
+Space the window is already on is a no-op. The window keeps its tiled or
+floating state; its native tab group and associated child windows (sheets,
+popovers) are submitted as one batch and the destination row keeps the tab
+grouping. Nothing in the layout changes before native membership has been
+observed. If the batch could not be confirmed whole — an error after
+submission, or the deadline — the members the window server does report on
+the target are reconciled individually into the destination row, while the
+rest keep their last known layout; only a batch confirmed whole completes the
+move as such, and for `spacemove` only a whole batch triggers the switch to
+the destination.
+
+Moves are refused for native-fullscreen windows, hidden windows, windows on
+more than one Space (sticky/multi-Space), and a window whose previous move is
+still being confirmed. A window with `window_follow` turned on cannot be
+*sent* (it would just follow you back); turn follow off first. It can be
+*moved*: the follow is resumed automatically once the move has landed.
+
+#### Completion is asynchronous
+
+Every native request is a submission, not a confirmation: macOS creates and
+destroys Desktops and reassigns windows asynchronously. Paneru observes the
+native state roughly every 50 ms and gives up after two seconds per
+confirmation phase. `send-cmd` returns as soon as the daemon has accepted the
+request, so success on the command line does not mean the Space or window has
+changed yet. A timeout, a partial failure, or a transient census read error
+does not prove that macOS applied nothing: Paneru logs the outcome, keeps the
+last known layout rather than guessing, never resubmits a stale request, and
+never attempts a native rollback. Only one native request is in flight at a
+time; a command issued while another is still being confirmed is refused.
+
+Use `paneru query native-spaces --json` (see the
+[query format](./QUERY_AND_SUBSCRIBE_FORMAT.md#paneru-query-native-spaces---json))
+to read the resulting native state; a query that fails right after a request
+can be retried once the native state has settled.
+
+Private API availability and method signatures are checked at runtime. Paneru
+does not inject a fallback gesture or repeatedly resubmit a pending request.
+Ordinary single-display Desktops are the exercised path; multi-display and
+fullscreen interactions are guarded by the refusals above rather than by
+empirical guarantees.
 
 | Action | Description |
 | :--- | :--- |
 | `space_focus_next` | Focus the next native macOS Space. |
 | `space_focus_prev` / `_previous` | Focus the previous native macOS Space. |
 | `space_focus_<number>` | Focus a native Space by global Mission Control number. |
+| `space_create` | Create a new native Desktop without switching to it. |
+| `space_destroy_next` / `_prev` / `_previous` / `_<number>` | Destroy the selected inactive Desktop if it holds no application windows. Never switches Spaces. |
+| `space_destroy_<target>_migrate` | Same, but let macOS migrate its remaining windows; Paneru reconciles to the memberships it observes afterwards. |
+| `window_spacemove_next` / `_prev` / `_previous` / `_<number>` | Move the focused window to the selected native Space and follow it. |
+| `window_spacesend_next` / `_prev` / `_previous` / `_<number>` | Send the focused window to the selected native Space but stay here. |
 
 **Example:**
 ```toml
@@ -265,6 +349,11 @@ space_focus_prev = "ctrl - left"
 space_focus_1 = "ctrl - 1"
 space_focus_2 = "ctrl - 2"
 space_focus_3 = "ctrl - 3"
+space_create = "ctrl + alt - n"
+space_destroy_3 = "ctrl + alt - 3"
+space_destroy_3_migrate = "ctrl + alt + shift - 3"
+window_spacemove_next = "ctrl + shift - right"
+window_spacesend_prev = "ctrl + alt - left"
 ```
 
 **Example command line:**
@@ -272,6 +361,11 @@ space_focus_3 = "ctrl - 3"
 $ paneru send-cmd space focus next
 $ paneru send-cmd space focus prev
 $ paneru send-cmd space focus 3
+$ paneru send-cmd space create
+$ paneru send-cmd space destroy 3
+$ paneru send-cmd space destroy 3 migrate
+$ paneru send-cmd window spacemove next
+$ paneru send-cmd window spacesend prev
 ```
 
 ### Virtual workspaces (Experimental)

@@ -172,6 +172,14 @@ pub enum QueryCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Prints the native macOS Space census in global Mission Control order:
+    /// every Space the bridge sees, including empty and fullscreen ones, with
+    /// its owning display and whether it is that display's current Space.
+    /// Read fresh from the OS; not part of the state document.
+    NativeSpaces {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The main entry point of the `paneru` application.
@@ -234,7 +242,7 @@ fn main() -> Result<()> {
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
         SubCmd::SendCmd { cmd } => client::run(ClientCommand::Send(cmd))?,
-        SubCmd::Query { query } => client::run(ClientCommand::Query(query.kind()))?,
+        SubCmd::Query { query } => client::run(query.command())?,
         SubCmd::Subscribe { json: _ } => client::run(ClientCommand::Subscribe)?,
         SubCmd::State { state } => client::run(ClientCommand::ScriptState(state.request()?))?,
     }
@@ -281,12 +289,18 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
 }
 
 impl QueryCmd {
-    fn kind(&self) -> StateQueryKind {
+    /// The client command this asks for. State document queries share one
+    /// request shape; the native Space census is its own request, since the
+    /// state document has no such data.
+    fn command(&self) -> ClientCommand {
         match self {
-            QueryCmd::State { json: _ } => StateQueryKind::State,
-            QueryCmd::VirtualWorkspaces { json: _ } => StateQueryKind::VirtualWorkspaces,
-            QueryCmd::Active { json: _ } => StateQueryKind::Active,
-            QueryCmd::OnScreen { json: _ } => StateQueryKind::OnScreen,
+            QueryCmd::State { json: _ } => ClientCommand::Query(StateQueryKind::State),
+            QueryCmd::VirtualWorkspaces { json: _ } => {
+                ClientCommand::Query(StateQueryKind::VirtualWorkspaces)
+            }
+            QueryCmd::Active { json: _ } => ClientCommand::Query(StateQueryKind::Active),
+            QueryCmd::OnScreen { json: _ } => ClientCommand::Query(StateQueryKind::OnScreen),
+            QueryCmd::NativeSpaces { json: _ } => ClientCommand::NativeSpaces,
         }
     }
 }
