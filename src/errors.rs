@@ -23,6 +23,17 @@ pub enum Error {
     IO(String),
     /// A generic error with a descriptive message.
     Generic(String),
+    /// A native macOS Space request (activation or window move) failed.
+    ///
+    /// `request_may_have_applied` is `false` while the failure happened before
+    /// anything was submitted to the window server, and `true` once any
+    /// asynchronous operation had been performed; the caller must then observe
+    /// the reported target instead of assuming the previous state.
+    NativeSpaceRequest {
+        workspace_id: u64,
+        request_may_have_applied: bool,
+        message: String,
+    },
 }
 
 impl Error {
@@ -53,6 +64,18 @@ impl Display for Error {
             Error::InvalidInput(msg) => format!("Invalid input: {msg}"),
             Error::IO(msg) => format!("IO error: {msg}"),
             Error::Generic(msg) => format!("Generic error: {msg}"),
+            Error::NativeSpaceRequest {
+                workspace_id,
+                request_may_have_applied,
+                message,
+            } => {
+                let state = if *request_may_have_applied {
+                    "may have applied"
+                } else {
+                    "not submitted"
+                };
+                format!("Native Space {workspace_id} request {state}: {message}")
+            }
         };
         write!(f, "{msg}")
     }
