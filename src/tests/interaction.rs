@@ -9,13 +9,15 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, MoveFocus, Operation, SpaceOperation, SpaceSelector};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::workspace::FollowSpacePending;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, ManualStripOffset,
-    MissionControlActive, NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker,
+    Initializing, InstantSpaceSwitch, ManualStripOffset, MissionControlActive,
+    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
-use crate::manager::{Origin, Size, Window};
+use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::{Modifiers, WinID};
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
@@ -288,10 +290,11 @@ fn configured_focus_skips_native_space_animation_once() {
         .on_iteration(1, |world, state| {
             assert_eq!(state.active_workspace(TEST_DISPLAY_ID), TEST_WORKSPACE_ID);
             assert_eq!(state.workspace_focuses(), vec![0]);
+            let now = world.resource::<Time>().elapsed();
             assert!(
                 world
-                    .resource::<crate::ecs::InstantSpaceSwitch>()
-                    .suppress_focus_follows_mouse(),
+                    .resource::<InstantSpaceSwitch>()
+                    .suppress_focus_follows_mouse(now),
                 "focus-follows-mouse remains suppressed after SpaceChanged"
             );
         })
@@ -409,6 +412,1059 @@ fn native_space_commands_are_rejected_during_mission_control() {
         .run(vec![Event::Command {
             command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
         }]);
+}
+
+/// Long enough for a 50ms confirmation check to land after the virtual
+/// window server applies a request, and for the resulting commands to flush.
+const NATIVE_REACTION: Duration = Duration::from_millis(200);
+
+/// Past the 2s confirmation deadline, measured from submission.
+const NATIVE_DEADLINE: Duration = Duration::from_millis(2200);
+
+/// A single-display harness whose one window is a configured follower and
+/// whose display offers `workspaces` for the user to switch between.
+fn follower_harness(workspaces: Vec<WorkspaceId>) -> TestHarness {
+    let mut params = WindowParams::new(".*", None);
+    params.follow = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            workspaces,
+        )
+        .with_windows(1)
+}
+
+/// The user switches the test display to `workspace_id`, and the OS
+/// notification arrives.
+fn user_switches_native_space(harness: &mut TestHarness, workspace_id: WorkspaceId) {
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, workspace_id, false);
+    harness.world().write_message(Event::SpaceChanged);
+}
+
+fn follower_move_pending(world: &mut World, id: WinID) -> bool {
+    let entity = find_window_entity(id, world);
+    world.entity(entity).contains::<FollowSpacePending>()
+}
+
+fn native_switch_pending(world: &World) -> bool {
+    world.resource::<InstantSpaceSwitch>().is_pending()
+}
+
+/// How long the pending native switch has been waiting, as the ECS sees it.
+fn switch_waited(world: &World) -> Duration {
+    let now = world.resource::<Time>().elapsed();
+    world.resource::<InstantSpaceSwitch>().waited(now)
+}
+
+/// The display the ECS treats as active.
+fn ecs_active_display(world: &mut World) -> u32 {
+    world
+        .query_filtered::<&Display, With<ActiveDisplayMarker>>()
+        .single(world)
+        .expect("one active display")
+        .id()
+}
+
+/// The native Spaces whose strips the ECS treats as active.
+fn ecs_active_workspaces(world: &mut World) -> Vec<WorkspaceId> {
+    world
+        .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+        .iter(world)
+        .map(LayoutStrip::id)
+        .collect()
+}
+
+/// Configuration with the native switch opt-in and nothing else.
+fn instant_switch_config() -> Config {
+    (
+        MainOptions {
+            skip_native_space_switch_animation: Some(true),
+            ..default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// The external display, to the right of the test display.
+fn ext_display_bounds() -> IRect {
+    IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    )
+}
+
+/// Whether `frame` sits entirely on the test display.
+fn on_test_display(frame: IRect) -> bool {
+    let test_bounds = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    test_bounds.contains(frame.min) && frame.max.x <= TEST_DISPLAY_WIDTH
+}
+
+/// A two-display harness whose one window, 100, is a configured follower on
+/// the external display's Space. Layout animation is instant, so a confirmed
+/// placement shows on the next frame.
+fn cross_display_follower_harness() -> TestHarness {
+    let mut params = WindowParams::new(".*", None);
+    params.follow = Some(true);
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            ..default()
+        },
+        vec![params],
+    )
+        .into();
+    TestHarness::new()
+        .with_config(config)
+        .with_display(EXT_DISPLAY_ID, ext_display_bounds(), vec![EXT_WORKSPACE_ID])
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.frame.min.x += TEST_DISPLAY_WIDTH;
+            window.frame.max.x += TEST_DISPLAY_WIDTH;
+        })
+}
+
+/// Runs startup the way production does when windows sit on Spaces that are
+/// not showing: across several frames. Windows found while `Initializing`
+/// is still present are neither focused nor requested for a native switch,
+/// so the first request is the one the test makes.
+fn start_across_frames(harness: &mut TestHarness) {
+    harness.hold_initialization();
+    harness.advance(NATIVE_REACTION);
+    harness.release_initialization();
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+}
+
+/// A started single-display harness with the native switch opt-in whose
+/// windows 0 and 1 both sit on a Space that is not showing, and whose window
+/// server holds activations in flight. No switch has been requested yet.
+fn deferred_hidden_space_harness() -> TestHarness {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = TestHarness::new()
+        .with_config(instant_switch_config())
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(0, NEXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(1, NEXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(TEST_WINDOW_WIDTH, 0, 2 * TEST_WINDOW_WIDTH, 700);
+        });
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    start_across_frames(&mut harness);
+    assert!(
+        harness.mock_state.workspace_focuses().is_empty()
+            && !native_switch_pending(harness.world()),
+        "startup requests no switch for windows on a Space that is not showing"
+    );
+    harness
+}
+
+#[test]
+fn native_focus_request_survives_early_space_change_until_confirmed() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let config: Config = (
+        MainOptions {
+            skip_native_space_switch_animation: Some(true),
+            ..default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        )
+        .with_windows(1);
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, NEXT_WORKSPACE_ID, false);
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.workspace_focuses(), vec![0]);
+    assert_eq!(harness.mock_state.pending_native_requests(), 1);
+    assert!(native_switch_pending(harness.world()));
+
+    // A Space notification that is not the requested switch arrives while the
+    // request is in flight, together with a repeat of the focus notification.
+    harness.world().write_message(Event::SpaceChanged);
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert!(
+        native_switch_pending(harness.world()),
+        "an unrelated Space change does not stand in for confirmation"
+    );
+    assert_eq!(
+        harness.mock_state.workspace_focuses(),
+        vec![0],
+        "a repeated focus notification does not resubmit the switch"
+    );
+    assert_eq!(
+        harness.mock_state.active_workspace(TEST_DISPLAY_ID),
+        NEXT_WORKSPACE_ID
+    );
+    assert!(
+        harness
+            .mock_state
+            .native_space_focus_completions()
+            .is_empty(),
+        "focus policy waits for the window server"
+    );
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.active_workspace(TEST_DISPLAY_ID),
+        TEST_WORKSPACE_ID
+    );
+    assert_eq!(
+        harness.mock_state.native_space_focus_completions(),
+        vec![TEST_WORKSPACE_ID]
+    );
+    assert!(!native_switch_pending(harness.world()));
+}
+
+#[test]
+fn command_focus_defers_cross_display_focus_until_native_confirmation() {
+    const EXT_NEXT_WORKSPACE_ID: WorkspaceId = EXT_WORKSPACE_ID + 1;
+
+    let mut harness = TestHarness::new().with_display(
+        EXT_DISPLAY_ID,
+        ext_display_bounds(),
+        vec![EXT_WORKSPACE_ID, EXT_NEXT_WORKSPACE_ID],
+    );
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::Space(SpaceOperation::Focus(SpaceSelector::Number(3))),
+    }]);
+
+    assert_eq!(
+        harness.mock_state.native_space_focuses(),
+        vec![EXT_NEXT_WORKSPACE_ID]
+    );
+    assert_eq!(harness.mock_state.pending_native_requests(), 1);
+    assert_eq!(
+        harness.mock_state.active_display(),
+        TEST_DISPLAY_ID,
+        "the source display keeps focus while the switch is in flight"
+    );
+    assert_eq!(harness.mock_state.cursor_position(), Origin::ZERO);
+    assert!(
+        harness
+            .mock_state
+            .native_space_focus_completions()
+            .is_empty()
+    );
+    assert_eq!(ecs_active_display(harness.world()), TEST_DISPLAY_ID);
+    assert_eq!(
+        ecs_active_workspaces(harness.world()),
+        vec![TEST_WORKSPACE_ID],
+        "the ECS keeps the source display and Space until the switch is confirmed"
+    );
+
+    harness.world().write_message(Event::Command {
+        command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+    });
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.native_space_focuses(),
+        vec![EXT_NEXT_WORKSPACE_ID],
+        "a second command waits for the in-flight switch"
+    );
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.active_workspace(EXT_DISPLAY_ID),
+        EXT_NEXT_WORKSPACE_ID
+    );
+    assert_eq!(
+        harness.mock_state.native_space_focus_completions(),
+        vec![EXT_NEXT_WORKSPACE_ID]
+    );
+    assert_eq!(harness.mock_state.active_display(), EXT_DISPLAY_ID);
+    assert!(
+        ext_display_bounds().contains(harness.mock_state.cursor_position()),
+        "the cursor follows only once the Space is confirmed"
+    );
+    assert!(!native_switch_pending(harness.world()));
+    assert_eq!(ecs_active_display(harness.world()), EXT_DISPLAY_ID);
+    assert_eq!(
+        ecs_active_workspaces(harness.world()),
+        vec![EXT_NEXT_WORKSPACE_ID],
+        "the ECS follows the confirmed switch onto the other display"
+    );
+}
+
+#[test]
+fn native_focus_pending_clears_when_the_target_space_vanishes() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    const THIRD_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 2;
+
+    let config: Config = (
+        MainOptions {
+            skip_native_space_switch_animation: Some(true),
+            ..default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID, THIRD_WORKSPACE_ID],
+        )
+        .with_workspace_window(0, NEXT_WORKSPACE_ID, |_| {});
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.workspace_focuses(), vec![0]);
+    assert!(native_switch_pending(harness.world()));
+
+    // The user closes the requested Desktop before the window server applies
+    // the switch.
+    harness
+        .mock_state
+        .remove_workspace(TEST_DISPLAY_ID, NEXT_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert!(
+        !native_switch_pending(harness.world()),
+        "a switch to a vanished Space goes idle instead of waiting out the deadline"
+    );
+    assert!(
+        harness
+            .mock_state
+            .native_space_focus_completions()
+            .is_empty()
+    );
+    assert_eq!(
+        harness.mock_state.active_workspace(TEST_DISPLAY_ID),
+        TEST_WORKSPACE_ID
+    );
+
+    // The abandoned switch no longer blocks a new request.
+    harness.world().write_message(Event::Command {
+        command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+    });
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.native_space_focuses(),
+        vec![THIRD_WORKSPACE_ID]
+    );
+}
+
+#[test]
+fn follower_repositions_only_after_exact_membership_is_confirmed() {
+    let mut harness = cross_display_follower_harness();
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    let frame_before = window_frame(harness.world(), 100);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![100], TEST_WORKSPACE_ID)]
+    );
+    assert_eq!(harness.mock_state.window_workspace(100), EXT_WORKSPACE_ID);
+    assert!(follower_move_pending(harness.world(), 100));
+
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "an unobserved move is not resubmitted"
+    );
+    assert_eq!(
+        window_frame(harness.world(), 100),
+        frame_before,
+        "the follower stays put until its membership is confirmed"
+    );
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(100), TEST_WORKSPACE_ID);
+    let frame = window_frame(harness.world(), 100);
+    assert!(
+        on_test_display(frame),
+        "follower at {frame:?} lands on the confirmed display"
+    );
+    assert!(!follower_move_pending(harness.world(), 100));
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+}
+
+#[test]
+fn follower_observes_an_uncertain_move_instead_of_resubmitting() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = follower_harness(vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID]);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Uncertain { applies: true });
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+    assert!(harness.mock_state.workspace_moves().is_empty());
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID)],
+        "a request that may have applied is observed, not repeated"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), TEST_WORKSPACE_ID);
+    assert!(follower_move_pending(harness.world(), 0));
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(0), NEXT_WORKSPACE_ID);
+    assert!(!follower_move_pending(harness.world(), 0));
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+}
+
+#[test]
+fn follower_drops_a_refused_move_without_retrying() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = follower_harness(vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID]);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Rejected);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID)],
+        "a request refused before submission is neither observed nor retried"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), TEST_WORKSPACE_ID);
+    assert!(!follower_move_pending(harness.world(), 0));
+
+    // Only a genuinely new Space change asks again.
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Immediate);
+    user_switches_native_space(&mut harness, TEST_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "switching back to the Space the follower never left needs no move"
+    );
+    assert!(!follower_move_pending(harness.world(), 0));
+}
+
+#[test]
+fn follower_retargets_only_after_the_in_flight_move_lands() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    const THIRD_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 2;
+
+    let mut harness = follower_harness(vec![
+        TEST_WORKSPACE_ID,
+        NEXT_WORKSPACE_ID,
+        THIRD_WORKSPACE_ID,
+    ]);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID)]
+    );
+
+    user_switches_native_space(&mut harness, THIRD_WORKSPACE_ID);
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "the newer target waits for the in-flight move to be observed"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), TEST_WORKSPACE_ID);
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID), (vec![0], THIRD_WORKSPACE_ID)]
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), NEXT_WORKSPACE_ID);
+    assert!(follower_move_pending(harness.world(), 0));
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(0), THIRD_WORKSPACE_ID);
+    assert!(!follower_move_pending(harness.world(), 0));
+}
+
+#[test]
+fn follower_gives_up_after_the_deadline_and_queues_a_new_target() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    const THIRD_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 2;
+
+    let mut harness = follower_harness(vec![
+        TEST_WORKSPACE_ID,
+        NEXT_WORKSPACE_ID,
+        THIRD_WORKSPACE_ID,
+    ]);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID)]
+    );
+
+    harness.advance(NATIVE_DEADLINE);
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "a move the window server never applies is not retried"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), TEST_WORKSPACE_ID);
+    assert!(
+        !follower_move_pending(harness.world(), 0),
+        "an unconfirmed move goes idle after the deadline"
+    );
+
+    user_switches_native_space(&mut harness, THIRD_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID), (vec![0], THIRD_WORKSPACE_ID)],
+        "a genuinely new target queues again"
+    );
+}
+
+#[test]
+fn follower_survives_its_destination_vanishing_mid_flight() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = follower_harness(vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID]);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID)]
+    );
+
+    // The user closes the destination Desktop; the window server drops the
+    // in-flight move and the display falls back to the original Space.
+    harness
+        .mock_state
+        .remove_workspace(TEST_DISPLAY_ID, NEXT_WORKSPACE_ID);
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_DEADLINE);
+
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "no move is sent to a Space the window already occupies"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), TEST_WORKSPACE_ID);
+    assert!(!follower_move_pending(harness.world(), 0));
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    assert!(
+        world
+            .entity(entity)
+            .contains::<FollowCurrentWorkspaceMarker>()
+    );
+    assert!(matches!(
+        world.get::<Unmanaged>(entity),
+        Some(Unmanaged::Floating)
+    ));
+    assert_eq!(ecs_active_workspaces(world), vec![TEST_WORKSPACE_ID]);
+}
+
+#[test]
+fn follower_found_during_multi_frame_initialization_is_carried_after_setup() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut params = WindowParams::new(".*", None);
+    params.follow = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(0, NEXT_WORKSPACE_ID, |_| {});
+    harness.hold_initialization();
+
+    // The follower is known, and marked, frames before initialization ends.
+    harness.advance(NATIVE_REACTION);
+    assert!(harness.world().contains_resource::<Initializing>());
+    let entity = find_window_entity(0, harness.world());
+    assert!(
+        harness
+            .world()
+            .entity(entity)
+            .contains::<FollowCurrentWorkspaceMarker>()
+    );
+    assert!(
+        harness.mock_state.workspace_moves().is_empty(),
+        "nothing is carried while initializing"
+    );
+
+    harness.release_initialization();
+    harness.advance(NATIVE_REACTION);
+    assert!(!harness.world().contains_resource::<Initializing>());
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], TEST_WORKSPACE_ID)],
+        "a follower found during initialization is carried to the active Space once it ends"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), TEST_WORKSPACE_ID);
+    assert!(!follower_move_pending(harness.world(), 0));
+}
+
+#[test]
+fn focus_on_a_sibling_of_the_pending_space_does_not_resubmit_the_switch() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = deferred_hidden_space_harness();
+
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.workspace_focuses(), vec![0]);
+    assert_eq!(harness.mock_state.pending_native_requests(), 1);
+    let waited_before = switch_waited(harness.world());
+
+    // The app hands focus to a sibling on the same hidden Space while the
+    // activation is still in flight.
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_focuses(),
+        vec![0],
+        "the in-flight activation is not submitted again for a sibling"
+    );
+    assert_eq!(harness.mock_state.pending_native_requests(), 1);
+    assert_eq!(
+        harness
+            .world()
+            .resource::<InstantSpaceSwitch>()
+            .pending_target(),
+        Some(NEXT_WORKSPACE_ID)
+    );
+    assert!(
+        switch_waited(harness.world()) >= waited_before + NATIVE_REACTION,
+        "the sibling's focus does not restart the confirmation deadline"
+    );
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.active_workspace(TEST_DISPLAY_ID),
+        NEXT_WORKSPACE_ID
+    );
+    assert!(!native_switch_pending(harness.world()));
+}
+
+#[test]
+fn focus_on_a_window_with_unreadable_spaces_holds_while_a_switch_is_live() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = deferred_hidden_space_harness();
+
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.workspace_focuses(), vec![0]);
+    let waited_before = switch_waited(harness.world());
+
+    // Focus moves to a window the window server cannot answer for while the
+    // activation is in flight.
+    harness.mock_state.set_window_queries_failing(1, true);
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_focuses(),
+        vec![0],
+        "a window whose Spaces cannot be read does not restart the switch"
+    );
+    assert_eq!(harness.mock_state.pending_native_requests(), 1);
+    assert!(native_switch_pending(harness.world()));
+    assert_eq!(
+        harness
+            .world()
+            .resource::<InstantSpaceSwitch>()
+            .pending_target(),
+        Some(NEXT_WORKSPACE_ID)
+    );
+    assert!(
+        switch_waited(harness.world()) >= waited_before + NATIVE_REACTION,
+        "the unreadable window does not restart the confirmation deadline"
+    );
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.active_workspace(TEST_DISPLAY_ID),
+        NEXT_WORKSPACE_ID
+    );
+    assert!(!native_switch_pending(harness.world()));
+}
+
+#[test]
+fn focus_follows_mouse_stays_suppressed_until_the_deferred_switch_settles() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    // The hidden window floats, so the only window under the pointer is the
+    // tiled one on the Space that is still showing.
+    let mut hidden = WindowParams::new("^Window 1$", None);
+    hidden.floating = Some(true);
+    let config: Config = (
+        MainOptions {
+            skip_native_space_switch_animation: Some(true),
+            ..default()
+        },
+        vec![hidden],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(1, NEXT_WORKSPACE_ID, |window| {
+            window.frame = IRect::new(600, 0, 1000, 100);
+        });
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    start_across_frames(&mut harness);
+    assert_focused!(harness.world(), 0);
+    assert!(
+        harness.mock_state.workspace_focuses().is_empty(),
+        "startup requests no switch for the hidden window"
+    );
+
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    assert!(native_switch_pending(harness.world()));
+    assert_focused!(harness.world(), 1);
+
+    // 1.5s into an activation the window server has not applied yet — past
+    // the fixed focus-follows-mouse delay, before the confirmation deadline —
+    // the pointer crosses the source Space's window.
+    let over_source_window = Event::MouseMoved {
+        point: CGPoint { x: 50.0, y: 500.0 },
+        modifiers: Modifiers::empty(),
+    };
+    harness.advance(
+        Duration::from_millis(1500)
+            .checked_sub(NATIVE_REACTION)
+            .expect("reaction precedes the mid-flight sample"),
+    );
+    assert!(native_switch_pending(harness.world()));
+    harness.world().write_message(over_source_window.clone());
+    harness.advance(NATIVE_REACTION);
+    assert_focused!(harness.world(), 1);
+
+    // Once the request has expired, the same motion focuses again.
+    harness.advance(NATIVE_DEADLINE);
+    assert!(!native_switch_pending(harness.world()));
+    harness.world().write_message(over_source_window);
+    harness.advance(NATIVE_REACTION);
+    assert_focused!(harness.world(), 0);
+}
+
+#[test]
+fn deferred_space_command_times_out_and_the_next_command_submits_again() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = TestHarness::new().with_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+    );
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+    }]);
+    assert_eq!(
+        harness.mock_state.native_space_focuses(),
+        vec![NEXT_WORKSPACE_ID]
+    );
+    assert!(native_switch_pending(harness.world()));
+
+    harness.advance(NATIVE_DEADLINE);
+    assert!(
+        !native_switch_pending(harness.world()),
+        "an activation the window server never applies is given up on"
+    );
+    assert!(
+        harness
+            .mock_state
+            .native_space_focus_completions()
+            .is_empty(),
+        "nothing is completed without confirmation"
+    );
+    assert_eq!(
+        harness.mock_state.active_workspace(TEST_DISPLAY_ID),
+        TEST_WORKSPACE_ID
+    );
+    assert_eq!(
+        ecs_active_workspaces(harness.world()),
+        vec![TEST_WORKSPACE_ID]
+    );
+
+    harness.world().write_message(Event::Command {
+        command: Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
+    });
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.native_space_focuses(),
+        vec![NEXT_WORKSPACE_ID, NEXT_WORKSPACE_ID],
+        "the expired request no longer blocks a new one"
+    );
+    assert!(native_switch_pending(harness.world()));
+}
+
+#[test]
+fn eventless_cross_display_confirmation_refreshes_the_ecs_active_display() {
+    const EXT_NEXT_WORKSPACE_ID: WorkspaceId = EXT_WORKSPACE_ID + 1;
+
+    let mut harness = TestHarness::new().with_display(
+        EXT_DISPLAY_ID,
+        ext_display_bounds(),
+        vec![EXT_WORKSPACE_ID, EXT_NEXT_WORKSPACE_ID],
+    );
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    // The window server applies the switch without announcing it.
+    harness.mock_state.set_native_activation_notifies(false);
+    harness.run(vec![Event::Command {
+        command: Command::Space(SpaceOperation::Focus(SpaceSelector::Number(3))),
+    }]);
+    assert_eq!(harness.mock_state.pending_native_requests(), 1);
+    assert_eq!(ecs_active_display(harness.world()), TEST_DISPLAY_ID);
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.native_space_focus_completions(),
+        vec![EXT_NEXT_WORKSPACE_ID]
+    );
+    assert_eq!(harness.mock_state.active_display(), EXT_DISPLAY_ID);
+    assert!(!native_switch_pending(harness.world()));
+    assert_eq!(
+        ecs_active_display(harness.world()),
+        EXT_DISPLAY_ID,
+        "the ECS learns of the confirmed switch without an OS notification"
+    );
+    assert_eq!(
+        ecs_active_workspaces(harness.world()),
+        vec![EXT_NEXT_WORKSPACE_ID]
+    );
+}
+
+#[test]
+fn follower_lands_when_an_attached_window_closes_mid_flight() {
+    let mut harness = cross_display_follower_harness();
+    harness.mock_state.attach_window(100, 101);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    let frame_before = window_frame(harness.world(), 100);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![100, 101], TEST_WORKSPACE_ID)],
+        "the attached window travels in the follower's batch"
+    );
+    assert!(follower_move_pending(harness.world(), 100));
+
+    // The sheet is dismissed while the move is in flight.
+    harness.mock_state.os_close_window(101);
+    harness.advance(NATIVE_REACTION);
+    assert!(
+        follower_move_pending(harness.world(), 100),
+        "the follower itself is still unconfirmed"
+    );
+    assert_eq!(window_frame(harness.world(), 100), frame_before);
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(100), TEST_WORKSPACE_ID);
+    let frame = window_frame(harness.world(), 100);
+    assert!(
+        on_test_display(frame),
+        "follower at {frame:?} is placed once its own move landed; its closed sheet never can"
+    );
+    assert!(!follower_move_pending(harness.world(), 100));
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+}
+
+#[test]
+fn follower_never_confirms_on_an_attached_window_whose_queries_fail() {
+    let mut harness = cross_display_follower_harness();
+    harness.mock_state.attach_window(100, 101);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    let frame_before = window_frame(harness.world(), 100);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![100, 101], TEST_WORKSPACE_ID)]
+    );
+
+    // The window server applies the move but can no longer answer for the
+    // sheet: neither its Spaces nor whether it still exists.
+    harness.mock_state.set_window_queries_failing(101, true);
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(100), TEST_WORKSPACE_ID);
+    assert_eq!(
+        window_frame(harness.world(), 100),
+        frame_before,
+        "a member that cannot be asked about is not a confirmed one"
+    );
+
+    harness.advance(NATIVE_DEADLINE);
+    assert_eq!(window_frame(harness.world(), 100), frame_before);
+    assert!(!follower_move_pending(harness.world(), 100));
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "an unconfirmable move is not resubmitted"
+    );
+}
+
+#[test]
+fn follower_with_an_unmovable_attached_window_is_not_moved_without_it() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = follower_harness(vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID]);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    // A sheet the window server will not move opens on the follower.
+    harness.mock_state.attach_window(0, 1);
+    harness.mock_state.set_window_sticky(1, true);
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0, 1], NEXT_WORKSPACE_ID)],
+        "the batch is offered whole; a live attached window is not dropped to make it movable"
+    );
+    assert_eq!(
+        harness.mock_state.window_workspace(0),
+        TEST_WORKSPACE_ID,
+        "a batch the window server refuses moves nothing"
+    );
+    assert_eq!(harness.mock_state.pending_native_requests(), 0);
+    assert!(!follower_move_pending(harness.world(), 0));
+
+    harness.advance(NATIVE_DEADLINE);
+    assert_eq!(
+        harness.mock_state.workspace_moves().len(),
+        1,
+        "a refused batch is not retried"
+    );
+}
+
+#[test]
+fn follower_leaves_out_an_attached_window_that_already_closed() {
+    const NEXT_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    let mut harness = follower_harness(vec![TEST_WORKSPACE_ID, NEXT_WORKSPACE_ID]);
+    harness.mock_state.attach_window(0, 1);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+
+    // The sheet is dismissed; the window server still lists the association.
+    harness.mock_state.os_close_window(1);
+    harness.advance(NATIVE_REACTION);
+
+    user_switches_native_space(&mut harness, NEXT_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(
+        harness.mock_state.workspace_moves(),
+        vec![(vec![0], NEXT_WORKSPACE_ID)],
+        "a window that is definitively gone is left out rather than failing the batch"
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), NEXT_WORKSPACE_ID);
+    assert!(!follower_move_pending(harness.world(), 0));
 }
 
 #[test]
@@ -716,11 +1772,13 @@ fn inertia_survives_switching_displays_before_finger_lift() {
     });
     harness.advance(Duration::from_millis(20));
 
-    // Focus crosses displays before the release reaches the input reader.
-    harness
-        .world()
-        .resource::<crate::manager::WindowManager>()
-        .focus_native_space(EXT_WORKSPACE_ID)
+    // Focus crosses displays before the release reaches the input reader:
+    // the target Space is already current there, so only the display focus
+    // policy is outstanding.
+    let window_manager = harness.world().resource::<crate::manager::WindowManager>();
+    assert!(window_manager.focus_native_space(EXT_WORKSPACE_ID).unwrap());
+    window_manager
+        .complete_native_space_focus(EXT_WORKSPACE_ID)
         .unwrap();
     harness.world().write_message(Event::DisplayChanged);
     harness.mock_state.focus_window(100);

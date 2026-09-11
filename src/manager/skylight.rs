@@ -188,12 +188,6 @@ unsafe extern "C" {
         repeat_uuid: &CFString,
     ) -> CGError;
 
-    /// Reports whether the managed display is currently changing Spaces.
-    ///
-    /// # Original signature
-    /// extern bool SLSManagedDisplayIsAnimating(int cid, `CFStringRef` uuid);
-    pub fn SLSManagedDisplayIsAnimating(cid: ConnID, uuid: &CFString) -> bool;
-
     /// Retrieves the height of the menu bar for a given display.
     ///
     /// # Arguments
