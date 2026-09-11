@@ -23,12 +23,17 @@ pub enum Error {
     IO(String),
     /// A generic error with a descriptive message.
     Generic(String),
-    /// A native macOS Space request (activation or window move) failed.
+    /// A native macOS Space request (creation, destruction, activation or
+    /// window move) failed.
     ///
     /// `request_may_have_applied` is `false` while the failure happened before
     /// anything was submitted to the window server, and `true` once any
-    /// asynchronous operation had been performed; the caller must then observe
-    /// the reported target instead of assuming the previous state.
+    /// operation had been performed; the caller must then observe the
+    /// reported target instead of assuming the previous state. For creation
+    /// `workspace_id` is `0` unless the window server returned a nonzero ID
+    /// absent from the prior census: a pre-existing ID is never reported as
+    /// created. A destruction that fails after submission carries no sample
+    /// of the windows it might have migrated.
     NativeSpaceRequest {
         workspace_id: u64,
         request_may_have_applied: bool,

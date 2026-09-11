@@ -2,27 +2,29 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, TaskPoolBuilder};
 use bevy::time::TimeUpdateStrategy;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use crate::commands::register_commands;
-use crate::config::Config;
+use crate::commands::{Command, register_commands};
+use crate::config::{Config, MainOptions};
 use crate::ecs::display::DisplayEventsPlugin;
 use crate::ecs::focus::FocusEventsPlugin;
-use crate::ecs::layout::LayoutEventsPlugin;
+use crate::ecs::layout::{LayoutEventsPlugin, LayoutStrip};
 use crate::ecs::mouse::MouseEventsPlugin;
+use crate::ecs::params::FrameActivity;
 use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
-use crate::ecs::workspace::WorkspaceEventsPlugin;
+use crate::ecs::workspace::{FollowSpacePending, WorkspaceEventsPlugin};
 use crate::ecs::{
-    BProcess, BruteforceWindows, ExistingMarker, FocusFollowsMouse, Initializing,
-    InstantSpaceSwitch, MissionControlActive, SkipReshuffle, SpawnWindowTrigger, register_systems,
-    register_triggers,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, BProcess, BruteforceWindows, ExistingMarker,
+    FocusFollowsMouse, Initializing, InstantSpaceSwitch, MissionControlActive, SkipReshuffle,
+    SpawnWindowTrigger, register_systems, register_triggers,
 };
 use crate::events::Event;
-use crate::manager::{Window, WindowManager};
+use crate::manager::{Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 
 use super::*;
@@ -311,6 +313,111 @@ pub(crate) fn find_window_entity(window_id: WinID, world: &mut World) -> Entity 
         .iter(world)
         .find(|(w, _)| w.id() == window_id)
         .map_or_else(|| panic!("window {window_id} not found"), |(_, e)| e)
+}
+
+/// Long enough for a 50ms confirmation check to land after the virtual
+/// window server applies a request, and for the resulting commands to flush.
+pub(crate) const NATIVE_REACTION: Duration = Duration::from_millis(200);
+
+/// Past the 2s confirmation deadline, measured from submission.
+pub(crate) const NATIVE_DEADLINE: Duration = Duration::from_millis(2200);
+
+/// The user switches the test display to `workspace_id`, and the OS
+/// notification arrives.
+pub(crate) fn user_switches_native_space(harness: &mut TestHarness, workspace_id: WorkspaceId) {
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, workspace_id, false);
+    harness.world().write_message(Event::SpaceChanged);
+}
+
+pub(crate) fn follower_move_pending(world: &mut World, id: WinID) -> bool {
+    let entity = find_window_entity(id, world);
+    world.entity(entity).contains::<FollowSpacePending>()
+}
+
+pub(crate) fn native_switch_pending(world: &World) -> bool {
+    world.resource::<InstantSpaceSwitch>().is_pending()
+}
+
+/// Whether anything still keeps the event pump awake: a native request
+/// whose confirmation is still being observed, or a frame in motion. What
+/// production's idle loop consults, so a wait that should have ended shows
+/// up here whatever component carries it.
+pub(crate) fn pump_awake(world: &mut World) -> bool {
+    let mut activity = SystemState::<FrameActivity>::new(world);
+    activity
+        .get_mut(world)
+        .expect("setup_world inserts InstantSpaceSwitch; the other params are queries")
+        .mid_frame()
+}
+
+/// The display the ECS treats as active.
+pub(crate) fn ecs_active_display(world: &mut World) -> u32 {
+    world
+        .query_filtered::<&Display, With<ActiveDisplayMarker>>()
+        .single(world)
+        .expect("one active display")
+        .id()
+}
+
+/// The native Spaces whose strips the ECS treats as active.
+pub(crate) fn ecs_active_workspaces(world: &mut World) -> Vec<WorkspaceId> {
+    world
+        .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+        .iter(world)
+        .map(LayoutStrip::id)
+        .collect()
+}
+
+/// Configuration with the native switch opt-in and nothing else.
+pub(crate) fn instant_switch_config() -> Config {
+    (
+        MainOptions {
+            skip_native_space_switch_animation: Some(true),
+            ..default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// The external display, to the right of the test display.
+pub(crate) fn ext_display_bounds() -> IRect {
+    IRect::new(
+        TEST_DISPLAY_WIDTH,
+        0,
+        TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+        EXT_DISPLAY_HEIGHT,
+    )
+}
+
+/// Whether `frame` sits entirely on the test display.
+pub(crate) fn on_test_display(frame: IRect) -> bool {
+    let test_bounds = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    test_bounds.contains(frame.min) && frame.max.x <= TEST_DISPLAY_WIDTH
+}
+
+/// Runs startup the way production does when windows sit on Spaces that are
+/// not showing: across several frames. Windows found while `Initializing`
+/// is still present are neither focused nor requested for a native switch,
+/// so the first request is the one the test makes.
+pub(crate) fn start_across_frames(harness: &mut TestHarness) {
+    harness.hold_initialization();
+    harness.advance(NATIVE_REACTION);
+    harness.release_initialization();
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+}
+
+pub(crate) fn window_frame(world: &mut World, id: WinID) -> IRect {
+    let mut query = world.query::<&Window>();
+    query
+        .iter(world)
+        .find(|w| w.id() == id)
+        .map(|w| w.frame())
+        .expect("window not found")
 }
 
 #[macro_export]

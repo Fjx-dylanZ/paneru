@@ -137,6 +137,10 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
             parse_virtual_workspace_number(argument()?)?,
             MoveFocus::Stay,
         ),
+        // Native Space moves take exactly one selector; anything trailing is a
+        // typo we refuse rather than a modifier we silently drop.
+        "spacemove" => Operation::SpaceMove(space_selector(argv)?, MoveFocus::Follow),
+        "spacesend" => Operation::SpaceMove(space_selector(argv)?, MoveFocus::Stay),
         _ => return Err(err()),
     })
 }
@@ -154,6 +158,14 @@ fn virtual_target(
     }
 }
 
+/// Parses the single native Space selector following a `window space*` verb.
+fn space_selector(argv: &[&str]) -> Result<SpaceSelector> {
+    let [_, selector] = argv else {
+        return Err(ParseError::invalid(argv));
+    };
+    SpaceSelector::parse(selector)
+}
+
 /// Parses a mouse command (e.g. `["nextdisplay"]`).
 fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     match *argv.first().unwrap_or(&"") {
@@ -162,11 +174,26 @@ fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     }
 }
 
+/// Parses a native Space operation (e.g. `["focus", "next"]`,
+/// `["destroy", "3", "migrate"]`).
+///
+/// Arity is exact: `destroy` accepts only the canonical `migrate` keyword
+/// as its optional third token, so a mistyped option can never be read as
+/// "delete without migrating".
 fn parse_space_operation(argv: &[&str]) -> Result<SpaceOperation> {
-    let ["focus", selector] = argv else {
-        return Err(ParseError::invalid(argv));
-    };
-    Ok(SpaceOperation::Focus(SpaceSelector::parse(selector)?))
+    Ok(match argv {
+        ["focus", selector] => SpaceOperation::Focus(SpaceSelector::parse(selector)?),
+        ["create"] => SpaceOperation::Create,
+        ["destroy", selector] => SpaceOperation::Destroy {
+            selector: SpaceSelector::parse(selector)?,
+            migrate: false,
+        },
+        ["destroy", selector, "migrate"] => SpaceOperation::Destroy {
+            selector: SpaceSelector::parse(selector)?,
+            migrate: true,
+        },
+        _ => return Err(ParseError::invalid(argv)),
+    })
 }
 
 impl Command {
@@ -187,6 +214,16 @@ impl Command {
             }
             Command::Space(SpaceOperation::Focus(selector)) => {
                 vec!["space".to_string(), "focus".to_string(), selector.token()]
+            }
+            Command::Space(SpaceOperation::Create) => {
+                vec!["space".to_string(), "create".to_string()]
+            }
+            Command::Space(SpaceOperation::Destroy { selector, migrate }) => {
+                let mut argv = vec!["space".to_string(), "destroy".to_string(), selector.token()];
+                if *migrate {
+                    argv.push("migrate".to_string());
+                }
+                argv
             }
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
@@ -254,6 +291,12 @@ impl Operation {
             Operation::CycleFloating(true) => owned(&["cyclefloat", "reverse"]),
             Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
             Operation::CopyRule => owned(&["copyrule"]),
+            Operation::SpaceMove(selector, MoveFocus::Follow) => {
+                vec!["spacemove".to_string(), selector.token()]
+            }
+            Operation::SpaceMove(selector, MoveFocus::Stay) => {
+                vec!["spacesend".to_string(), selector.token()]
+            }
         }
     }
 }
@@ -307,6 +350,10 @@ mod tests {
             Operation::CycleFloating(true),
             Operation::ToggleFloatingLayer,
             Operation::CopyRule,
+            Operation::SpaceMove(SpaceSelector::Next, MoveFocus::Follow),
+            Operation::SpaceMove(SpaceSelector::Previous, MoveFocus::Stay),
+            Operation::SpaceMove(SpaceSelector::Number(4), MoveFocus::Follow),
+            Operation::SpaceMove(SpaceSelector::Number(4), MoveFocus::Stay),
         ];
 
         for operation in operations {
@@ -330,6 +377,15 @@ mod tests {
             Command::Space(SpaceOperation::Focus(SpaceSelector::Next)),
             Command::Space(SpaceOperation::Focus(SpaceSelector::Previous)),
             Command::Space(SpaceOperation::Focus(SpaceSelector::Number(3))),
+            Command::Space(SpaceOperation::Create),
+            Command::Space(SpaceOperation::Destroy {
+                selector: SpaceSelector::Next,
+                migrate: false,
+            }),
+            Command::Space(SpaceOperation::Destroy {
+                selector: SpaceSelector::Number(3),
+                migrate: true,
+            }),
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),
@@ -364,5 +420,58 @@ mod tests {
         assert!(parse_command(&["window", "cyclefloat", "backwards"]).is_err());
         assert!(parse_command(&["space", "focus", "0"]).is_err());
         assert!(parse_command(&["space", "focus", "next", "extra"]).is_err());
+    }
+
+    /// `migrate` is the only way to opt into moving windows off a destroyed
+    /// Space, and it is opt-in: a bare `destroy` must never encode it, and a
+    /// misspelt or extra token must fail rather than fall back to either form.
+    #[test]
+    fn space_destroy_migration_is_explicit_and_strict() {
+        assert_eq!(
+            parse_command(&["space", "destroy", "3"]),
+            Ok(Command::Space(SpaceOperation::Destroy {
+                selector: SpaceSelector::Number(3),
+                migrate: false,
+            }))
+        );
+        assert_eq!(
+            parse_command(&["space", "destroy", "previous", "migrate"]),
+            Ok(Command::Space(SpaceOperation::Destroy {
+                selector: SpaceSelector::Previous,
+                migrate: true,
+            }))
+        );
+        assert!(parse_command(&["space", "destroy"]).is_err());
+        assert!(parse_command(&["space", "destroy", "0"]).is_err());
+        assert!(parse_command(&["space", "destroy", "current"]).is_err());
+        assert!(parse_command(&["space", "destroy", "3", "force"]).is_err());
+        assert!(parse_command(&["space", "destroy", "3", "migrate", "extra"]).is_err());
+        assert!(parse_command(&["space", "destroy", "migrate"]).is_err());
+        assert!(parse_command(&["space", "create", "extra"]).is_err());
+    }
+
+    /// `spacemove` follows and `spacesend` stays; both need exactly one
+    /// selector and never accept a follow modifier that could flip them.
+    #[test]
+    fn window_space_moves_take_exactly_one_selector() {
+        assert_eq!(
+            parse_command(&["window", "spacemove", "next"]),
+            Ok(Command::Window(Operation::SpaceMove(
+                SpaceSelector::Next,
+                MoveFocus::Follow
+            )))
+        );
+        assert_eq!(
+            parse_command(&["window", "spacesend", "2"]),
+            Ok(Command::Window(Operation::SpaceMove(
+                SpaceSelector::Number(2),
+                MoveFocus::Stay
+            )))
+        );
+        assert!(parse_command(&["window", "spacemove"]).is_err());
+        assert!(parse_command(&["window", "spacemove", "0"]).is_err());
+        assert!(parse_command(&["window", "spacesend", "east"]).is_err());
+        assert!(parse_command(&["window", "spacemove", "next", "stay"]).is_err());
+        assert!(parse_command(&["window", "spacesend", "next", "follow"]).is_err());
     }
 }
