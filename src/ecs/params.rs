@@ -7,6 +7,7 @@ use bevy::{
         world::Mut,
     },
     math::IRect,
+    time::Time,
 };
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
@@ -18,9 +19,10 @@ use crate::{
         ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
         Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
         ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        workspace::FollowSpacePending,
     },
     manager::{Application, Display, Origin, Size, Window},
-    platform::{ProcessSerialNumber, WinID},
+    platform::{ProcessSerialNumber, WinID, WorkspaceId},
 };
 
 /// A Bevy `SystemParam` that provides access to the application's configuration and related state.
@@ -31,8 +33,10 @@ pub struct GlobalState<'w> {
     focus_follows_mouse_id: ResMut<'w, FocusFollowsMouse>,
     /// Resource to determine if window reshuffling should be skipped.
     skip_reshuffle: ResMut<'w, SkipReshuffle>,
-    /// State for instant native Space focus transitions.
+    /// State for native Space focus transitions.
     instant_space_switch: ResMut<'w, InstantSpaceSwitch>,
+    /// The clock native Space requests are timed against.
+    time: Res<'w, Time>,
 
     initializing: Option<Res<'w, Initializing>>,
 }
@@ -76,15 +80,27 @@ impl GlobalState<'_> {
     }
 
     pub fn should_begin_instant_space_switch(&self, window_id: WinID) -> bool {
-        self.instant_space_switch.should_begin(window_id)
+        self.instant_space_switch
+            .should_begin(window_id, self.time.elapsed())
     }
 
-    pub fn begin_instant_space_switch(&mut self, window_id: WinID) {
-        self.instant_space_switch.begin(window_id);
+    /// The Space a focus-driven native switch is still waiting on, so a focus
+    /// notification for another window on that same Space is not submitted
+    /// again on top of it.
+    pub fn live_instant_space_target(&self) -> Option<WorkspaceId> {
+        self.instant_space_switch.live_target(self.time.elapsed())
+    }
+
+    /// Records that a native switch to `target` was submitted on behalf of
+    /// `window_id`; it is confirmed later, never assumed.
+    pub fn begin_instant_space_switch(&mut self, window_id: WinID, target: WorkspaceId) {
+        let now = self.time.elapsed();
+        self.instant_space_switch.begin(window_id, target, now);
     }
 
     pub fn suppress_focus_follows_mouse(&self) -> bool {
-        self.instant_space_switch.suppress_focus_follows_mouse()
+        self.instant_space_switch
+            .suppress_focus_follows_mouse(self.time.elapsed())
     }
 
     pub fn initializing(&self) -> bool {
@@ -211,7 +227,8 @@ impl ActiveDisplayMut<'_, '_> {
     }
 }
 
-/// Markers indicating something on screen is still animating; used by the
+/// Markers indicating something is still in motion — frames to draw, or a
+/// native Space request whose confirmation has yet to be observed; used by the
 /// event pump to decide how long it may sleep.
 #[derive(SystemParam)]
 pub struct FrameActivity<'w, 's> {
@@ -219,16 +236,21 @@ pub struct FrameActivity<'w, 's> {
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    space_switch: Res<'w, InstantSpaceSwitch>,
+    following: Query<'w, 's, (), With<FollowSpacePending>>,
 }
 
 impl FrameActivity<'_, '_> {
-    /// Returns `true` while any window is being moved, resized or scrolled, or
-    /// a flash message is on screen — i.e. while frames still need drawing.
+    /// Returns `true` while any window is being moved, resized or scrolled, a
+    /// flash message is on screen, or a native Space switch or follower move
+    /// is awaiting confirmation — i.e. while the pump must keep waking.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || self.space_switch.is_pending()
+            || !self.following.is_empty()
     }
 }
 

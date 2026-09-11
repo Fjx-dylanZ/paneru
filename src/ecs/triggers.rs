@@ -29,6 +29,7 @@ use crate::ecs::{
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
     VerifyWindowPosition, WidthRatio, WindowProperties,
 };
+use crate::errors::Error;
 use crate::events::{DestroySource, Event};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
@@ -73,6 +74,16 @@ pub(crate) fn apply_config_side_effects(
     }
 }
 
+/// Submits a native switch to the Space holding `window_id` when the
+/// `skip_native_space_switch_animation` opt-in is on. A submission is not a
+/// confirmation: it is recorded on [`InstantSpaceSwitch`](super::InstantSpaceSwitch)
+/// and observed by `confirm_native_space_focus`; a partially applied request
+/// is observed the same way rather than retried. While one is in flight, a
+/// focus notification for another window that lives on the very Space being
+/// activated — a tab-group sibling the app reports focused instead — asks
+/// nothing more of the window server: the request already out will carry it.
+/// A window whose Spaces cannot be read at all while that request is live
+/// gets no blind second write either; only a known, different Space does.
 fn focus_window_workspace_if_configured(
     window_id: WinID,
     app: &Application,
@@ -87,15 +98,49 @@ fn focus_window_workspace_if_configured(
     {
         return;
     }
+    if let Some(pending) = global_state.live_instant_space_target() {
+        match window_manager.window_workspaces(window_id) {
+            Ok(workspaces) if !workspaces.contains(&pending) => {}
+            Ok(_) => {
+                debug!(
+                    window_id,
+                    workspace_id = pending,
+                    "native Space switch already in flight for this window's Space"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    window_id,
+                    workspace_id = pending,
+                    "native Space switch in flight and this window's Spaces are unknown; not requesting another: {err}"
+                );
+                return;
+            }
+        }
+    }
 
     match window_manager.focus_window_workspace(window_id, app.psn()) {
         Ok(Some(workspace_id)) => {
-            global_state.begin_instant_space_switch(window_id);
-            debug!(window_id, workspace_id, "posted instant Space switch");
+            global_state.begin_instant_space_switch(window_id, workspace_id);
+            debug!(window_id, workspace_id, "requested native Space switch");
         }
         Ok(None) => {}
+        Err(Error::NativeSpaceRequest {
+            workspace_id,
+            request_may_have_applied: true,
+            message,
+            ..
+        }) => {
+            global_state.begin_instant_space_switch(window_id, workspace_id);
+            warn!(
+                window_id,
+                workspace_id,
+                "native Space switch may have partially applied, observing it: {message}"
+            );
+        }
         Err(err) => {
-            warn!(window_id, "instant Space switch unavailable: {err}");
+            warn!(window_id, "native Space switch unavailable: {err}");
         }
     }
 }

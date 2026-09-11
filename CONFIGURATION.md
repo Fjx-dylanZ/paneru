@@ -24,7 +24,7 @@ General behavior settings for the window manager.
 | :--- | :--- | :--- | :--- |
 | `focus_follows_mouse` | Boolean | `true` | If enabled, the window under the mouse cursor will automatically gain focus. |
 | `mouse_follows_focus` | Boolean | `true` | If enabled, the mouse cursor will warp to the center of the focused window when focus changes via keyboard. |
-| `skip_native_space_switch_animation` | Boolean | `false` | If enabled, focusing a window on another native macOS Space posts a high-velocity Dock gesture to skip the transition animation. This works with SIP enabled. On another display, the cursor moves to that display so the gesture targets the correct Space. |
+| `skip_native_space_switch_animation` | Boolean | `false` | If enabled, focusing a window on another native macOS Space requests native activation without a sliding transition. Uses runtime-checked private APIs with SIP enabled, not synthetic gestures. Display focus is completed after the target Space is confirmed current. |
 | `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
@@ -208,7 +208,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_vertical_shrink` | Cycle a stacked window through preset heights (Shrink). |
 | `window_fullwidth` | Toggle full-width mode. |
 | `window_manage` | Toggle between tiled and floating state. |
-| `window_follow` | Toggle sticky-style following of the current native macOS Space. Following implies floating. |
+| `window_follow` | Toggle carrying the window to the current native macOS Space. Following implies floating. |
 | `window_stack` | Stack the current window into the column on the left. |
 | `window_unstack` | Pull a window out of a stack into its own column. |
 | `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
@@ -240,10 +240,16 @@ displays. Relative selection does not wrap: `next` on the last Space and
 instant native Space transition, independently of
 `skip_native_space_switch_animation`. They also support empty Spaces.
 
-When a target Space is already visible on another display, Paneru activates
-that display. Otherwise, it moves the cursor to the target display before
-posting the Space gesture. Commands are ignored while Mission Control is open
-or a prior instant transition is still pending.
+Paneru requests the native show/hide/set-current sequence on the target's owning
+display, then confirms it without blocking the event loop. Cursor and display
+focus changes happen only after that confirmation. A Space already current on
+another display only needs the display-focus step. Commands are ignored while
+Mission Control is open or a prior instant transition is still pending.
+
+Private API availability and method signatures are checked at runtime. An
+unconfirmed request expires after two seconds; a timeout or partial failure does
+not prove that macOS applied nothing. Paneru logs the outcome and does not inject
+a fallback gesture or repeatedly resubmit a pending request.
 
 | Action | Description |
 | :--- | :--- |
@@ -419,10 +425,19 @@ current Paneru process, while a window rule reapplies whenever the window is
 discovered.
 
 This is a one-Space-to-one-Space move, not true simultaneous membership in all
-macOS Spaces. It uses a capability-detected private SkyLight operation and does
-not require disabling System Integrity Protection. If Apple removes that
-operation in a future macOS build, Paneru logs the feature as unavailable and
-does not use a SIP-requiring fallback.
+macOS Spaces. It uses runtime-checked private SkyLight operations with SIP enabled.
+Only ordinary single-Space application windows can be moved; fullscreen,
+multi-Space and unsupported live associated windows are refused before submission.
+
+Paneru confirms the exact destination membership of the window and its associated
+windows before repositioning it onto another display. A definitively closed
+associated window no longer blocks confirmation; unreadable metadata is not
+treated as proof that it closed. Confirmation is bounded to two seconds without
+blocking input processing or blindly retrying. A later workspace change can queue
+the follower again after an unavailable or unconfirmed operation.
+
+These private APIs can change between macOS releases. Native movement and
+activation do not fall back to synthetic gestures, Dock injection or disabling SIP.
 
 ### Forcing management of LSUIElement or non-standard windows
 

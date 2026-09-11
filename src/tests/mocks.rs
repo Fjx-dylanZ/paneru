@@ -77,6 +77,35 @@ struct MockDisplayData {
     active_workspace: WorkspaceId,
 }
 
+/// What the virtual window server does with a native Space request after the
+/// manager has submitted it. The default mirrors a window server that keeps
+/// up; the others model the asynchronous bridge honestly: a request that is
+/// not yet applied is not reported as applied by any query.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NativeRequestOutcome {
+    /// Applied before the submitting call returns.
+    #[default]
+    Immediate,
+    /// Accepted, but held in flight until [`MockState::settle_native_requests`].
+    Deferred,
+    /// Refused before anything is submitted.
+    Rejected,
+    /// Reported as failed after submission; `applies` decides whether the
+    /// window server nevertheless carries it out on settle.
+    Uncertain { applies: bool },
+}
+
+/// A submitted native request the virtual window server has not applied yet.
+enum PendingNativeRequest {
+    Move {
+        windows: Vec<WinID>,
+        workspace_id: WorkspaceId,
+    },
+    Activate {
+        workspace_id: WorkspaceId,
+    },
+}
+
 /// The internal state of our "Virtual macOS".
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
@@ -90,9 +119,170 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
+    /// Child windows the window server reports for a parent. Reported as
+    /// recorded, like an app's window list: a closed child stays associated
+    /// until it is explicitly disassociated, so a stale association can be
+    /// handed to the manager after the child is already gone.
+    associated_windows: HashMap<WinID, Vec<WinID>>,
+    /// Windows on every Space at once; the window server refuses to move
+    /// them, and reports every Space as their membership.
+    sticky_windows: HashSet<WinID>,
+    /// Windows whose per-window queries fail outright, independent of
+    /// whether the window exists: the answer is an error, not absence.
+    failing_window_queries: HashSet<WinID>,
+    /// Every move the manager requested, whether the window server accepted,
+    /// deferred or refused it.
     workspace_moves: Vec<(Vec<WinID>, WorkspaceId)>,
     workspace_focuses: Vec<WinID>,
     native_space_focuses: Vec<WorkspaceId>,
+    /// Spaces whose cross-display focus policy was completed after
+    /// confirmation.
+    native_space_focus_completions: Vec<WorkspaceId>,
+    native_move_outcome: NativeRequestOutcome,
+    native_activation_outcome: NativeRequestOutcome,
+    /// Whether an applied activation is announced with `SpaceChanged`, as
+    /// the OS normally does. Off, the manager only learns of the switch by
+    /// asking.
+    activation_notifies: bool,
+    pending_native_requests: Vec<PendingNativeRequest>,
+}
+
+impl MockStateInner {
+    fn owning_display(&self, workspace_id: WorkspaceId) -> Option<u32> {
+        self.displays.values().find_map(|display| {
+            display
+                .workspaces
+                .contains(&workspace_id)
+                .then_some(display.id)
+        })
+    }
+
+    fn apply(&mut self, request: PendingNativeRequest) {
+        match request {
+            PendingNativeRequest::Move {
+                windows,
+                workspace_id,
+            } => {
+                // A destination that vanished while the request was in flight
+                // cannot receive anything; the window server drops the move.
+                if self.owning_display(workspace_id).is_none() {
+                    return;
+                }
+                for window_id in windows {
+                    if let Some(window) = self.windows.get_mut(&window_id) {
+                        window.workspace_id = workspace_id;
+                    }
+                }
+            }
+            PendingNativeRequest::Activate { workspace_id } => {
+                let Some(display_id) = self.owning_display(workspace_id) else {
+                    return;
+                };
+                self.displays
+                    .get_mut(&display_id)
+                    .expect("finding owning display")
+                    .active_workspace = workspace_id;
+                if self.activation_notifies {
+                    self.event_queue.push_back(Event::SpaceChanged);
+                }
+            }
+        }
+    }
+
+    /// Routes a submitted request through the configured outcome.
+    fn submit(
+        &mut self,
+        outcome: NativeRequestOutcome,
+        workspace_id: WorkspaceId,
+        request: PendingNativeRequest,
+    ) -> crate::errors::Result<()> {
+        match outcome {
+            NativeRequestOutcome::Immediate => {
+                self.apply(request);
+                Ok(())
+            }
+            NativeRequestOutcome::Deferred => {
+                self.pending_native_requests.push(request);
+                Ok(())
+            }
+            NativeRequestOutcome::Rejected => Err(Error::NativeSpaceRequest {
+                workspace_id,
+                request_may_have_applied: false,
+                message: "the virtual window server refused the request".to_string(),
+            }),
+            NativeRequestOutcome::Uncertain { applies } => {
+                if applies {
+                    self.pending_native_requests.push(request);
+                }
+                Err(Error::NativeSpaceRequest {
+                    workspace_id,
+                    request_may_have_applied: true,
+                    message: "the virtual window server lost the reply".to_string(),
+                })
+            }
+        }
+    }
+
+    /// The Spaces the window server reports for `window_id`, read the way
+    /// `SLSCopySpacesForWindows` answers: an empty list for a window it no
+    /// longer knows, every Space for a sticky one.
+    fn window_memberships(&self, window_id: WinID) -> crate::errors::Result<Vec<WorkspaceId>> {
+        self.check_window_query(window_id)?;
+        let Some(window) = self.windows.get(&window_id) else {
+            return Ok(vec![]);
+        };
+        if self.sticky_windows.contains(&window_id) {
+            let mut displays = self.displays.values().collect::<Vec<_>>();
+            displays.sort_unstable_by_key(|display| display.id);
+            return Ok(displays
+                .into_iter()
+                .flat_map(|display| display.workspaces.iter().copied())
+                .collect());
+        }
+        Ok(vec![window.workspace_id])
+    }
+
+    fn check_window_query(&self, window_id: WinID) -> crate::errors::Result<()> {
+        if self.failing_window_queries.contains(&window_id) {
+            return Err(Error::Generic(format!(
+                "the virtual window server could not answer for window {window_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates a move batch the way the bridge does before it submits
+    /// anything: every member must exist and sit on exactly one Space. The
+    /// first offender fails the whole batch; nothing is submitted.
+    fn check_move_batch(&self, windows: &[WinID]) -> crate::errors::Result<()> {
+        for &window_id in windows {
+            match self.window_memberships(window_id)?.as_slice() {
+                [] => {
+                    return Err(Error::NotFound(format!(
+                        "window {window_id} has no native Space membership; it may not exist"
+                    )));
+                }
+                [_] => {}
+                memberships => {
+                    return Err(Error::InvalidInput(format!(
+                        "window {window_id} belongs to {} native Spaces and cannot be moved",
+                        memberships.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `window_id` is attached to a parent. Attached windows are not
+    /// standalone application windows: the window server leaves them out of
+    /// its Space window lists and the app never offers them for management,
+    /// so they only reach the manager through the parent's association.
+    fn is_associated_child(&self, window_id: WinID) -> bool {
+        self.associated_windows
+            .values()
+            .any(|children| children.contains(&window_id))
+    }
 }
 
 #[derive(Clone)]
@@ -113,9 +303,17 @@ impl MockState {
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
+                associated_windows: HashMap::new(),
+                sticky_windows: HashSet::new(),
+                failing_window_queries: HashSet::new(),
                 workspace_moves: Vec::new(),
                 workspace_focuses: Vec::new(),
                 native_space_focuses: Vec::new(),
+                native_space_focus_completions: Vec::new(),
+                native_move_outcome: NativeRequestOutcome::default(),
+                native_activation_outcome: NativeRequestOutcome::default(),
+                activation_notifies: true,
+                pending_native_requests: Vec::new(),
             })),
         }
     }
@@ -281,6 +479,123 @@ impl MockState {
 
     pub(crate) fn native_space_focuses(&self) -> Vec<WorkspaceId> {
         self.inner.force_read().native_space_focuses.clone()
+    }
+
+    pub(crate) fn native_space_focus_completions(&self) -> Vec<WorkspaceId> {
+        self.inner
+            .force_read()
+            .native_space_focus_completions
+            .clone()
+    }
+
+    // --- Native Request Controls ---
+
+    pub(crate) fn set_native_move_outcome(&self, outcome: NativeRequestOutcome) {
+        self.inner.force_write().native_move_outcome = outcome;
+    }
+
+    pub(crate) fn set_native_activation_outcome(&self, outcome: NativeRequestOutcome) {
+        self.inner.force_write().native_activation_outcome = outcome;
+    }
+
+    /// Whether the window server announces an applied activation with
+    /// `SpaceChanged`. Off, a confirmed switch is only visible to whoever
+    /// asks the window server.
+    pub(crate) fn set_native_activation_notifies(&self, notifies: bool) {
+        self.inner.force_write().activation_notifies = notifies;
+    }
+
+    /// Spawns `child` attached to `parent` the way a sheet or an attached
+    /// panel is: owned by the parent's app, on the parent's Space, and
+    /// reported by the window server as one of the parent's associated
+    /// windows. The association is reported as recorded even after the child
+    /// closes; it is the caller's job to check whether the child still exists.
+    pub(crate) fn attach_window(&self, parent: WinID, child: WinID) {
+        let mut inner = self.inner.force_write();
+        let parent_window = inner.windows.get(&parent).expect("finding parent window");
+        let (pid, workspace_id, frame) = (
+            parent_window.pid,
+            parent_window.workspace_id,
+            parent_window.frame,
+        );
+        inner.windows.insert(
+            child,
+            MockWindowData {
+                id: child,
+                pid,
+                frame,
+                title: format!("Sheet {child}"),
+                workspace_id,
+                ..default()
+            },
+        );
+        inner
+            .associated_windows
+            .entry(parent)
+            .or_default()
+            .push(child);
+    }
+
+    /// Puts `window_id` on every Space at once. The window server reports
+    /// all of them as its membership and refuses to move it, failing any
+    /// batch that contains it before anything is submitted.
+    pub(crate) fn set_window_sticky(&self, window_id: WinID, sticky: bool) {
+        let mut inner = self.inner.force_write();
+        if sticky {
+            inner.sticky_windows.insert(window_id);
+        } else {
+            inner.sticky_windows.remove(&window_id);
+        }
+    }
+
+    /// Makes every per-window query about `window_id` fail, whether or not
+    /// the window exists. A failed query is never an answer about existence
+    /// or membership.
+    pub(crate) fn set_window_queries_failing(&self, window_id: WinID, failing: bool) {
+        let mut inner = self.inner.force_write();
+        if failing {
+            inner.failing_window_queries.insert(window_id);
+        } else {
+            inner.failing_window_queries.remove(&window_id);
+        }
+    }
+
+    /// Number of submitted requests the window server has not applied yet.
+    pub(crate) fn pending_native_requests(&self) -> usize {
+        self.inner.force_read().pending_native_requests.len()
+    }
+
+    /// Lets the window server carry out every in-flight request, in
+    /// submission order, emitting the notifications a real apply would.
+    pub(crate) fn settle_native_requests(&self) {
+        let mut inner = self.inner.force_write();
+        for request in std::mem::take(&mut inner.pending_native_requests) {
+            inner.apply(request);
+        }
+    }
+
+    /// Removes a Space from its display, as when the user closes a Desktop
+    /// in Mission Control, reporting it the way macOS does: the Space change
+    /// first when the current Space vanished, then the destruction. Windows
+    /// keep their stale membership until an explicit move, which is what the
+    /// window server reports for a Space that no longer exists.
+    pub(crate) fn remove_workspace(&self, display_id: u32, workspace_id: WorkspaceId) {
+        let mut inner = self.inner.force_write();
+        let display = inner
+            .displays
+            .get_mut(&display_id)
+            .expect("finding display");
+        display.workspaces.retain(|id| *id != workspace_id);
+        let fell_back = display.active_workspace == workspace_id;
+        if fell_back {
+            display.active_workspace = display.workspaces.first().copied().unwrap_or_default();
+        }
+        if fell_back {
+            inner.event_queue.push_back(Event::SpaceChanged);
+        }
+        inner.event_queue.push_back(Event::SpaceDestroyed {
+            space_id: workspace_id,
+        });
     }
 
     // --- State Mutation Methods ---
@@ -709,6 +1024,7 @@ impl MockState {
                         .filter(|&(_, &owner)| owner == pid)
                         .map(|(&id, _)| id),
                 )
+                .filter(|&id| !inner.is_associated_child(id))
                 .collect::<Vec<_>>()
         };
 
@@ -767,29 +1083,22 @@ impl MockState {
         wm.expect_focus_native_space()
             .returning(move |workspace_id| {
                 let mut inner = s.inner.force_write();
-                let display_id = inner
-                    .displays
-                    .iter()
-                    .find_map(|(id, display)| {
-                        display.workspaces.contains(&workspace_id).then_some(*id)
-                    })
-                    .ok_or(Error::InvalidWindow)?;
-                let changed = inner.active_display_id != display_id
-                    || inner
-                        .displays
-                        .get(&display_id)
-                        .is_some_and(|display| display.active_workspace != workspace_id);
-                if !changed {
+                let display_id = inner.owning_display(workspace_id).ok_or_else(|| {
+                    Error::NotFound(format!("no display owns native Space {workspace_id}"))
+                })?;
+                let current = inner.displays[&display_id].active_workspace == workspace_id;
+                if current && inner.active_display_id == display_id {
                     return Ok(false);
                 }
-                inner.active_display_id = display_id;
-                inner
-                    .displays
-                    .get_mut(&display_id)
-                    .expect("finding target display")
-                    .active_workspace = workspace_id;
                 inner.native_space_focuses.push(workspace_id);
-                inner.event_queue.push_back(Event::SpaceChanged);
+                if !current {
+                    let outcome = inner.native_activation_outcome;
+                    inner.submit(
+                        outcome,
+                        workspace_id,
+                        PendingNativeRequest::Activate { workspace_id },
+                    )?;
+                }
                 Ok(true)
             });
 
@@ -802,15 +1111,8 @@ impl MockState {
                     .get(&window_id)
                     .map(|window| window.workspace_id)
                     .ok_or(Error::InvalidWindow)?;
-                let display_id = inner
-                    .displays
-                    .iter()
-                    .find_map(|(id, display)| {
-                        display
-                            .workspaces
-                            .contains(&target_workspace)
-                            .then_some(*id)
-                    })
+                inner
+                    .owning_display(target_workspace)
                     .ok_or(Error::InvalidWindow)?;
                 if inner
                     .displays
@@ -819,15 +1121,61 @@ impl MockState {
                 {
                     return Ok(None);
                 }
-                inner.active_display_id = display_id;
-                inner
-                    .displays
-                    .get_mut(&display_id)
-                    .expect("finding target display")
-                    .active_workspace = target_workspace;
                 inner.workspace_focuses.push(window_id);
-                inner.event_queue.push_back(Event::SpaceChanged);
+                let outcome = inner.native_activation_outcome;
+                inner.submit(
+                    outcome,
+                    target_workspace,
+                    PendingNativeRequest::Activate {
+                        workspace_id: target_workspace,
+                    },
+                )?;
                 Ok(Some(target_workspace))
+            });
+
+        let s = self.clone();
+        wm.expect_window_workspaces()
+            .returning(move |window_id| s.inner.force_read().window_memberships(window_id));
+
+        let s = self.clone();
+        wm.expect_window_exists().returning(move |window_id| {
+            let inner = s.inner.force_read();
+            inner.check_window_query(window_id)?;
+            Ok(inner.windows.contains_key(&window_id))
+        });
+
+        let s = self.clone();
+        wm.expect_native_space_is_active()
+            .returning(move |workspace_id| {
+                let inner = s.inner.force_read();
+                let display_id = inner.owning_display(workspace_id).ok_or_else(|| {
+                    Error::NotFound(format!("no display owns native Space {workspace_id}"))
+                })?;
+                Ok(inner.displays[&display_id].active_workspace == workspace_id)
+            });
+
+        let s = self.clone();
+        wm.expect_complete_native_space_focus()
+            .returning(move |workspace_id| {
+                let mut inner = s.inner.force_write();
+                let display_id = inner.owning_display(workspace_id).ok_or_else(|| {
+                    Error::NotFound(format!("no display owns native Space {workspace_id}"))
+                })?;
+                let (current, bounds) = {
+                    let display = &inner.displays[&display_id];
+                    (display.active_workspace, display.bounds)
+                };
+                if current != workspace_id {
+                    return Err(Error::Generic(format!(
+                        "native Space {workspace_id} is not current on display {display_id} yet"
+                    )));
+                }
+                if !bounds.contains(inner.cursor_position) {
+                    inner.cursor_position = bounds.center();
+                }
+                inner.active_display_id = display_id;
+                inner.native_space_focus_completions.push(workspace_id);
+                Ok(())
             });
 
         let s = self.clone();
@@ -849,14 +1197,15 @@ impl MockState {
         wm.expect_find_existing_application_windows()
             .returning(move |app, spaces, _config| {
                 let pid = app.pid();
-                let mut windows = s
-                    .inner
-                    .force_read()
+                let inner = s.inner.force_read();
+                let mut windows = inner
                     .windows
                     .values()
                     .filter_map(|w| {
-                        (w.pid == pid && spaces.contains(&w.workspace_id))
-                            .then_some(s.create_window(w.id))
+                        (w.pid == pid
+                            && spaces.contains(&w.workspace_id)
+                            && !inner.is_associated_child(w.id))
+                        .then_some(s.create_window(w.id))
                     })
                     .collect::<Vec<_>>();
                 windows.sort_unstable_by_key(|window| window.id());
@@ -866,12 +1215,14 @@ impl MockState {
         let s = self.clone();
         wm.expect_windows_in_workspace()
             .returning(move |workspace_id| {
-                let mut windows = s
-                    .inner
-                    .force_read()
+                let inner = s.inner.force_read();
+                let mut windows = inner
                     .windows
                     .values()
-                    .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
+                    .filter_map(|w| {
+                        (w.workspace_id == workspace_id && !inner.is_associated_child(w.id))
+                            .then_some(w.id)
+                    })
                     .collect::<Vec<_>>();
                 // Sort the windows to keep the tests consistent
                 windows.sort_unstable();
@@ -881,16 +1232,20 @@ impl MockState {
         let s = self.clone();
         wm.expect_move_windows_to_workspace()
             .returning(move |window_ids, workspace_id| {
-                let mut state = s.inner.force_write();
-                state
+                let mut inner = s.inner.force_write();
+                let outcome = inner.native_move_outcome;
+                inner
                     .workspace_moves
                     .push((window_ids.to_vec(), workspace_id));
-                for window_id in window_ids {
-                    if let Some(window) = state.windows.get_mut(window_id) {
-                        window.workspace_id = workspace_id;
-                    }
-                }
-                Ok(())
+                inner.check_move_batch(window_ids)?;
+                inner.submit(
+                    outcome,
+                    workspace_id,
+                    PendingNativeRequest::Move {
+                        windows: window_ids.to_vec(),
+                        workspace_id,
+                    },
+                )
             });
 
         let s = self.clone();
@@ -914,7 +1269,16 @@ impl MockState {
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
-        wm.expect_get_associated_windows().return_const(vec![]);
+        let s = self.clone();
+        wm.expect_get_associated_windows()
+            .returning(move |window_id| {
+                s.inner
+                    .force_read()
+                    .associated_windows
+                    .get(&window_id)
+                    .cloned()
+                    .unwrap_or_default()
+            });
 
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {

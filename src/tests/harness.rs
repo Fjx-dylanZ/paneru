@@ -17,8 +17,9 @@ use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
-    BProcess, ExistingMarker, FocusFollowsMouse, Initializing, InstantSpaceSwitch,
-    MissionControlActive, SkipReshuffle, SpawnWindowTrigger, register_systems, register_triggers,
+    BProcess, BruteforceWindows, ExistingMarker, FocusFollowsMouse, Initializing,
+    InstantSpaceSwitch, MissionControlActive, SkipReshuffle, SpawnWindowTrigger, register_systems,
+    register_triggers,
 };
 use crate::events::Event;
 use crate::manager::{Window, WindowManager};
@@ -47,6 +48,8 @@ pub(crate) struct TestHarness {
     pub(crate) app: App,
     pub(crate) mock_state: MockState,
     pub(crate) verifiers: HashMap<usize, VerifierFunc>,
+    /// Keeps the outstanding scan of [`Self::hold_initialization`] alive.
+    initialization_hold: Option<async_channel::Sender<()>>,
 }
 
 impl TestHarness {
@@ -80,6 +83,7 @@ impl TestHarness {
             app,
             mock_state,
             verifiers: HashMap::new(),
+            initialization_hold: None,
         }
     }
 
@@ -188,6 +192,32 @@ impl TestHarness {
     {
         self.verifiers.insert(iteration, Box::new(verifier));
         self
+    }
+
+    /// Keeps initialization from finishing until [`Self::release_initialization`],
+    /// the way an application whose windows are still being brute-forced
+    /// does: `finish_setup` returns early every frame while the scan is
+    /// outstanding, so `Initializing` outlives the frames in which the
+    /// already-known windows get their markers.
+    pub(crate) fn hold_initialization(&mut self) {
+        let (sender, receiver) = async_channel::bounded::<()>(1);
+        let scan = AsyncComputeTaskPool::get().spawn(async move {
+            _ = receiver.recv().await;
+            Vec::<Window>::new()
+        });
+        self.app.world_mut().spawn(BruteforceWindows(scan));
+        self.initialization_hold = Some(sender);
+    }
+
+    /// Lets the outstanding scan finish. It is reaped by the next frame and
+    /// initialization completes on the one after, as in production.
+    pub(crate) fn release_initialization(&mut self) {
+        drop(self.initialization_hold.take());
+        let world = self.app.world_mut();
+        let mut scans = world.query::<&BruteforceWindows>();
+        while !scans.iter(world).all(|scan| scan.0.is_finished()) {
+            std::thread::yield_now();
+        }
     }
 
     /// Runs the app for `duration` of simulated time, draining the mock

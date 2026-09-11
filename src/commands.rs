@@ -7,6 +7,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::Time;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info, warn};
 
@@ -156,12 +157,17 @@ fn resolve_native_space(
     }
 }
 
+/// Submits a native switch for the selected Space. `Ok(true)` from the
+/// manager only means the request went out (or a display-focus change is
+/// owed); it is recorded on [`InstantSpaceSwitch`] and confirmed later by
+/// `confirm_native_space_focus`, which also finishes the cross-display focus.
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn command_focus_native_space(
     mut messages: MessageReader<Event>,
     window_manager: Res<WindowManager>,
     mission_control: Res<MissionControlActive>,
+    time: Res<Time>,
     mut instant_space_switch: ResMut<InstantSpaceSwitch>,
 ) {
     for selector in messages.read().filter_map(|event| {
@@ -177,37 +183,53 @@ fn command_focus_native_space(
             warn!("native Space focus is unavailable during Mission Control");
             continue;
         }
-        if !instant_space_switch.should_begin_command() {
-            warn!("native Space focus is already in progress");
+        let now = time.elapsed();
+        if !instant_space_switch.should_begin_command(now) {
+            warn!(
+                pending = instant_space_switch.pending_target(),
+                "native Space focus is still awaiting confirmation"
+            );
             continue;
         }
 
-        let target = window_manager
-            .native_spaces()
-            .and_then(|spaces| {
-                let display_id = window_manager.active_display_id()?;
-                let current_workspace = window_manager.active_display_space(display_id)?;
-                resolve_native_space(&spaces, current_workspace, selector).ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "native Space selector {selector:?} is out of range"
-                    ))
-                })
+        let target = window_manager.native_spaces().and_then(|spaces| {
+            let display_id = window_manager.active_display_id()?;
+            let current_workspace = window_manager.active_display_space(display_id)?;
+            resolve_native_space(&spaces, current_workspace, selector).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "native Space selector {selector:?} is out of range"
+                ))
             })
-            .and_then(|workspace_id| {
-                window_manager
-                    .focus_native_space(workspace_id)
-                    .map(|switched| (workspace_id, switched))
-            });
-
-        match target {
-            Ok((workspace_id, true)) => {
-                instant_space_switch.begin_command();
-                debug!(workspace_id, "focused native Space");
+        });
+        let workspace_id = match target {
+            Ok(workspace_id) => workspace_id,
+            Err(err) => {
+                warn!("could not resolve native Space: {err}");
+                continue;
             }
-            Ok((workspace_id, false)) => {
+        };
+
+        match window_manager.focus_native_space(workspace_id) {
+            Ok(true) => {
+                instant_space_switch.begin_command(workspace_id, now);
+                debug!(workspace_id, "requested native Space focus");
+            }
+            Ok(false) => {
                 debug!(workspace_id, "native Space is already focused");
             }
-            Err(err) => warn!("could not focus native Space: {err}"),
+            Err(Error::NativeSpaceRequest {
+                workspace_id: reported,
+                request_may_have_applied: true,
+                message,
+                ..
+            }) => {
+                instant_space_switch.begin_command(reported, now);
+                warn!(
+                    workspace_id = reported,
+                    "native Space focus may have partially applied, observing it: {message}"
+                );
+            }
+            Err(err) => warn!(workspace_id, "could not focus native Space: {err}"),
         }
     }
 }

@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::manager::skylight::SLSSetWindowListBrightness;
-use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId, macos_major_version};
+use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
@@ -40,11 +40,10 @@ use skylight::{
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSManagedDisplayIsAnimating,
-    SLSSetActiveMenuBarDisplayIdentifier, SLSSpaceGetType, SLSSpaceSetFrontPSN,
-    SLSWindowIsOrderedIn, SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes,
-    SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID,
-    SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
+    SLSManagedDisplayGetCurrentSpace, SLSSetActiveMenuBarDisplayIdentifier, SLSSpaceGetType,
+    SLSSpaceSetFrontPSN, SLSWindowIsOrderedIn, SLSWindowIteratorAdvance,
+    SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags,
+    SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
@@ -55,7 +54,6 @@ pub use windows::MockWindowApi;
 
 pub(crate) mod app;
 mod display;
-mod macho;
 mod native_spaces;
 mod process;
 mod skylight;
@@ -130,17 +128,43 @@ pub trait WindowManagerApi: Send + Sync {
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
     /// Returns every native macOS Space in global Mission Control order.
     fn native_spaces(&self) -> Result<Vec<WorkspaceId>>;
-    /// Instantly focuses `workspace_id`, including an empty Space. Returns
-    /// `true` when display focus or a Space gesture was issued.
+    /// Requests that `workspace_id`, including an empty Space, becomes the
+    /// current Space of its owning display.
+    ///
+    /// `Ok(true)` means a native activation was submitted, or the Space is
+    /// already current on a display that still needs the cross-display focus
+    /// policy; neither is confirmation. Callers observe the outcome with
+    /// [`Self::native_space_is_active`] and only then call
+    /// [`Self::complete_native_space_focus`]. `Ok(false)` means the Space is
+    /// already current on the active display and nothing was submitted.
     fn focus_native_space(&self, workspace_id: WorkspaceId) -> Result<bool>;
-    /// Instantly switches to the native Space containing `window_id`, if that
-    /// Space is not already visible. Returns the selected Space when a gesture
-    /// was posted.
+    /// Requests the native Space containing `window_id` if that Space is not
+    /// visible on any display.
+    ///
+    /// `Ok(Some(target))` names the Space whose activation was submitted;
+    /// like [`Self::focus_native_space`] it is a submission, not a
+    /// confirmation. `Ok(None)` means the window is already visible.
     fn focus_window_workspace(
         &self,
         window_id: WinID,
         psn: ProcessSerialNumber,
     ) -> Result<Option<WorkspaceId>>;
+    /// Returns the native Spaces `window_id` is currently a member of, read
+    /// fresh from the window server so a pending move is only reported once
+    /// it has applied.
+    fn window_workspaces(&self, window_id: WinID) -> Result<Vec<WorkspaceId>>;
+    /// Returns whether the window server still knows `window_id`, read fresh
+    /// from the window list. `Ok(false)` is definitive absence; a lookup that
+    /// cannot be completed is an error, never absence.
+    fn window_exists(&self, window_id: WinID) -> Result<bool>;
+    /// Returns whether `workspace_id` is the current Space of the display that
+    /// owns it, independent of which display holds the menu bar. Errors when
+    /// no present display owns the Space.
+    fn native_space_is_active(&self, workspace_id: WorkspaceId) -> Result<bool>;
+    /// Applies the cross-display focus policy (cursor, menu bar, keyboard
+    /// focus) for `workspace_id` once it has been observed current on its
+    /// display. Errors, without touching focus, if it is not current yet.
+    fn complete_native_space_focus(&self, workspace_id: WorkspaceId) -> Result<()>;
     /// Centers the mouse cursor on a given window within its display bounds if it's not already within the window.
     ///
     /// # Arguments
@@ -188,10 +212,14 @@ pub trait WindowManagerApi: Send + Sync {
     /// Returns `true` when a window is no longer ordered into the window list.
     fn window_is_unordered(&self, window_id: WinID) -> bool;
 
-    /// Assigns the supplied windows to one native macOS Space.
+    /// Submits one native request assigning every window in `windows` to
+    /// exactly `workspace_id`.
     ///
-    /// The operation is asynchronous. Callers should confirm membership with
-    /// `windows_in_workspace` before considering the move complete.
+    /// `Ok(())` means the request was accepted, not applied: the window
+    /// server carries it out asynchronously. Callers confirm each member with
+    /// [`Self::window_workspaces`] and must not resubmit while the request is
+    /// merely unobserved. `Error::NativeSpaceRequest` reports whether a
+    /// failed request may nevertheless have applied.
     fn move_windows_to_workspace(&self, windows: &[WinID], workspace_id: WorkspaceId)
     -> Result<()>;
 
@@ -347,91 +375,17 @@ impl WindowManagerOS {
         (connection != 0).then_some(connection)
     }
 
-    fn display_is_animating(&self, display_id: CGDirectDisplayID) -> bool {
-        // This private API is unreliable after Ventura; match yabai's guard.
-        if !(11..=13).contains(&macos_major_version()) {
-            return false;
-        }
-        Display::uuid_from_id(display_id)
-            .is_ok_and(|uuid| unsafe { SLSManagedDisplayIsAnimating(self.main_cid, &uuid) })
-    }
-
-    fn focus_display(&self, display: &Display, workspace_id: WorkspaceId) -> Result<()> {
-        let uuid = Display::uuid_from_id(display.id())?;
-        unsafe { SLSSetActiveMenuBarDisplayIdentifier(self.main_cid, &uuid, &uuid) }
-            .to_result("SLSSetActiveMenuBarDisplayIdentifier")?;
-
-        let active_workspace = self
-            .active_display_id()
-            .and_then(|display_id| self.active_display_space(display_id))
-            .ok();
-        if active_workspace != Some(workspace_id) {
-            native_spaces::post_left_click(origin_to(display.bounds().center()))?;
-        }
-        Ok(())
-    }
-
-    fn focus_native_space_with_displays(
-        &self,
-        workspace_id: WorkspaceId,
-        displays: &[(Display, Vec<WorkspaceId>)],
-    ) -> Result<bool> {
-        let (display, workspaces) = displays
-            .iter()
-            .find(|(_, workspaces)| workspaces.contains(&workspace_id))
-            .ok_or_else(|| {
-                Error::NotFound(format!(
-                    "native Space {workspace_id} is not assigned to a present display"
-                ))
-            })?;
-        if self.display_is_animating(display.id()) {
-            return Err(Error::Generic(format!(
-                "display {} is already changing native Spaces",
-                display.id()
-            )));
-        }
-
-        let current_workspace = self.active_display_space(display.id())?;
-        let active_display = self.active_display_id().ok();
-        if current_workspace == workspace_id && active_display == Some(display.id()) {
-            return Ok(false);
-        }
-
-        if self
-            .cursor_position()
-            .is_none_or(|point| !display.bounds().contains(origin_from(point)))
-        {
-            self.warp_mouse(display.bounds().center());
-        }
-
-        if current_workspace == workspace_id {
-            self.focus_display(display, workspace_id)?;
-            return Ok(true);
-        }
-
-        let current_index = workspaces
-            .iter()
-            .position(|workspace| *workspace == current_workspace)
-            .ok_or_else(|| {
-                Error::NotFound(format!(
-                    "current native Space {current_workspace} is missing from display {}",
-                    display.id()
-                ))
-            })?;
-        let target_index = workspaces
-            .iter()
-            .position(|workspace| *workspace == workspace_id)
-            .ok_or_else(|| {
-                Error::NotFound(format!(
-                    "target native Space {workspace_id} is missing from display {}",
-                    display.id()
-                ))
-            })?;
-        let switched = native_spaces::post_workspace_switch_gesture(current_index, target_index)?;
-        if switched && active_display != Some(display.id()) {
-            self.focus_display(display, workspace_id)?;
-        }
-        Ok(switched)
+    /// Submits a native activation for `workspace_id` unless it is already
+    /// the current Space of `display`, which must own it.
+    ///
+    /// Returns `true` when a request went out, or when nothing was submitted
+    /// but the Space is current on a display other than the active one, so
+    /// the caller still has a cross-display focus to observe and complete.
+    /// `false` means there is nothing left to do at all.
+    fn request_native_space(&self, workspace_id: WorkspaceId, display: &Display) -> Result<bool> {
+        let submitted = self.active_display_space(display.id())? != workspace_id
+            && native_spaces::activate_workspace(self.main_cid, workspace_id)?;
+        Ok(submitted || self.active_display_id().ok() != Some(display.id()))
     }
 }
 
@@ -537,7 +491,8 @@ impl WindowManagerApi for WindowManagerOS {
 
     fn focus_native_space(&self, workspace_id: WorkspaceId) -> Result<bool> {
         let displays = self.present_displays();
-        self.focus_native_space_with_displays(workspace_id, &displays)
+        let display = owning_display(workspace_id, &displays)?;
+        self.request_native_space(workspace_id, display)
     }
 
     fn focus_window_workspace(
@@ -557,13 +512,9 @@ impl WindowManagerApi for WindowManagerOS {
             }
         }
 
-        let target_workspace = window_workspaces
-            .into_iter()
-            .find(|target| {
-                displays
-                    .iter()
-                    .any(|(_, workspaces)| workspaces.contains(target))
-            })
+        let (target_workspace, display) = window_workspaces
+            .iter()
+            .find_map(|&target| owning_display(target, &displays).ok().map(|d| (target, d)))
             .ok_or_else(|| {
                 Error::NotFound(format!(
                     "no display contains a native Space for window {window_id}"
@@ -576,8 +527,56 @@ impl WindowManagerApi for WindowManagerOS {
             warn!("could not associate Space {target_workspace} with its front process: {err}");
         }
 
-        let switched = self.focus_native_space_with_displays(target_workspace, &displays)?;
-        Ok(switched.then_some(target_workspace))
+        let requested = self.request_native_space(target_workspace, display)?;
+        Ok(requested.then_some(target_workspace))
+    }
+
+    fn window_workspaces(&self, window_id: WinID) -> Result<Vec<WorkspaceId>> {
+        native_spaces::window_workspaces(self.main_cid, window_id)
+    }
+
+    fn window_exists(&self, window_id: WinID) -> Result<bool> {
+        native_spaces::window_exists(window_id)
+    }
+
+    fn native_space_is_active(&self, workspace_id: WorkspaceId) -> Result<bool> {
+        native_spaces::workspace_is_active(self.main_cid, workspace_id)
+    }
+
+    fn complete_native_space_focus(&self, workspace_id: WorkspaceId) -> Result<()> {
+        let displays = self.present_displays();
+        let display = owning_display(workspace_id, &displays)?;
+        let current_workspace = self.active_display_space(display.id())?;
+        if current_workspace != workspace_id {
+            return Err(Error::Generic(format!(
+                "native Space {workspace_id} is not current on display {} yet; {current_workspace} is",
+                display.id()
+            )));
+        }
+
+        if self
+            .cursor_position()
+            .is_none_or(|point| !display.bounds().contains(origin_from(point)))
+        {
+            self.warp_mouse(display.bounds().center());
+        }
+        if self.active_display_id().ok() == Some(display.id()) {
+            return Ok(());
+        }
+
+        let uuid = Display::uuid_from_id(display.id())?;
+        unsafe { SLSSetActiveMenuBarDisplayIdentifier(self.main_cid, &uuid, &uuid) }
+            .to_result("SLSSetActiveMenuBarDisplayIdentifier")?;
+        // Moving the menu bar alone does not give an empty Space keyboard
+        // focus; a click on its desktop, where the cursor now is, does.
+        let active_workspace = self
+            .active_display_id()
+            .and_then(|display_id| self.active_display_space(display_id))
+            .ok();
+        if active_workspace != Some(workspace_id) {
+            native_spaces::post_left_click(origin_to(display.bounds().center()))?;
+        }
+        Ok(())
     }
 
     /// Centers the mouse cursor on the window if it's not already within the window's bounds.
@@ -705,7 +704,7 @@ impl WindowManagerApi for WindowManagerOS {
         windows: &[WinID],
         workspace_id: WorkspaceId,
     ) -> Result<()> {
-        native_spaces::move_windows_to_workspace(windows, workspace_id)
+        native_spaces::move_windows_to_workspace(self.main_cid, windows, workspace_id)
     }
 
     fn quit(&self) -> Result<()> {
@@ -774,6 +773,21 @@ impl WindowManagerApi for WindowManagerOS {
                 .collect::<Vec<_>>()
         })
     }
+}
+
+/// Returns the present display whose managed Space list owns `workspace_id`.
+fn owning_display(
+    workspace_id: WorkspaceId,
+    displays: &[(Display, Vec<WorkspaceId>)],
+) -> Result<&Display> {
+    displays
+        .iter()
+        .find_map(|(display, workspaces)| workspaces.contains(&workspace_id).then_some(display))
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "native Space {workspace_id} is not assigned to a present display"
+            ))
+        })
 }
 
 /// Retrieves a list of window IDs for specified spaces and connection, with an option to include minimized windows.

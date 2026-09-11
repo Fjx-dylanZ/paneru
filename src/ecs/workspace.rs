@@ -7,16 +7,17 @@ use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
-use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
+use bevy::ecs::schedule::{IntoScheduleConfigs as _, SystemCondition as _};
 use bevy::ecs::system::{
     Commands, Local, NonSend, ParamSet, Populated, Query, Res, ResMut, Single,
 };
 use bevy::math::IRect;
+use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, InstantSpaceSwitch, SpawnWindowTrigger};
@@ -34,7 +35,7 @@ use crate::ecs::{
     ManualStripOffset, NativeFullscreenMarker, Position, RaiseWindow, RepositionMarker, Scrolling,
     SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::events::{DestroySource, Event};
 use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
@@ -92,6 +93,19 @@ impl Plugin for WorkspaceEventsPlugin {
             config.is_some_and(|config| config.reap_empty_workspaces())
         };
 
+        let space_switch_pending =
+            |instant_space_switch: Res<InstantSpaceSwitch>| instant_space_switch.is_pending();
+        // Bevy evaluates run conditions eagerly and each evaluation advances
+        // the condition's change tick, so this must sit behind the
+        // initialization guard in a short-circuiting `and_then`: as a sibling
+        // `run_if` it would consume the `Added`/`Changed` ticks on every one
+        // of the several frames initialization takes, and followers found at
+        // startup would never be queued.
+        let followers_changed = |activated: Query<(), Added<ActiveWorkspaceMarker>>,
+                                 changed: ChangedFollowers| {
+            !activated.is_empty() || !changed.is_empty()
+        };
+
         app.add_systems(
             PreUpdate,
             (switch_virtual_workspace_bind, move_virtual_workspace_bind),
@@ -102,6 +116,7 @@ impl Plugin for WorkspaceEventsPlugin {
                 renumber_virtual_indexes,
                 reap_empty_virtual_workspaces.run_if(reap_workspaces),
                 workspace_change_handler,
+                confirm_native_space_focus.run_if(space_switch_pending),
                 workspace_created_handler,
                 show_active_workspace,
                 handle_virtual_window_moves,
@@ -115,7 +130,8 @@ impl Plugin for WorkspaceEventsPlugin {
         app.add_systems(
             PostUpdate,
             (
-                queue_followed_windows.run_if(not(resource_exists::<Initializing>)),
+                queue_followed_windows
+                    .run_if(not(resource_exists::<Initializing>).and_then(followers_changed)),
                 sync_followed_windows,
             )
                 .chain(),
@@ -132,28 +148,65 @@ pub(super) struct VirtualMoveMarker {
     pub move_focus: MoveFocus,
 }
 
-/// Tracks eventual consistency for the asynchronous native Space operation.
-/// Keeping this state on the entity makes rapid Space changes last-target-wins.
+/// The native Space move a follower still owes. `desired` is the Space the
+/// follower should end up on and is the only field the queueing side writes;
+/// `in_flight` is the one batch submitted for it. Keeping both apart is what
+/// lets a rapid run of Space changes land on the last target without ever
+/// resending a write that has merely not been observed yet. The component is
+/// removed once the work is done or given up on, so a later Space change
+/// queues it afresh.
 #[derive(Component, Debug)]
 pub(crate) struct FollowSpacePending {
-    target_space: WorkspaceId,
-    attempts: u8,
-    next_retry: Instant,
-    confirmed: bool,
+    desired: WorkspaceId,
+    in_flight: Option<FollowSpaceRequest>,
 }
 
-impl FollowSpacePending {
-    fn new(target_space: WorkspaceId) -> Self {
+/// One submitted `move_windows_to_workspace` batch awaiting confirmation.
+#[derive(Debug)]
+struct FollowSpaceRequest {
+    target: WorkspaceId,
+    /// The windows still owed confirmation: the follower and the associated
+    /// windows that travelled with it, each of which must report exactly
+    /// `target`. An associated window that closes mid-flight leaves the list;
+    /// the follower itself never does.
+    windows: Vec<WinID>,
+    requested_at: Duration,
+    next_check: Duration,
+}
+
+impl FollowSpaceRequest {
+    /// The pre-submission membership read just showed the old state, so the
+    /// first confirmation waits a full interval rather than re-asking at once.
+    fn new(target: WorkspaceId, windows: Vec<WinID>, now: Duration) -> Self {
         Self {
-            target_space,
-            attempts: 0,
-            next_retry: Instant::now(),
-            confirmed: false,
+            target,
+            windows,
+            requested_at: now,
+            next_check: now + FollowSpacePending::CHECK_INTERVAL,
         }
     }
 
-    fn reset(&mut self, target_space: WorkspaceId) {
-        *self = Self::new(target_space);
+    fn expired(&self, now: Duration) -> bool {
+        now >= self.requested_at + FollowSpacePending::TIMEOUT
+    }
+}
+
+impl FollowSpacePending {
+    /// Bound on how long one submitted batch may go unobserved.
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    /// Cadence of the non-blocking membership queries while a batch is in
+    /// flight.
+    const CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+    fn new(desired: WorkspaceId) -> Self {
+        Self {
+            desired,
+            in_flight: None,
+        }
+    }
+
+    fn retarget(&mut self, desired: WorkspaceId) {
+        self.desired = desired;
     }
 }
 
@@ -244,10 +297,13 @@ fn fullscreen_window_in_strip(
         })
 }
 
+/// Applies the OS's current Space for the active display to the ECS. A pending
+/// native switch is deliberately left alone: this notification may be early
+/// (the source display changing first) or unrelated, and only
+/// [`confirm_native_space_focus`] may declare the requested target landed.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn workspace_change_handler(
     mut messages: MessageReader<Event>,
-    mut instant_space_switch: ResMut<InstantSpaceSwitch>,
     windows: Windows,
     mut workspaces: Query<(
         &mut LayoutStrip,
@@ -265,7 +321,6 @@ fn workspace_change_handler(
     {
         return;
     }
-    instant_space_switch.clear();
     let (active_display, display_entity) = *active_display;
 
     let Ok(workspace_id) = window_manager.active_display_space(active_display.id()) else {
@@ -335,6 +390,93 @@ fn workspace_change_handler(
     }
 }
 
+/// Observes the native Space switch [`InstantSpaceSwitch`] is waiting on.
+/// Every check interval it asks whether the requested target is current on
+/// its owning display; once it is, the cross-display focus policy is applied
+/// and the display/workspace refresh path is notified, so the ECS catches up
+/// even when the OS posted no notification for the change. The deadline and
+/// any query failure end the wait so nothing keeps polling for a Space that
+/// will not arrive; nothing here blocks, and a partially applied request is
+/// observed exactly like a clean one rather than retried.
+#[allow(clippy::needless_pass_by_value)]
+fn confirm_native_space_focus(
+    mut instant_space_switch: ResMut<InstantSpaceSwitch>,
+    time: Res<Time>,
+    window_manager: Res<WindowManager>,
+    strips: Query<(&LayoutStrip, &ChildOf, Has<ActiveWorkspaceMarker>)>,
+    active_display: Query<Entity, With<ActiveDisplayMarker>>,
+    _platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
+    mut commands: Commands,
+) {
+    let now = time.elapsed();
+    let Some(workspace_id) = instant_space_switch.due_target(now) else {
+        return;
+    };
+    let waited = instant_space_switch.waited(now);
+
+    match window_manager.native_space_is_active(workspace_id) {
+        Ok(true) => {
+            // Observed current is the confirmation; the display focus policy
+            // that follows may still fail, which ends the wait all the same —
+            // it is neither retried nor reported as finished.
+            match window_manager.complete_native_space_focus(workspace_id) {
+                Ok(()) => debug!(
+                    workspace_id,
+                    ?waited,
+                    "requested native Space confirmed current"
+                ),
+                Err(err) => warn!(
+                    workspace_id,
+                    ?waited,
+                    "requested native Space confirmed current, but its display focus could not be finished: {err}"
+                ),
+            }
+            instant_space_switch.clear();
+
+            // The OS may already have told us, in which case the ECS shows the
+            // target active on the active display and needs no refresh. A
+            // target on another display, or one no strip knows yet, goes
+            // through the display refresh, which cascades into the Space one.
+            let active_display = active_display.iter().next();
+            let mut owner = None;
+            for (strip, child_of, active) in &strips {
+                if strip.id() != workspace_id {
+                    continue;
+                }
+                if active && Some(child_of.parent()) == active_display {
+                    return;
+                }
+                owner = Some(child_of.parent());
+            }
+            let refresh = if owner.is_some() && owner == active_display {
+                Event::SpaceChanged
+            } else {
+                Event::DisplayChanged
+            };
+            commands.trigger(SendMessageTrigger(refresh));
+        }
+        Ok(false) if !instant_space_switch.expired(now) => {
+            instant_space_switch.schedule_check(now);
+        }
+        Ok(false) => {
+            warn!(
+                workspace_id,
+                ?waited,
+                "requested native Space not observed current before the deadline; giving up"
+            );
+            instant_space_switch.clear();
+        }
+        Err(err) => {
+            warn!(
+                workspace_id,
+                ?waited,
+                "unable to confirm requested native Space: {err}"
+            );
+            instant_space_switch.clear();
+        }
+    }
+}
+
 type ChangedFollowers<'w, 's> = Query<
     'w,
     's,
@@ -345,7 +487,7 @@ type ChangedFollowers<'w, 's> = Query<
     ),
 >;
 
-type FollowingWindows<'w, 's> = Query<
+type FollowingWindows<'w, 's> = Populated<
     'w,
     's,
     (
@@ -360,10 +502,10 @@ type FollowingWindows<'w, 's> = Query<
 
 /// Queue every follower for the newly active native Space, including floats
 /// that gained follow without adding `Unmanaged`, or were just deminimized.
+/// Only the desired Space is written here; a batch already in flight keeps
+/// being observed and is retargeted once it has landed or been given up on.
 #[allow(clippy::needless_pass_by_value)]
 fn queue_followed_windows(
-    activated: Query<(), Added<ActiveWorkspaceMarker>>,
-    changed_followers: ChangedFollowers,
     followers: Query<
         (Entity, &Window, &Unmanaged, Option<&mut FollowSpacePending>),
         With<FollowCurrentWorkspaceMarker>,
@@ -371,51 +513,179 @@ fn queue_followed_windows(
     active_display: ActiveDisplay,
     mut commands: Commands,
 ) {
-    if activated.is_empty() && changed_followers.is_empty() {
-        return;
-    }
-
-    let target_space = active_display.active_strip().id();
+    let desired = active_display.active_strip().id();
     for (entity, window, unmanaged, pending) in followers {
         if !matches!(unmanaged, Unmanaged::Floating) || window.is_full_screen() {
             continue;
         }
         if let Some(mut pending) = pending {
-            pending.reset(target_space);
+            pending.retarget(desired);
         } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(FollowSpacePending::new(target_space));
+            entity_commands.try_insert(FollowSpacePending::new(desired));
         }
     }
 }
 
-/// Reassign followed floating windows to the current native Space. The hidden
-/// `SkyLight` operation is asynchronous, so membership is confirmed and retried
-/// with a small bound instead of assuming submission means completion.
+/// Whether every window of `windows` now reports exactly `target`, read fresh
+/// from the window server. Inclusion of the follower alone is not enough: its
+/// associated windows travel in the same batch and must have landed too before
+/// the follower is treated as moved. An associated window the window server no
+/// longer knows at all — closed before or during the move — is dropped from
+/// `windows` rather than waited on, so its parent is not stranded on the far
+/// side of a move that did land; the follower itself never is dropped, and a
+/// failed query is neither landing nor absence.
+fn follower_batch_landed(
+    window_manager: &WindowManager,
+    windows: &mut Vec<WinID>,
+    follower: WinID,
+    target: WorkspaceId,
+) -> Result<bool> {
+    let mut landed = true;
+    let mut index = 0;
+    while let Some(&window_id) = windows.get(index) {
+        let workspaces = window_manager.window_workspaces(window_id);
+        if !matches!(workspaces.as_deref(), Ok([workspace]) if *workspace == target) {
+            if window_id != follower && !window_manager.window_exists(window_id)? {
+                debug!(
+                    follower,
+                    window_id,
+                    workspace_id = target,
+                    "associated window closed; no longer part of the followed move"
+                );
+                windows.remove(index);
+                continue;
+            }
+            // A live window that has not landed keeps the batch waiting; one
+            // whose Spaces could not be read at all fails the check outright.
+            workspaces?;
+            landed = false;
+        }
+        index += 1;
+    }
+    Ok(landed)
+}
+
+/// Drops a follower's pending work so the system sleeps until a Space change
+/// queues it again.
+fn release_follower(entity: Entity, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<FollowSpacePending>();
+    }
+}
+
+/// Checks one in-flight batch. `Some(true)` once every member reports the
+/// target, `Some(false)` when the deadline passed or the query failed, and
+/// `None` while it is still worth waiting on, with the next check scheduled.
+/// Old membership on an early check is never a reason to resend the write.
+fn observe_follower_request(
+    window_manager: &WindowManager,
+    request: &mut FollowSpaceRequest,
+    window_id: WinID,
+    now: Duration,
+) -> Option<bool> {
+    let target = request.target;
+    match follower_batch_landed(window_manager, &mut request.windows, window_id, target) {
+        Ok(true) => {
+            debug!(
+                window_id,
+                workspace_id = target,
+                waited = ?now.saturating_sub(request.requested_at),
+                "followed window confirmed on requested Space"
+            );
+            Some(true)
+        }
+        Ok(false) if !request.expired(now) => {
+            request.next_check = now + FollowSpacePending::CHECK_INTERVAL;
+            None
+        }
+        Ok(false) => {
+            warn!(
+                window_id,
+                workspace_id = target,
+                "followed window not observed on requested Space before the deadline; giving up"
+            );
+            Some(false)
+        }
+        Err(err) => {
+            warn!(
+                window_id,
+                workspace_id = target,
+                "unable to confirm followed window on requested Space: {err}"
+            );
+            Some(false)
+        }
+    }
+}
+
+/// Submits one batch for `desired`. Returns the Space to observe: `desired`
+/// on success, the reported one when the request may have partially applied,
+/// and nothing when it was refused before anything happened.
+fn submit_follower_move(
+    window_manager: &WindowManager,
+    batch: &[WinID],
+    desired: WorkspaceId,
+    window_id: WinID,
+) -> Option<WorkspaceId> {
+    match window_manager.move_windows_to_workspace(batch, desired) {
+        Ok(()) => {
+            debug!(
+                window_id,
+                workspace_id = desired,
+                ?batch,
+                "requested followed window move"
+            );
+            Some(desired)
+        }
+        Err(Error::NativeSpaceRequest {
+            workspace_id: reported,
+            request_may_have_applied: true,
+            message,
+            ..
+        }) => {
+            warn!(
+                window_id,
+                workspace_id = reported,
+                "followed window move may have partially applied, observing it: {message}"
+            );
+            Some(reported)
+        }
+        Err(err) => {
+            warn!(
+                window_id,
+                workspace_id = desired,
+                "unable to move followed window: {err}"
+            );
+            None
+        }
+    }
+}
+
+/// Carries followed floating windows to the Space they want to be on. The
+/// hidden `SkyLight` move is asynchronous, so each batch is submitted once and
+/// then observed on `Time`: every member still open must report exactly the
+/// target Space before the follower is repositioned onto the display, and only
+/// a batch that has landed, timed out or failed to query makes room for the
+/// next desired Space. Finished or abandoned work drops the component, so the
+/// system sleeps until a Space change queues a follower again.
 #[allow(clippy::needless_pass_by_value)]
 fn sync_followed_windows(
-    mut followers: FollowingWindows,
+    followers: FollowingWindows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
+    time: Res<Time>,
     _platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
     mut commands: Commands,
 ) {
-    const MAX_ATTEMPTS: u8 = 5;
-    const RETRY_DELAY: Duration = Duration::from_millis(150);
-
-    let target_space = active_display.active_strip().id();
+    let now = time.elapsed();
     let target_bounds = active_display.actual_bounds(&config);
-    let now = Instant::now();
-    let mut target_members = None;
 
-    for (entity, window, unmanaged, mut pending, moving) in &mut followers {
+    for (entity, window, unmanaged, mut pending, moving) in followers {
+        let window_id = window.id();
+        // A follower that stopped floating or went fullscreen mid-flight has
+        // nothing left to carry; being queued again once it floats covers it.
         if !matches!(unmanaged, Unmanaged::Floating) || window.is_full_screen() {
-            continue;
-        }
-        if pending.target_space != target_space {
-            pending.reset(target_space);
-        }
-        if pending.confirmed || now < pending.next_retry {
+            release_follower(entity, &mut commands);
             continue;
         }
         let frame = moving.map_or_else(
@@ -425,42 +695,54 @@ fn sync_followed_windows(
             },
         );
 
-        let members = target_members.get_or_insert_with(|| {
-            window_manager
-                .windows_in_workspace(target_space)
-                .map_or_else(
-                    |err| {
-                        warn!("unable to confirm followed windows in Space {target_space}: {err}");
-                        HashSet::new()
-                    },
-                    |windows| windows.into_iter().collect::<HashSet<_>>(),
-                )
-        });
-        if members.contains(&window.id()) {
-            pending.confirmed = true;
-            reposition_follower(
-                entity,
-                window,
-                frame,
-                &active_display,
-                target_bounds,
-                &mut commands,
+        // The batch in flight is observed to the end before anything else may
+        // be submitted for this follower.
+        let mut settled = None;
+        if let Some(request) = &mut pending.in_flight {
+            if now < request.next_check {
+                continue;
+            }
+            match observe_follower_request(&window_manager, request, window_id, now) {
+                Some(landed) => settled = Some((request.target, landed)),
+                None => continue,
+            }
+        }
+        if let Some((target, landed)) = settled {
+            pending.in_flight = None;
+            if pending.desired == target {
+                if landed {
+                    reposition_follower(
+                        entity,
+                        window,
+                        frame,
+                        &active_display,
+                        target_bounds,
+                        &mut commands,
+                    );
+                }
+                release_follower(entity, &mut commands);
+                continue;
+            }
+            debug!(
+                window_id,
+                observed = target,
+                desired = pending.desired,
+                "followed window retargeted after its earlier move settled"
             );
-            continue;
-        }
-        if pending.attempts >= MAX_ATTEMPTS {
-            continue;
         }
 
-        let mut window_ids = vec![window.id()];
-        window_ids.extend(window_manager.get_associated_windows(window.id()));
-        window_ids.sort_unstable();
-        window_ids.dedup();
+        let desired = pending.desired;
+        let mut batch = vec![window_id];
+        batch.extend(window_manager.get_associated_windows(window_id));
+        batch.sort_unstable();
+        batch.dedup();
 
-        match window_manager.move_windows_to_workspace(&window_ids, target_space) {
-            Ok(()) => {
-                pending.attempts += 1;
-                pending.next_retry = now + RETRY_DELAY;
+        // Already there — a float toggled on the current Space, or a Space
+        // switched away from and back — needs no write at all. Associated
+        // windows that have since closed leave the batch here; any that are
+        // live but unmovable still fail the whole submission closed.
+        match follower_batch_landed(&window_manager, &mut batch, window_id, desired) {
+            Ok(true) => {
                 reposition_follower(
                     entity,
                     window,
@@ -469,14 +751,26 @@ fn sync_followed_windows(
                     target_bounds,
                     &mut commands,
                 );
+                release_follower(entity, &mut commands);
+                continue;
             }
+            Ok(false) => {}
             Err(err) => {
-                pending.attempts = MAX_ATTEMPTS;
                 warn!(
-                    "unable to move followed window {} to Space {target_space}: {err}",
-                    window.id()
+                    window_id,
+                    workspace_id = desired,
+                    "unable to read followed window's Spaces: {err}"
                 );
+                release_follower(entity, &mut commands);
+                continue;
             }
+        }
+
+        match submit_follower_move(&window_manager, &batch, desired, window_id) {
+            Some(target) => {
+                pending.in_flight = Some(FollowSpaceRequest::new(target, batch, now));
+            }
+            None => release_follower(entity, &mut commands),
         }
     }
 }

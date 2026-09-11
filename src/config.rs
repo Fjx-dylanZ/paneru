@@ -821,7 +821,7 @@ impl Config {
     }
 
     /// Returns whether native Space changes triggered by window focus should
-    /// use an instant synthetic gesture. Disabled by default.
+    /// use native activation without a sliding transition. Disabled by default.
     pub fn skip_native_space_switch_animation(&self) -> bool {
         self.options()
             .skip_native_space_switch_animation

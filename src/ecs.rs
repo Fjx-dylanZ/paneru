@@ -1,5 +1,5 @@
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
@@ -22,7 +22,7 @@ use bevy::{
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
 };
 use derive_more::{Deref, DerefMut};
-use tracing::{Level, error, instrument, warn};
+use tracing::{Level, debug, error, instrument, warn};
 
 use crate::commands::register_commands;
 use crate::config::snippet::SnippetDialect;
@@ -431,8 +431,10 @@ pub struct StrayFocusEvent(pub WinID);
 #[derive(Component)]
 pub struct RetryFrontSwitch(pub Entity);
 
+/// An outstanding scan for windows on other Spaces; `finish_setup` holds
+/// initialization open until every one of these has resolved.
 #[derive(Component)]
-pub struct BruteforceWindows(Task<Vec<Window>>);
+pub struct BruteforceWindows(pub(crate) Task<Vec<Window>>);
 
 #[derive(Component, Debug)]
 pub enum DockPosition {
@@ -485,59 +487,150 @@ pub struct MissionControlActive(pub bool);
 #[derive(Resource)]
 pub struct FocusFollowsMouse(pub Option<WinID>);
 
-#[derive(Clone, Copy)]
+/// Who asked for the native Space switch that is still being confirmed.
+#[derive(Clone, Copy, Debug)]
 enum InstantSpaceSwitchSource {
+    /// A focus notification for this window; repeats of it are deduplicated.
     Window(WinID),
+    /// An explicit `space_focus` command; it holds until confirmed or expired.
     Command,
 }
 
-/// Tracks a synthetic native Space switch so duplicate focus notifications do
-/// not post another gesture and focus-follows-mouse stays quiet while it lands.
+/// A submitted native Space activation awaiting confirmation on its owning
+/// display. All instants are `Time::elapsed()` so the harness clock drives
+/// them.
+#[derive(Clone, Copy, Debug)]
+struct PendingSpaceSwitch {
+    source: InstantSpaceSwitchSource,
+    target: WorkspaceId,
+    requested_at: Duration,
+    next_check: Duration,
+}
+
+/// Coordinates native Space switches requested by window focus or the
+/// `space_focus` command. A request is a submission, never a confirmation: the
+/// target stays pending until `confirm_native_space_focus` observes it current
+/// on its owning display, the deadline passes, or the query fails. While it
+/// lands, focus notifications for the window or the Space already in flight
+/// are deduplicated and focus-follows-mouse stays quiet.
 #[derive(Resource, Default)]
 pub struct InstantSpaceSwitch {
-    pending: Option<(InstantSpaceSwitchSource, Instant)>,
-    last_gesture: Option<Instant>,
+    pending: Option<PendingSpaceSwitch>,
+    last_request: Option<Duration>,
 }
 
 impl InstantSpaceSwitch {
-    const PENDING_TIMEOUT: Duration = Duration::from_secs(2);
+    /// How long a submitted activation may go unobserved before it is given
+    /// up on.
+    pub const PENDING_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Cadence of the non-blocking confirmation queries while a switch is
+    /// pending.
+    pub const CHECK_INTERVAL: Duration = Duration::from_millis(50);
     const FOCUS_FOLLOWS_MOUSE_DELAY: Duration = Duration::from_millis(1250);
 
-    pub fn should_begin(&self, window_id: WinID) -> bool {
-        match self.pending {
-            Some((_, started)) if started.elapsed() >= Self::PENDING_TIMEOUT => true,
-            Some((InstantSpaceSwitchSource::Window(pending_window), _)) => {
-                pending_window != window_id
-            }
-            Some((InstantSpaceSwitchSource::Command, _)) => false,
+    fn live(&self, now: Duration) -> Option<&PendingSpaceSwitch> {
+        self.pending
+            .as_ref()
+            .filter(|pending| now < pending.requested_at + Self::PENDING_TIMEOUT)
+    }
+
+    /// Whether a focus notification for `window_id` should submit a switch: a
+    /// repeat for the window already in flight is a duplicate, and a command
+    /// holds focus-driven switches off until it lands or expires. A different
+    /// window on the Space in flight is deduplicated by the caller against
+    /// [`Self::live_target`], since only it can read that window's Spaces.
+    pub fn should_begin(&self, window_id: WinID, now: Duration) -> bool {
+        match self.live(now).map(|pending| pending.source) {
+            Some(InstantSpaceSwitchSource::Window(pending_window)) => pending_window != window_id,
+            Some(InstantSpaceSwitchSource::Command) => false,
             None => true,
         }
     }
 
-    pub fn begin(&mut self, window_id: WinID) {
-        let now = Instant::now();
-        self.pending = Some((InstantSpaceSwitchSource::Window(window_id), now));
-        self.last_gesture = Some(now);
+    pub fn begin(&mut self, window_id: WinID, target: WorkspaceId, now: Duration) {
+        self.begin_from(InstantSpaceSwitchSource::Window(window_id), target, now);
     }
 
-    pub fn should_begin_command(&self) -> bool {
+    pub fn should_begin_command(&self, now: Duration) -> bool {
+        self.live(now).is_none()
+    }
+
+    pub fn begin_command(&mut self, target: WorkspaceId, now: Duration) {
+        self.begin_from(InstantSpaceSwitchSource::Command, target, now);
+    }
+
+    /// Records a submission. The first confirmation query is due at once — a
+    /// Space already current on another display only owes the display focus
+    /// policy — and later ones follow [`Self::CHECK_INTERVAL`].
+    fn begin_from(&mut self, source: InstantSpaceSwitchSource, target: WorkspaceId, now: Duration) {
+        if let Some(previous) = self.pending.replace(PendingSpaceSwitch {
+            source,
+            target,
+            requested_at: now,
+            next_check: now,
+        }) && previous.target != target
+        {
+            debug!(
+                superseded = previous.target,
+                requested = target,
+                "native Space switch superseded before confirmation"
+            );
+        }
+        self.last_request = Some(now);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The Space whose activation is awaiting confirmation.
+    pub fn pending_target(&self) -> Option<WorkspaceId> {
+        self.pending.map(|pending| pending.target)
+    }
+
+    /// The pending Space while its request is still within the deadline.
+    pub fn live_target(&self, now: Duration) -> Option<WorkspaceId> {
+        self.live(now).map(|pending| pending.target)
+    }
+
+    /// The pending target when its next confirmation query is due.
+    pub fn due_target(&self, now: Duration) -> Option<WorkspaceId> {
         self.pending
-            .is_none_or(|(_, started)| started.elapsed() >= Self::PENDING_TIMEOUT)
+            .filter(|pending| now >= pending.next_check)
+            .map(|pending| pending.target)
     }
 
-    pub fn begin_command(&mut self) {
-        let now = Instant::now();
-        self.pending = Some((InstantSpaceSwitchSource::Command, now));
-        self.last_gesture = Some(now);
+    /// How long the pending request has been waiting.
+    pub fn waited(&self, now: Duration) -> Duration {
+        self.pending.map_or(Duration::ZERO, |pending| {
+            now.saturating_sub(pending.requested_at)
+        })
+    }
+
+    pub fn expired(&self, now: Duration) -> bool {
+        self.pending.is_some() && self.live(now).is_none()
+    }
+
+    /// Defers the next confirmation query by [`Self::CHECK_INTERVAL`].
+    pub fn schedule_check(&mut self, now: Duration) {
+        if let Some(pending) = &mut self.pending {
+            pending.next_check = now + Self::CHECK_INTERVAL;
+        }
     }
 
     pub fn clear(&mut self) {
         self.pending = None;
     }
 
-    pub fn suppress_focus_follows_mouse(&self) -> bool {
-        self.last_gesture
-            .is_some_and(|started| started.elapsed() < Self::FOCUS_FOLLOWS_MOUSE_DELAY)
+    /// Focus-follows-mouse stays quiet for as long as a submitted switch is
+    /// still being observed — the window server applies it at a time of its
+    /// choosing, and a mouse-driven focus meanwhile would raise a window on
+    /// the source Space — and for a short cooldown after every request.
+    pub fn suppress_focus_follows_mouse(&self, now: Duration) -> bool {
+        self.live(now).is_some()
+            || self
+                .last_request
+                .is_some_and(|requested_at| now < requested_at + Self::FOCUS_FOLLOWS_MOUSE_DELAY)
     }
 }
 
