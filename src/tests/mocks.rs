@@ -10,8 +10,8 @@ use crate::errors::Error;
 use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
-    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, NativeTabSnapshot,
+    Origin, Size, Window, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::types::state::NativeSpaceState;
@@ -151,6 +151,11 @@ struct NativeNotifications {
     lifecycle: bool,
 }
 
+struct MockNativeTabGroup {
+    members: Vec<WinID>,
+    selected: WinID,
+}
+
 /// The internal state of our "Virtual macOS".
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
@@ -164,20 +169,28 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
-    /// Windows the app keeps out of its accessibility window list while the
-    /// window server still reports them on screen: a background native tab.
-    background_tabs: HashSet<WinID>,
     /// Child windows the window server reports for a parent. Reported as
     /// recorded, like an app's window list: a closed child stays associated
     /// until it is explicitly disassociated, so a stale association can be
     /// handed to the manager after the child is already gone.
     associated_windows: HashMap<WinID, Vec<WinID>>,
+    native_tab_groups: Vec<MockNativeTabGroup>,
+    assigned_inactive_tabs: HashSet<WinID>,
+    raised_inactive_tabs: HashSet<WinID>,
+    failing_tab_queries: HashSet<WinID>,
+    failing_title_queries: HashSet<WinID>,
+    window_census_reads: usize,
+    application_window_list_reads: usize,
+    native_tab_snapshot_reads: usize,
+    membership_overrides: HashMap<WinID, Vec<WorkspaceId>>,
     /// Windows on every Space at once; the window server refuses to move
     /// them, and reports every Space as their membership.
     sticky_windows: HashSet<WinID>,
     /// Windows whose per-window queries fail outright, independent of
     /// whether the window exists: the answer is an error, not absence.
     failing_window_queries: HashSet<WinID>,
+    /// Spaces whose occupancy enumeration fails rather than reporting no windows.
+    failing_workspace_queries: HashSet<WorkspaceId>,
     /// Every move the manager requested, whether the window server accepted,
     /// deferred or refused it.
     workspace_moves: Vec<(Vec<WinID>, WorkspaceId)>,
@@ -218,6 +231,59 @@ struct MockStateInner {
 }
 
 impl MockStateInner {
+    fn inactive_tab(&self, id: WinID) -> bool {
+        self.native_tab_groups
+            .iter()
+            .any(|group| group.members.contains(&id) && group.selected != id)
+    }
+
+    fn select_tab(&mut self, id: WinID) {
+        if let Some(group) = self
+            .native_tab_groups
+            .iter_mut()
+            .find(|group| group.members.contains(&id))
+        {
+            let previous = group.selected;
+            if previous != id {
+                let frame = self.windows.get(&previous).map(|window| window.frame);
+                if let Some(window) = self.windows.get_mut(&id)
+                    && let Some(frame) = frame
+                {
+                    window.frame = frame;
+                }
+                self.assigned_inactive_tabs.remove(&previous);
+                self.assigned_inactive_tabs.remove(&id);
+                self.raised_inactive_tabs.remove(&previous);
+                self.raised_inactive_tabs.remove(&id);
+            }
+            group.selected = id;
+        }
+    }
+
+    fn remove_tab(&mut self, id: WinID) {
+        let mut selected = None;
+        for group in &mut self.native_tab_groups {
+            group.members.retain(|member| *member != id);
+            if group.selected == id
+                && let Some(&next) = group.members.first()
+            {
+                group.selected = next;
+                selected = Some(next);
+            }
+        }
+        self.native_tab_groups
+            .retain(|group| group.members.len() > 1);
+        if let Some(next) = selected
+            && let Some(window) = self.windows.get(&next)
+        {
+            if let Some(app) = self.apps.get_mut(&window.pid) {
+                app.focused_window_id = Some(next);
+            }
+            self.event_queue
+                .push_back(Event::WindowFocused { window_id: next });
+        }
+    }
+
     fn owning_display(&self, workspace_id: WorkspaceId) -> Option<u32> {
         self.displays.values().find_map(|display| {
             display
@@ -239,6 +305,9 @@ impl MockStateInner {
                     return;
                 }
                 for window_id in windows {
+                    if self.inactive_tab(window_id) {
+                        self.assigned_inactive_tabs.insert(window_id);
+                    }
                     if let Some(window) = self.windows.get_mut(&window_id) {
                         window.workspace_id = workspace_id;
                     }
@@ -441,6 +510,7 @@ impl MockStateInner {
             .filter(|window| {
                 (window.workspace_id == workspace_id || self.sticky_windows.contains(&window.id))
                     && !self.is_associated_child(window.id)
+                    && !self.inactive_tab(window.id)
             })
             .map(|window| window.id)
             .collect::<Vec<_>>();
@@ -552,6 +622,15 @@ impl MockStateInner {
     /// longer knows, every Space for a sticky one.
     fn window_memberships(&self, window_id: WinID) -> crate::errors::Result<Vec<WorkspaceId>> {
         self.check_window_query(window_id)?;
+        if let Some(memberships) = self.membership_overrides.get(&window_id) {
+            return Ok(memberships.clone());
+        }
+        if self.inactive_tab(window_id)
+            && !self.assigned_inactive_tabs.contains(&window_id)
+            && !self.raised_inactive_tabs.contains(&window_id)
+        {
+            return Ok(vec![]);
+        }
         let Some(window) = self.windows.get(&window_id) else {
             return Ok(vec![]);
         };
@@ -578,9 +657,14 @@ impl MockStateInner {
     /// Validates a move batch the way the bridge does before it submits
     /// anything: every member must exist and sit on exactly one Space. The
     /// first offender fails the whole batch; nothing is submitted.
-    fn check_move_batch(&self, windows: &[WinID]) -> crate::errors::Result<()> {
+    fn check_move_batch(
+        &self,
+        windows: &[WinID],
+        inactive_tabs: &[WinID],
+    ) -> crate::errors::Result<()> {
         for &window_id in windows {
             match self.window_memberships(window_id)?.as_slice() {
+                [] if inactive_tabs.contains(&window_id) && self.inactive_tab(window_id) => {}
                 [] => {
                     return Err(Error::NotFound(format!(
                         "window {window_id} has no native Space membership; it may not exist"
@@ -627,10 +711,19 @@ impl MockState {
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
-                background_tabs: HashSet::new(),
                 associated_windows: HashMap::new(),
+                native_tab_groups: Vec::new(),
+                assigned_inactive_tabs: HashSet::new(),
+                raised_inactive_tabs: HashSet::new(),
+                failing_tab_queries: HashSet::new(),
+                failing_title_queries: HashSet::new(),
+                window_census_reads: 0,
+                application_window_list_reads: 0,
+                native_tab_snapshot_reads: 0,
+                membership_overrides: HashMap::new(),
                 sticky_windows: HashSet::new(),
                 failing_window_queries: HashSet::new(),
+                failing_workspace_queries: HashSet::new(),
                 workspace_moves: Vec::new(),
                 workspace_focuses: Vec::new(),
                 native_space_focuses: Vec::new(),
@@ -657,26 +750,16 @@ impl MockState {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_window_unordered(&self, window_id: WinID, unordered: bool) {
         let mut inner = self.inner.force_write();
         if unordered {
             inner.unordered_windows.insert(window_id);
+            inner.raised_inactive_tabs.remove(&window_id);
         } else {
             inner.unordered_windows.remove(&window_id);
-        }
-    }
-
-    /// Makes `window_id` a background native tab: on screen as far as the
-    /// window server is concerned, absent from the app's accessibility window
-    /// list. This is what Ghostty does with every tab but the selected one.
-    #[allow(unused)]
-    pub fn set_background_tab(&self, window_id: WinID, background: bool) {
-        let mut inner = self.inner.force_write();
-        if background {
-            inner.background_tabs.insert(window_id);
-        } else {
-            inner.background_tabs.remove(&window_id);
+            if inner.inactive_tab(window_id) {
+                inner.raised_inactive_tabs.insert(window_id);
+            }
         }
     }
 
@@ -686,6 +769,83 @@ impl MockState {
         window.visible = visible;
     }
 
+    pub(crate) fn merge_native_tabs(&self, members: &[WinID], selected: WinID) {
+        let mut inner = self.inner.force_write();
+        assert!(members.len() > 1 && members.contains(&selected));
+        let selected_window = &inner.windows[&selected];
+        let (pid, workspace, frame) = (
+            selected_window.pid,
+            selected_window.workspace_id,
+            selected_window.frame,
+        );
+        for id in members {
+            assert_eq!(inner.windows[id].pid, pid);
+            assert_eq!(inner.windows[id].workspace_id, workspace);
+            inner.remove_tab(*id);
+            inner.windows.get_mut(id).expect("known tab").frame = frame;
+        }
+        inner.native_tab_groups.push(MockNativeTabGroup {
+            members: members.to_vec(),
+            selected,
+        });
+        inner.apps.get_mut(&pid).expect("tab app").focused_window_id = Some(selected);
+        inner.event_queue.push_back(Event::WindowResized {
+            window_id: selected,
+        });
+        inner.event_queue.push_back(Event::WindowFocused {
+            window_id: selected,
+        });
+    }
+
+    pub(crate) fn detach_native_tab(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        inner.remove_tab(id);
+        inner
+            .event_queue
+            .push_back(Event::WindowResized { window_id: id });
+    }
+
+    pub(crate) fn set_tab_queries_failing(&self, id: WinID, failing: bool) {
+        let mut inner = self.inner.force_write();
+        if failing {
+            inner.failing_tab_queries.insert(id);
+        } else {
+            inner.failing_tab_queries.remove(&id);
+        }
+    }
+
+    pub(crate) fn set_title_queries_failing(&self, id: WinID, failing: bool) {
+        let mut inner = self.inner.force_write();
+        if failing {
+            inner.failing_title_queries.insert(id);
+        } else {
+            inner.failing_title_queries.remove(&id);
+        }
+    }
+
+    /// Global CG censuses, AX application window lists, and Cocoa titlebar reads.
+    pub(crate) fn native_tab_read_counts(&self) -> (usize, usize, usize) {
+        let inner = self.inner.force_read();
+        (
+            inner.window_census_reads,
+            inner.application_window_list_reads,
+            inner.native_tab_snapshot_reads,
+        )
+    }
+
+    pub(crate) fn set_window_memberships(&self, id: WinID, memberships: Vec<WorkspaceId>) {
+        self.inner
+            .force_write()
+            .membership_overrides
+            .insert(id, memberships);
+    }
+
+    pub(crate) fn window_memberships(&self, id: WinID) -> Vec<WorkspaceId> {
+        self.inner
+            .force_read()
+            .window_memberships(id)
+            .expect("readable native membership")
+    }
     // --- OS Behavior Methods ---
 
     pub fn spawn_app(&self, pid: Pid, bundle_id: &str, name: &str) {
@@ -732,6 +892,7 @@ impl MockState {
     /// real focus change would produce.
     pub fn set_focused_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
+        inner.select_tab(id);
         let Some(pid) = inner.windows.get(&id).map(|window| window.pid) else {
             return;
         };
@@ -742,6 +903,7 @@ impl MockState {
 
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
+        inner.select_tab(id);
         if let Some(win) = inner.windows.get(&id) {
             let pid = win.pid;
             if let Some(app) = inner.apps.get_mut(&pid) {
@@ -951,6 +1113,18 @@ impl MockState {
             .push(child);
     }
 
+    /// Associates two already tracked windows without replacing either one's
+    /// native frame, membership, application, or visibility.
+    pub(crate) fn associate_window(&self, parent: WinID, child: WinID) {
+        let mut inner = self.inner.force_write();
+        assert!(inner.windows.contains_key(&parent), "finding parent window");
+        assert!(inner.windows.contains_key(&child), "finding child window");
+        let children = inner.associated_windows.entry(parent).or_default();
+        if !children.contains(&child) {
+            children.push(child);
+        }
+    }
+
     /// Puts `window_id` on every Space at once. The window server reports
     /// all of them as its membership and refuses to move it, failing any
     /// batch that contains it before anything is submitted.
@@ -972,6 +1146,17 @@ impl MockState {
             inner.failing_window_queries.insert(window_id);
         } else {
             inner.failing_window_queries.remove(&window_id);
+        }
+    }
+
+    /// Fails occupancy enumeration for one Space without changing its census
+    /// presence or any per-window membership answers.
+    pub(crate) fn set_workspace_queries_failing(&self, workspace_id: WorkspaceId, failing: bool) {
+        let mut inner = self.inner.force_write();
+        if failing {
+            inner.failing_workspace_queries.insert(workspace_id);
+        } else {
+            inner.failing_workspace_queries.remove(&workspace_id);
         }
     }
 
@@ -1119,6 +1304,7 @@ impl MockState {
         let Some(window) = inner.windows.remove(&id) else {
             return;
         };
+        inner.remove_tab(id);
         inner.stale_window_ids.insert(id, window.pid);
         inner.event_queue.push_back(Event::WindowDestroyed {
             window_id: id,
@@ -1137,6 +1323,7 @@ impl MockState {
     pub fn os_vanish_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         inner.windows.remove(&id);
+        inner.remove_tab(id);
         inner.unordered_windows.insert(id);
     }
 
@@ -1239,6 +1426,9 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
+            if inner.inactive_tab(id) {
+                inner.raised_inactive_tabs.insert(id);
+            }
             if let Some(w) = inner.windows.get_mut(&id) {
                 w.frame.max = w.frame.min + size;
             }
@@ -1247,6 +1437,9 @@ impl MockState {
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
+            if inner.inactive_tab(id) {
+                inner.raised_inactive_tabs.insert(id);
+            }
             if let Some(w) = inner.windows.get_mut(&id) {
                 let size = w.frame.size();
                 w.frame.min = origin;
@@ -1259,18 +1452,60 @@ impl MockState {
             s.focus_window(id);
         });
 
+        let cached_title = Arc::new(RwLock::new(None));
+        let title_cache = cached_title.clone();
         let s = self.clone();
         mw.expect_title().returning(move || {
-            Ok(s.inner
-                .force_read()
+            let inner = s.inner.force_read();
+            if inner.failing_title_queries.contains(&id) {
+                return title_cache.force_read().clone().ok_or_else(|| {
+                    Error::Generic(format!("window {id} AXTitle observation failed"))
+                });
+            }
+            let title = inner
                 .windows
                 .get(&id)
                 .map(|w| w.title.clone())
-                .unwrap_or_default())
+                .unwrap_or_default();
+            *title_cache.force_write() = Some(title.clone());
+            Ok(title)
         });
-        // The mock reads its title from shared state every time, so there's
-        // nothing to invalidate — but the call still needs an expectation.
-        mw.expect_invalidate_title().return_const(());
+        // Live mock titles still follow shared state. Once AX becomes
+        // inaccessible, only a previously read, non-invalidated title survives.
+        mw.expect_invalidate_title().returning(move || {
+            cached_title.force_write().take();
+        });
+
+        let s = self.clone();
+        mw.expect_native_tab_snapshot().returning(move || {
+            let mut inner = s.inner.force_write();
+            inner.native_tab_snapshot_reads += 1;
+            if inner.failing_tab_queries.contains(&id) {
+                return Err(Error::Generic("native titlebar observation failed".into()));
+            }
+            if !inner.windows.contains_key(&id) {
+                return Err(Error::InvalidWindow);
+            }
+            let Some(group) = inner
+                .native_tab_groups
+                .iter()
+                .find(|group| group.selected == id)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(NativeTabSnapshot {
+                titles: group
+                    .members
+                    .iter()
+                    .map(|member| inner.windows[member].title.clone())
+                    .collect(),
+                selected: group
+                    .members
+                    .iter()
+                    .position(|member| *member == id)
+                    .expect("selected member"),
+            }))
+        });
 
         let s = self.clone();
         mw.expect_is_minimized().returning(move || {
@@ -1399,7 +1634,13 @@ impl MockState {
 
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
-        mw.expect_raise_without_focus().return_const(());
+        let s = self.clone();
+        mw.expect_raise_without_focus().returning(move || {
+            let mut inner = s.inner.force_write();
+            if inner.inactive_tab(id) {
+                inner.raised_inactive_tabs.insert(id);
+            }
+        });
 
         // Focusing without raising still moves the OS focus, it just leaves the
         // window order alone. Only the app's idea of its focused window changes
@@ -1502,20 +1743,14 @@ impl MockState {
                         .map(|(&id, _)| id),
                 )
                 .filter(|&id| !inner.is_associated_child(id))
+                .filter(|&id| !inner.inactive_tab(id))
                 .collect::<Vec<_>>()
         };
 
         let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
-
-        let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_ax_window_ids().returning(move || {
-            let background = s.inner.force_read().background_tabs.clone();
-            ids()
-                .into_iter()
-                .filter(|id| !background.contains(id))
-                .collect()
+        ma.expect_window_list().returning(move |_| {
+            s.inner.force_write().application_window_list_reads += 1;
+            ids().into_iter().map(|id| s.create_window(id)).collect()
         });
 
         Application::new(Box::new(ma))
@@ -1528,7 +1763,11 @@ impl MockState {
         let s = self.clone();
         wm.expect_window_is_unordered().returning(move |window_id| {
             let inner = s.inner.force_read();
-            inner.unordered_windows.contains(&window_id) || !inner.windows.contains_key(&window_id)
+            inner.check_window_query(window_id)?;
+            Ok(inner.unordered_windows.contains(&window_id)
+                || inner.inactive_tab(window_id)
+                    && !inner.raised_inactive_tabs.contains(&window_id)
+                || !inner.windows.contains_key(&window_id))
         });
 
         let s = self.clone();
@@ -1709,9 +1948,17 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_window_exists().returning(move |window_id| {
-            let inner = s.inner.force_read();
+            let mut inner = s.inner.force_write();
+            inner.window_census_reads += 1;
             inner.check_window_query(window_id)?;
             Ok(inner.windows.contains_key(&window_id))
+        });
+
+        let s = self.clone();
+        wm.expect_window_census().returning(move || {
+            let mut inner = s.inner.force_write();
+            inner.window_census_reads += 1;
+            Ok(inner.windows.keys().copied().collect())
         });
 
         let s = self.clone();
@@ -1775,7 +2022,8 @@ impl MockState {
                     .filter_map(|w| {
                         (w.pid == pid
                             && spaces.contains(&w.workspace_id)
-                            && !inner.is_associated_child(w.id))
+                            && !inner.is_associated_child(w.id)
+                            && !inner.inactive_tab(w.id))
                         .then_some(s.create_window(w.id))
                     })
                     .collect::<Vec<_>>();
@@ -1787,12 +2035,19 @@ impl MockState {
         wm.expect_windows_in_workspace()
             .returning(move |workspace_id| {
                 let inner = s.inner.force_read();
+                if inner.failing_workspace_queries.contains(&workspace_id) {
+                    return Err(Error::Generic(format!(
+                        "the virtual window server could not enumerate Space {workspace_id}"
+                    )));
+                }
                 let mut windows = inner
                     .windows
                     .values()
                     .filter_map(|w| {
-                        (w.workspace_id == workspace_id && !inner.is_associated_child(w.id))
-                            .then_some(w.id)
+                        (w.workspace_id == workspace_id
+                            && !inner.is_associated_child(w.id)
+                            && !inner.inactive_tab(w.id))
+                        .then_some(w.id)
                     })
                     .collect::<Vec<_>>();
                 // Sort the windows to keep the tests consistent
@@ -1801,14 +2056,14 @@ impl MockState {
             });
 
         let s = self.clone();
-        wm.expect_move_windows_to_workspace()
-            .returning(move |window_ids, workspace_id| {
+        wm.expect_move_windows_to_workspace().returning(
+            move |window_ids, workspace_id, inactive_tabs| {
                 let mut inner = s.inner.force_write();
                 let outcome = inner.native_move_outcome;
                 inner
                     .workspace_moves
                     .push((window_ids.to_vec(), workspace_id));
-                inner.check_move_batch(window_ids)?;
+                inner.check_move_batch(window_ids, inactive_tabs)?;
                 inner.submit(
                     outcome,
                     workspace_id,
@@ -1817,17 +2072,20 @@ impl MockState {
                         workspace_id,
                     },
                 )
-            });
+            },
+        );
 
         let s = self.clone();
         wm.expect_windows_on_screen().returning(move || {
-            let windows = s
-                .inner
-                .force_read()
+            let inner = s.inner.force_read();
+            let windows = inner
                 .windows
                 .iter()
-                .filter_map(|(id, window)| window.visible.then_some(id))
-                .copied()
+                .filter_map(|(id, window)| {
+                    (window.visible
+                        && (!inner.inactive_tab(*id) || inner.raised_inactive_tabs.contains(id)))
+                    .then_some(*id)
+                })
                 .collect::<Vec<_>>();
             Some(windows)
         });
@@ -1854,10 +2112,14 @@ impl MockState {
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {
             let point = origin_from(*at_point);
-            s.inner
-                .force_read()
+            let inner = s.inner.force_read();
+            inner
                 .windows
                 .iter()
+                .filter(|(id, window)| {
+                    window.visible
+                        && (!inner.inactive_tab(**id) || inner.raised_inactive_tabs.contains(id))
+                })
                 .find_map(|(id, window)| window.frame.contains(point).then_some(id))
                 .ok_or(Error::NotFound(format!("no window found at point {point}")))
                 .copied()

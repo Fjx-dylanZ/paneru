@@ -1123,72 +1123,38 @@ mod tests {
     }
 
     #[test]
-    fn paneru_config_has_resolved_defaults_before_setup() {
+    fn config_snapshot_customization_is_applied_only_by_setup() {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
                 r"
-                ffm = paneru.config.options.focus_follows_mouse
-                sliver = paneru.config.options.sliver_width
-                presets_len = #paneru.config.options.preset_column_widths
-                pad_top = paneru.config.padding.top
-                ws_count = paneru.config.default_workspaces
+                local config = paneru.config
+                config.options.skip_native_space_switch_animation =
+                  not config.options.skip_native_space_switch_animation
+                config.options.float_move_step = config.options.float_move_step * 2
+                config.swipe.scroll.window_step = not config.swipe.scroll.window_step
+                paneru.setup(config)
+
+                -- Editing the inspection table after setup must not silently
+                -- change the configuration handed to the window manager.
+                paneru.config.options.skip_native_space_switch_animation =
+                  not paneru.config.options.skip_native_space_switch_animation
+                paneru.config.options.float_move_step = 0.75
+                paneru.config.swipe.scroll.window_step = not paneru.config.swipe.scroll.window_step
                 ",
             )
-            .expect("script should load");
+            .expect("the defaults snapshot should be accepted by setup");
 
-        let globals = runtime.lua.globals();
-        assert!(globals.get::<bool>("ffm").unwrap());
-        assert_eq!(globals.get::<i32>("sliver").unwrap(), 5);
-        assert_eq!(globals.get::<usize>("presets_len").unwrap(), 8);
-        assert_eq!(globals.get::<i32>("pad_top").unwrap(), 0);
-        assert_eq!(globals.get::<u32>("ws_count").unwrap(), 1);
-    }
-
-    #[test]
-    fn paneru_setup_updates_paneru_config_and_merges_defaults() {
-        let world = TestWorld::default();
-        let runtime = world
-            .runtime(
-                r#"
-                paneru.setup {
-                  default_workspaces = 4,
-                  options = {
-                    focus_follows_mouse = false,
-                    preset_column_widths = { 0.5, 1.0 },
-                    custom_tag = "user_data",
-                  },
-                  padding = { top = 12 },
-                }
-
-                ffm = paneru.config.options.focus_follows_mouse
-                sliver = paneru.config.options.sliver_width
-                presets_len = #paneru.config.options.preset_column_widths
-                custom = paneru.config.options.custom_tag
-                pad_top = paneru.config.padding.top
-                pad_bottom = paneru.config.padding.bottom
-                ws_count = paneru.config.default_workspaces
-
-                paneru.bind("alt - x", function()
-                  if not paneru.config.options.focus_follows_mouse and paneru.config.padding.top == 12 then
-                    paneru.run("window balance")
-                  end
-                end)
-                "#,
-            )
-            .expect("script should load");
-
-        let globals = runtime.lua.globals();
-        assert!(!globals.get::<bool>("ffm").unwrap());
-        assert_eq!(globals.get::<i32>("sliver").unwrap(), 5);
-        assert_eq!(globals.get::<usize>("presets_len").unwrap(), 2);
-        assert_eq!(globals.get::<String>("custom").unwrap(), "user_data");
-        assert_eq!(globals.get::<i32>("pad_top").unwrap(), 12);
-        assert_eq!(globals.get::<i32>("pad_bottom").unwrap(), 0);
-        assert_eq!(globals.get::<u32>("ws_count").unwrap(), 4);
-
-        let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
-        assert_eq!(drained_commands(&runtime).len(), 1);
+        let defaults = Config::defaults().unwrap();
+        let config = runtime.built_config().expect("setup should build a config");
+        assert_eq!(
+            config.skip_native_space_switch_animation(),
+            !defaults.skip_native_space_switch_animation()
+        );
+        assert!((config.float_move_step() - defaults.float_move_step() * 2.0).abs() < f64::EPSILON);
+        assert_eq!(
+            config.swipe_scroll_window_step(),
+            !defaults.swipe_scroll_window_step()
+        );
     }
 }

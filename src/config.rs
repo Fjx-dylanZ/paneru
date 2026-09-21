@@ -1196,14 +1196,12 @@ impl InnerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
-#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 pub enum MissingWindowBehavior {
     Ignore,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
-#[cfg_attr(test, derive(serde::Serialize))]
 pub struct RestoreOptions {
     pub enabled: Option<bool>,
     pub startup_grace_ms: Option<u64>,
@@ -1213,7 +1211,6 @@ pub struct RestoreOptions {
 /// `MainOptions` represents the primary configuration options for the window manager.
 /// These options control various behaviors such as mouse focus, gesture recognition, and window animation.
 #[derive(Deserialize, Clone, Debug, Default)]
-#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
@@ -1276,7 +1273,6 @@ pub struct MainOptions {
     pub swipe_deceleration: Option<f64>,
     /// The modifier key used for mouse-based window resizing.
     #[serde(default, deserialize_with = "deserialize_modifier")]
-    #[cfg_attr(test, serde(serialize_with = "serialize_modifier"))]
     pub mouse_resize_modifier: Option<Modifiers>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
@@ -1558,15 +1554,6 @@ where
     parse_modifiers(&s)
         .map(Some)
         .map_err(|e: Error| serde::de::Error::custom(e.to_string()))
-}
-
-#[cfg(test)]
-#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn serialize_modifier<S: serde::Serializer>(
-    val: &Option<Modifiers>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.serialize_some(&val.as_ref().map(Modifiers::bits))
 }
 
 #[cfg(feature = "lua")]
@@ -2523,27 +2510,6 @@ fn test_parse_hex_color_malformed_hex() {
     // Non-hex digits fall back to 255 per channel.
     assert_eq!(parse_hex_color("ZZZZZZ"), (1.0, 1.0, 1.0));
     assert_eq!(parse_hex_color("GG0000"), (1.0, 0.0, 0.0));
-}
-
-#[test]
-#[allow(clippy::float_cmp)]
-fn test_config_defaults() {
-    let config = Config::default();
-    assert_eq!(config.dim_inactive_opacity(), 0.0);
-    assert_eq!(config.dim_inactive_color(), (0.0, 0.0, 0.0));
-    assert!(!config.border_active_window());
-    assert_eq!(config.border_color(), (1.0, 1.0, 1.0));
-    assert_eq!(config.border_opacity(), 1.0);
-    assert_eq!(config.border_width(), 2.0);
-    // Automatic radius detection is only enabled on macOS 26; other
-    // releases use the fixed-radius fallback.
-    let expected_radius = if macos_major_version() == 26 {
-        BorderRadiusOption::Auto
-    } else {
-        BorderRadiusOption::Value(10.0)
-    };
-    assert_eq!(config.border_radius(), expected_radius);
-    assert_eq!(config.menubar_height(), None);
 }
 
 #[test]

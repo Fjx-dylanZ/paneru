@@ -34,7 +34,7 @@ use crate::platform::{PlatformCallbacks, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 
 const ORPHANED_SPACES_TIMEOUT_SEC: u64 = 30;
-const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);
+pub(crate) const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);
 const DISPLAY_VERIFY_DELAY: Duration = Duration::from_secs(1);
 const DISPLAY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DISPLAY_RETRIES: u8 = 3;

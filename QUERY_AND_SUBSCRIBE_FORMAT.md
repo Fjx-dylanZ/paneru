@@ -5,14 +5,24 @@ a Mach service named `com.github.karinushka.paneru`. The CLI commands below
 require a running Paneru daemon.
 
 **The JSON below is what the CLI prints, not what crosses between processes.**
-Requests and responses travel as typed values in a compact binary encoding
-(`postcard`); `paneru query` and `paneru subscribe` render them as JSON because
-a terminal — and `jq`, and a status bar's shell script — needs text. Anything
-consuming these commands' output sees exactly the shapes documented here.
+Requests, replies and subscription events travel as typed values using
+MessagePack with named struct fields; `paneru query` and `paneru subscribe`
+render them as JSON because a terminal — and `jq`, and a status bar's shell
+script — needs text. Anything consuming these commands' output sees exactly
+the shapes documented here.
 
 A client written in Rust can skip the JSON entirely by using the
-`paneru::types` module (`src/types`): its `wire::Request` and `wire::Response`
-are the protocol, and `async-mach-ports` is the transport.
+`paneru::types` module (`src/types`): its `wire::Request`, `wire::Response`
+and `state::StateEvent` define the protocol. Use `wire::connect` / `wire::bind`
+and the shared wire aliases so requests, reply ports and subscription channels
+all use the same codec with `async-mach-ports` 0.3.
+
+The MessagePack transport is not binary-compatible with older Postcard-based
+builds. Update the daemon and clients together, restart the running daemon,
+and reload any process holding an older loadable Lua module. Reconnect
+subscriptions after the restart. There is no codec negotiation; the JSON
+state document's `version` is not a wire-protocol version. Shell consumers of
+the documented JSON output do not need to change.
 
 All query responses are a single JSON document. `subscribe` emits
 line-delimited JSON, with one complete event object per line.
@@ -23,6 +33,7 @@ line-delimited JSON, with one complete event object per line.
 paneru query state --json
 paneru query virtual-workspaces --json
 paneru query active --json
+paneru query on-screen --json
 paneru query native-spaces --json
 ```
 
@@ -72,7 +83,10 @@ Returns the complete state document.
           "role": "AXWindow",
           "subrole": "AXStandardWindow",
           "focused": true,
-          "floating": false
+          "floating": false,
+          "display_id": 1,
+          "frame": {"x": 0, "y": 32, "width": 800, "height": 600},
+          "visible": true
         }
       ]
     }
@@ -111,7 +125,10 @@ Returns only the `virtual_workspaces` array from the complete state document.
         "role": "AXWindow",
         "subrole": "AXStandardWindow",
         "focused": true,
-        "floating": false
+        "floating": false,
+        "display_id": 1,
+        "frame": {"x": 0, "y": 32, "width": 800, "height": 600},
+        "visible": true
       }
     ]
   }
@@ -134,6 +151,28 @@ Returns only the active display, workspace, and focused-window state.
 }
 ```
 
+### `paneru query on-screen --json`
+
+Returns the windows whose `visible` field is true, ordered left to right per
+display (then by window id when positions are equal). Each entry has the same
+window fields as the complete state document:
+
+```json
+[
+  {
+    "window_id": 321,
+    "bundle_id": "com.apple.Terminal",
+    "app_name": "Terminal",
+    "title": "paneru",
+    "focused": true,
+    "floating": false,
+    "display_id": 1,
+    "frame": {"x": 0, "y": 32, "width": 800, "height": 600},
+    "visible": true
+  }
+]
+```
+
 ### `paneru query native-spaces --json`
 
 Returns a fresh census of every native macOS Space, read from the OS at query
@@ -143,9 +182,10 @@ state document is Paneru's virtual layout, while this census is the window
 server's own list, independent of Paneru's layout and of whatever
 reconciliation is in flight, so it always lists empty and fullscreen Spaces
 whether or not Paneru holds a row for them. The `state`,
-`virtual-workspaces` and `active` shapes are unchanged by it. The embedded Lua
-`paneru.query(kind)` / `paneru.query_*` functions serve the state document
-only; this census is not available through them.
+`virtual-workspaces`, `active` and `on-screen` shapes are unchanged by it. Both
+the embedded and loadable Lua `paneru.query(kind)` / `paneru.query_*`
+functions serve the state document only; this census is not available through
+them.
 
 ```json
 [
@@ -217,10 +257,26 @@ or fail transiently while macOS converges; query again once it has settled.
 | `role` | string or null | Accessibility role (e.g. `AXWindow`), or null if the window reports none. |
 | `subrole` | string or null | Accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`, `AXFloatingWindow`), or null if the window reports none. |
 | `focused` | boolean | Whether this window is focused. |
-| `floating` | boolean | Whether this window is unmanaged/floating. |
+| `floating` | boolean | Persistent floating mode; remains true while a floating window is minimized or its application is hidden. |
+| `display_id` (window) | number or null | CoreGraphics display id the window mostly overlaps, when known. |
+| `frame` | object or null | Global display coordinates: integer `x`, `y`, `width` and `height`. |
+| `visible` | boolean | Meaningfully on screen, not minimized, application-hidden, an inactive native tab, or reduced to an off-screen sliver. |
 
 Paneru may include empty `windows` arrays for missing virtual workspace numbers
 inside a native workspace so integrations can render stable numbered slots.
+
+Minimized and application-hidden windows are not reported visible or focused.
+Unhiding an application does not imply that its minimized windows were restored.
+Inactive members of an identified native tab group remain in the logical row,
+but are also reported invisible and unfocused, even when macOS still lists
+their backing windows as ordered in.
+
+A confirmed-destroyed native Space can retain a last-known virtual row while
+Paneru cannot establish where one of its windows went. Queries preserve that
+row and its window metadata, but report it inactive and its windows invisible
+and unfocused. This does not mean the native Space still exists; use the native
+census for topology. A native enumeration failure for a present Space remains
+an error.
 
 ## Subscribe Command
 
@@ -231,11 +287,15 @@ paneru subscribe --json
 `subscribe` keeps its channel open and writes one JSON event per line. The stream
 is intended for integrations such as SketchyBar, so it emits changes that are
 useful for keeping a bar in sync: focus changes, native or virtual workspace
-changes, managed window-list changes, window title changes, and display changes.
+changes, managed window-list changes, on-screen window changes, window title
+changes, and display changes.
 Paneru coalesces duplicate internal events from the same ECS tick and skips
 events whose relevant state has not changed since the last emitted event.
 Consumers should parse each line independently and then call
 `paneru query state --json` when they need a full refresh.
+The event channel is non-blocking: events can be dropped if a subscriber stops
+reading and fills its queue. A subscription is not a durable event log; use a
+fresh query when an authoritative snapshot is needed.
 
 ### Event Types
 
@@ -267,6 +327,15 @@ are visible to subscribers. The `window_id`, `bundle_id`, `title`, and
 `virtual_workspace_number` fields are taken from the final active state for the
 tick, so stale lower-level focus notifications are not forwarded with mismatched
 window metadata.
+
+```json
+{"event":"on_screen_changed","windows":[],"active":{"display_id":1,"native_workspace_id":4,"virtual_workspace_number":3,"focused_window_id":null,"focused_bundle_id":null,"focused_app_name":null,"focused_window_title":null}}
+```
+
+Emitted when the on-screen window payload changes, including moves, resizes
+and title changes. `windows` has the same shape and ordering as
+`paneru query on-screen --json`; `active` is the final active state for the
+tick. An empty array means no tracked window is currently visible.
 
 ```json
 {"event":"window_title_changed","window_id":321,"title":"paneru"}

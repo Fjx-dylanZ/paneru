@@ -289,7 +289,7 @@ fn setup_world() -> App {
         .add_plugins(MinimalPlugins)
         .add_message::<Event>()
         .insert_resource(SkipReshuffle(false))
-        .insert_resource(MissionControlActive(false))
+        .insert_resource(MissionControlActive(Some(false)))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(InstantSpaceSwitch::default())
         .insert_resource(Config::default())

@@ -62,7 +62,7 @@ type ScrollingStrip<'w, 's> = Single<
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
-            mission_control.is_none_or(|active| !active.0)
+            mission_control.is_none_or(|active| !active.blocks_mutations())
         };
 
         // Only input ingestion is event-gated. Physics must continue after an

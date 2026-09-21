@@ -16,10 +16,13 @@ use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
+use super::{FloatingMarker, FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, VerifyFocus};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
+use crate::ecs::native_spaces::SpaceMovePending;
+use crate::ecs::params::{
+    ActiveDisplay, GlobalState, NotSuspended, Suspended, WindowCtx, WindowStateFlags, Windows,
+};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ReshuffleAroundMarker,
@@ -61,17 +64,15 @@ pub struct FocusHistory {
 }
 
 impl FocusHistory {
-    pub fn record(
-        &mut self,
-        workspace: WorkspaceId,
-        entity: Entity,
-        unmanaged: Option<&Unmanaged>,
-    ) {
+    pub fn record(&mut self, workspace: WorkspaceId, entity: Entity, flags: WindowStateFlags) {
+        if flags.is_suspended() {
+            return;
+        }
         let slot = self.by_workspace.entry(workspace).or_default();
-        match unmanaged {
-            None => slot.last_managed = Some(entity),
-            Some(Unmanaged::Floating) => slot.last_floating = Some(entity),
-            Some(_) => {}
+        if flags.floating {
+            slot.last_floating = Some(entity);
+        } else {
+            slot.last_managed = Some(entity);
         }
     }
 
@@ -162,10 +163,17 @@ fn clear_pending_focus_layout(
 fn maintain_focus_singleton(
     trigger: On<Add, FocusedMarker>,
     windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
+    suspended: Query<(), Suspended>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
     let focused_entity = trigger.event().entity;
+    if suspended.contains(focused_entity) {
+        if let Ok(mut entity_commands) = commands.get_entity(focused_entity) {
+            entity_commands.try_remove::<FocusedMarker>();
+        }
+        return;
+    }
 
     for (entity, focused) in windows {
         if focused
@@ -192,50 +200,34 @@ fn maintain_focus_singleton(
 /// of them at a time, and focusing any of them can leave the focus on the one
 /// the app decided to show.
 ///
-/// The strip knows the ones it has already grouped. The rest are recognised the
-/// same way [`super::systems::detect_tabbed_windows`] recognises them in the
-/// first place: same app, same frame.
+/// Only a positively discovered strip group can explain redirected focus;
+/// matching geometry alone does not establish a native tab relationship.
 fn shares_a_tab_group(
     workspaces: &Query<(Entity, &mut LayoutStrip)>,
-    windows: &Windows,
     target: Entity,
     actual: Entity,
 ) -> bool {
-    if workspaces.iter().any(|(_, strip)| {
+    workspaces.iter().any(|(_, strip)| {
         strip
             .tab_group(target)
             .is_some_and(|group| group.contains(&actual))
-    }) {
-        return true;
-    }
-
-    let parent_of = |entity: Entity| {
-        windows
-            .get(entity)
-            .and_then(|window| windows.find_parent(window.id()))
-            .map(|(_, _, parent)| parent)
-    };
-    let (Some(target_app), Some(actual_app)) = (parent_of(target), parent_of(actual)) else {
-        return false;
-    };
-    if target_app != actual_app {
-        return false;
-    }
-
-    windows
-        .frame(target)
-        .zip(windows.frame(actual))
-        .is_some_and(|(target_frame, actual_frame)| {
-            target_frame.min.chebyshev_distance(actual_frame.min) <= 1
-                && target_frame.size().chebyshev_distance(actual_frame.size()) <= 1
-        })
+    })
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
 fn fix_window_size_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
+    moves: Query<&SpaceMovePending>,
+    native_tabs: Query<&crate::ecs::native_tabs::NativeTabGroups>,
 ) {
+    if moves.iter().any(|pending| pending.travels(*focused))
+        || native_tabs
+            .iter()
+            .any(|groups| groups.is_inactive(*focused))
+    {
+        return;
+    }
     if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(*focused)
         && !resizing
         && let Ok(frame) = window.update_frame()
@@ -270,6 +262,7 @@ fn detect_focus_rejection(
     apps: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     windows: Windows,
+    moves: Query<&SpaceMovePending>,
     mut commands: Commands,
 ) {
     for (target_entity, target_window, child_of, timeout) in &pending {
@@ -307,13 +300,27 @@ fn detect_focus_rejection(
         {
             continue;
         }
+        if moves
+            .iter()
+            .any(|pending| pending.travels(target_entity) || pending.travels(actual_entity))
+        {
+            continue;
+        }
+        // Losing focus because visibility was suspended is not an application
+        // rejection and must never change the user's persistent tiling intent.
+        if windows
+            .get_managed(target_entity)
+            .is_some_and(|(_, _, flags)| flags.is_suspended())
+        {
+            continue;
+        }
 
         // Native tabs share one slot: asking for a background tab makes the app
         // select it, and the focus notification names whichever tab of the group
         // the app ended up showing. That is the app doing what was asked, not
         // refusing it — floating the window here is how a tabbed terminal ends up
         // scattered across the layout as windows nothing tiles.
-        if shares_a_tab_group(&workspaces, &windows, target_entity, actual_entity) {
+        if shares_a_tab_group(&workspaces, target_entity, actual_entity) {
             debug!(
                 "focus landed on tab sibling {actual_entity} of {target_entity}; not a rejection.",
             );
@@ -328,7 +335,7 @@ fn detect_focus_rejection(
         if let Ok(mut entity_commands) = commands.get_entity(target_entity) {
             entity_commands
                 .try_remove::<(Timeout, VerifyFocus)>()
-                .try_insert(Unmanaged::Floating);
+                .try_insert(FloatingMarker);
         }
         for (_, mut strip) in &mut workspaces {
             if strip.contains(target_entity) {
@@ -339,21 +346,27 @@ fn detect_focus_rejection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
+    activated: Query<&LayoutStrip, Added<ActiveWorkspaceMarker>>,
+    moves: Query<&SpaceMovePending>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
 ) {
     let entity = *focused;
 
-    // Skip auto-centering when this focus came from a workspace restore, since
-    // the strip is already at its saved origin. window_focused_trigger and
-    // timeout_ticker are responsible for clearing the marker.
-    if restored.iter().any(|marker| marker.entity == entity) {
+    // A native handoff owns traveling frames. A virtual strip activation owns
+    // its saved origin too: a focus reshuffle queued here would run next frame
+    // against the parked window frame and overwrite that restoration.
+    if moves.iter().any(|pending| pending.travels(entity))
+        || activated.iter().any(|strip| strip.contains(entity))
+        || restored.iter().any(|marker| marker.entity == entity)
+    {
         return;
     }
 
@@ -364,7 +377,10 @@ fn autocenter_window_on_focus(
         return;
     }
     if ctx.config.auto_center()
-        && let Some((_, _, None)) = ctx.windows.get_managed(entity)
+        && ctx
+            .windows
+            .get_managed(entity)
+            .is_some_and(|(_, _, flags)| flags.is_tiled())
         && let Some(size) = ctx.windows.size(entity)
         && let Some(mut origin) = ctx.windows.origin(entity)
     {
@@ -462,9 +478,12 @@ fn dim_remove_window_trigger(
     config: Res<Config>,
     theme: Option<Res<SystemTheme>>,
 ) {
-    let Some((window, _, None)) = windows.get_managed(trigger.event().entity) else {
+    let Some((window, _, flags)) = windows.get_managed(trigger.event().entity) else {
         return;
     };
+    if !flags.is_tiled() {
+        return;
+    }
 
     let same_display = active_display
         .active_strip()
@@ -484,8 +503,12 @@ fn dim_remove_window_trigger(
 fn virtual_strip_activated(
     trigger: On<Add, FocusedMarker>,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    moves: Query<&SpaceMovePending>,
     mut commands: Commands,
 ) {
+    if moves.iter().any(|pending| pending.travels(trigger.entity)) {
+        return;
+    }
     let owner_strip = workspaces.into_iter().find_map(|(entity, strip, active)| {
         (strip.contains(trigger.entity) && !active).then_some(entity)
     });
@@ -511,9 +534,12 @@ fn focus_window_trigger(
             entity_commands.try_remove::<(Timeout, VerifyFocus)>();
         }
     }
-    let Some(window) = windows.get(entity) else {
+    let Some((window, _, flags)) = windows.get_managed(entity) else {
         return;
     };
+    if flags.is_suspended() {
+        return;
+    }
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
@@ -529,13 +555,14 @@ fn focus_window_trigger(
 
 fn raise_window_trigger(
     trigger: On<RaiseWindow>,
-    windows: Query<(Entity, &Window, &Position, &Bounds)>,
+    windows: Query<(&Window, Entity, &Position, &Bounds), NotSuspended>,
     active_display: ActiveDisplay,
     config: Res<Config>,
+    native_tabs: super::native_tabs::NativeTabSurfaces,
 ) {
     let RaiseWindow { entity, with_strip } = *trigger.event();
 
-    let Ok((focus, window, _, _)) = windows.get(entity) else {
+    let Ok((window, focus, _, _)) = windows.get(entity) else {
         return;
     };
 
@@ -545,30 +572,31 @@ fn raise_window_trigger(
         strip
             .all_windows()
             .into_iter()
-            .filter_map(|entity| {
-                if entity == focus {
-                    None
-                } else {
-                    windows.get(entity).ok()
-                }
+            .filter(|entity| *entity != focus)
+            .filter_map(|entity| windows.get(entity).ok())
+            .filter(|(window, entity, _, _)| {
+                native_tabs.can_raise_alongside(*entity, focus, window.id())
             })
             .filter(|(_, _, origin, size)| {
                 let frame = IRect::from_corners(origin.0, origin.0 + size.0);
                 viewport.intersect(frame).width() > 50
             })
-            .for_each(|(_, window, _, _)| {
+            .for_each(|(window, _, _, _)| {
                 window.raise_without_focus();
             });
     }
 
     // Raise the focused window last, because raised windows get OS focus events.
-    window.raise_without_focus();
+    if native_tabs.can_write(focus, window.id()) {
+        window.raise_without_focus();
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
 fn recover_lost_focus(
     windows: Windows,
     active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    moves: Query<&SpaceMovePending>,
     mut commands: Commands,
 ) {
     if windows.focused().is_some() {
@@ -577,7 +605,12 @@ fn recover_lost_focus(
     if let Ok(strip) = active_workspace
         .single()
         .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
+        && let Some(entity) = strip.all_columns().into_iter().find(|entity| {
+            windows
+                .get_managed(*entity)
+                .is_some_and(|(_, _, flags)| flags.is_tiled())
+                && !moves.iter().any(|pending| pending.travels(*entity))
+        })
     {
         error!("Lost focus marker, recovering!");
         commands.focus_entity(entity, false);
@@ -649,8 +682,15 @@ mod tests {
         let floating = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, managed, None);
-        history.record(1, floating, Some(&Unmanaged::Floating));
+        history.record(1, managed, WindowStateFlags::default());
+        history.record(
+            1,
+            floating,
+            WindowStateFlags {
+                floating: true,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(history.last_managed(1), Some(managed));
         assert_eq!(history.last_floating(1), Some(floating));
@@ -662,8 +702,23 @@ mod tests {
         let entity = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, entity, Some(&Unmanaged::Minimized));
-        history.record(1, entity, Some(&Unmanaged::Hidden));
+        history.record(
+            1,
+            entity,
+            WindowStateFlags {
+                minimized: true,
+                ..Default::default()
+            },
+        );
+        history.record(
+            1,
+            entity,
+            WindowStateFlags {
+                floating: true,
+                hidden: true,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(history.last_managed(1), None);
         assert_eq!(history.last_floating(1), None);
@@ -676,8 +731,8 @@ mod tests {
         let b = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, a, None);
-        history.record(2, b, None);
+        history.record(1, a, WindowStateFlags::default());
+        history.record(2, b, WindowStateFlags::default());
 
         assert_eq!(history.last_managed(1), Some(a));
         assert_eq!(history.last_managed(2), Some(b));
@@ -690,9 +745,16 @@ mod tests {
         let other = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, target, None);
-        history.record(2, target, Some(&Unmanaged::Floating));
-        history.record(2, other, None);
+        history.record(1, target, WindowStateFlags::default());
+        history.record(
+            2,
+            target,
+            WindowStateFlags {
+                floating: true,
+                ..Default::default()
+            },
+        );
+        history.record(2, other, WindowStateFlags::default());
 
         history.forget(target);
 
@@ -707,7 +769,7 @@ mod tests {
         let entity = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, entity, None);
+        history.record(1, entity, WindowStateFlags::default());
         history.forget_workspace(1);
 
         assert_eq!(history.last_managed(1), None);
@@ -738,7 +800,7 @@ mod tests {
         _ = world.run_system(system_id);
 
         assert!(
-            world.get::<Unmanaged>(target).is_none(),
+            world.get::<FloatingMarker>(target).is_none(),
             "a tab sibling taking the focus must not float the requested tab"
         );
         let mut strips = world.query::<&LayoutStrip>();
@@ -771,11 +833,7 @@ mod tests {
         let system_id = world.register_system(detect_focus_rejection);
         _ = world.run_system(system_id);
 
-        assert!(
-            world
-                .get::<Unmanaged>(target)
-                .is_some_and(|u| matches!(u, Unmanaged::Floating))
-        );
+        assert!(world.get::<FloatingMarker>(target).is_some());
         assert!(world.get::<VerifyFocus>(target).is_none());
         assert!(world.get::<Timeout>(target).is_none());
     }

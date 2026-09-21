@@ -1,8 +1,8 @@
 //! The argv encoding of a [`Command`]: `["window", "focus", "east"]`.
 //!
-//! This is the wire format of the `send-cmd` socket protocol and the shape the
-//! TOML `[bindings]` keys are split into, so parsing and formatting live
-//! together here and are checked against each other by round-trip tests.
+//! This is the input to `send-cmd` and the shape TOML `[bindings]` keys are
+//! split into. Clients parse it into a typed command before sending it over
+//! Mach IPC; parsing, formatting and wire round trips are checked together.
 
 use crate::types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, SpaceOperation,
@@ -304,15 +304,25 @@ impl Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::wire::{Codec, MessagePack, Request};
 
     fn round_trip(command: &Command) -> Command {
         let argv = command.to_argv().expect("command should encode to argv");
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-        parse_command(&borrowed).unwrap_or_else(|err| panic!("re-parsing {argv:?}: {err}"))
+        let parsed =
+            parse_command(&borrowed).unwrap_or_else(|err| panic!("re-parsing {argv:?}: {err}"));
+        let bytes = MessagePack
+            .encode(&Request::Command(parsed))
+            .expect("command encodes");
+        let Request::Command(received) = MessagePack.decode(&bytes).expect("command decodes")
+        else {
+            panic!("expected a command request");
+        };
+        received
     }
 
     #[test]
-    fn every_operation_round_trips_through_argv() {
+    fn every_operation_round_trips_through_argv_and_wire() {
         let operations = [
             Operation::Focus(Direction::East),
             Operation::Focus(Direction::Nth(2)),
@@ -338,6 +348,7 @@ mod tests {
             Operation::Virtual(Direction::First),
             Operation::FocusOrVirtual(Direction::North),
             Operation::FocusOrVirtual(Direction::South),
+            Operation::VirtualAdd,
             Operation::VirtualNumber(2),
             Operation::VirtualMove(Direction::East, MoveFocus::Follow),
             Operation::VirtualMove(Direction::East, MoveFocus::Stay),
@@ -360,15 +371,14 @@ mod tests {
             let command = Command::Window(operation.clone());
             let reparsed = round_trip(&command);
             assert_eq!(
-                format!("{reparsed:?}"),
-                format!("{command:?}"),
-                "argv round-trip changed {operation:?}"
+                reparsed, command,
+                "argv and wire round-trip changed {operation:?}"
             );
         }
     }
 
     #[test]
-    fn global_commands_round_trip() {
+    fn global_commands_round_trip_through_argv_and_wire() {
         for command in [
             Command::Quit,
             Command::Restart,
@@ -387,10 +397,7 @@ mod tests {
                 migrate: true,
             }),
         ] {
-            assert_eq!(
-                format!("{:?}", round_trip(&command)),
-                format!("{command:?}")
-            );
+            assert_eq!(round_trip(&command), command);
         }
     }
 

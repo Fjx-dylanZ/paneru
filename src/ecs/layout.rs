@@ -2700,10 +2700,9 @@ mod tests {
         }
     }
 
-    // Mirrors the real `detect_tabbed_windows` flow: spawn_window_trigger
-    // appends the new window to the strip first, and only then does the
-    // tab detector merge it into the leader's column. Before the fix, the
-    // follower was left in both columns, and right_neighbour from the
+    // Native-tab reconciliation can merge a window that already has its own
+    // column into a leader's group. Before the fix, the follower was left
+    // in both columns, and right_neighbour from the
     // duplicated entity would self-loop because index_of returned the Tabs
     // column index, while the column at the next index was the orphaned
     // Single(follower).

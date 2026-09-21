@@ -148,8 +148,8 @@ pub struct NativeSpaceState {
     pub index: usize,
     /// Opaque identifier of the display that owns the Space.
     pub display: String,
-    /// 1-based position of the Space among the Spaces of its own display —
-    /// the number Mission Control shows for it on that display.
+    /// 1-based position in the owning display's native Space list, including
+    /// fullscreen and system entries; not necessarily its Desktop label.
     pub display_index: usize,
     /// The native Space type as reported by the OS; `0` is an ordinary Desktop.
     #[serde(rename = "type")]
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn events_round_trip_through_json() {
+    fn events_survive_the_wire_and_render_documented_json() {
         let event = StateEvent::OnScreenChanged {
             windows: vec![WindowState {
                 window_id: 1,
@@ -325,15 +325,33 @@ mod tests {
             active: ActiveState::default(),
         };
 
-        let line = serde_json::to_string(&event.to_json().unwrap()).unwrap();
-        assert!(line.contains(r#""event":"on_screen_changed""#));
-        assert!(line.contains(r#""windows":"#));
-
         let bytes = MessagePack.encode(&event).unwrap();
+        let decoded: StateEvent = MessagePack.decode(&bytes).unwrap();
         assert_eq!(
-            MessagePack.decode::<StateEvent>(&bytes).unwrap(),
-            event,
-            "clients must decode exactly what the daemon emits"
+            decoded.to_json().unwrap(),
+            serde_json::json!({
+                "event": "on_screen_changed",
+                "windows": [{
+                    "window_id": 1,
+                    "bundle_id": "com.example.app",
+                    "app_name": "Example",
+                    "title": "window",
+                    "focused": true,
+                    "floating": false,
+                    "display_id": 1,
+                    "frame": {"x": 0, "y": 0, "width": 800, "height": 600},
+                    "visible": true,
+                }],
+                "active": {
+                    "display_id": null,
+                    "native_workspace_id": null,
+                    "virtual_workspace_number": null,
+                    "focused_window_id": null,
+                    "focused_bundle_id": null,
+                    "focused_app_name": null,
+                    "focused_window_title": null,
+                },
+            })
         );
     }
 

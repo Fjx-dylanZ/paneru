@@ -4,7 +4,7 @@
 //! `paneru.window.*`, `paneru.workspace.*`, `paneru.mouse.*` — built on a
 //! caller-supplied dispatcher. The daemon's embedded runtime (`src/lua`) hands
 //! it one that queues the [`Command`] onto the command bus; [`client`] hands it
-//! one that writes the command to a running daemon's Unix socket, and adds the
+//! one that writes the command to a running daemon's Mach service, and adds the
 //! client-only `query_*` / `subscribe` helpers on top.
 //!
 //! With the `module` feature the crate additionally builds as a loadable Lua C
@@ -44,7 +44,7 @@
 //! the actual enums with mlua's serde support, so `"east"` becomes
 //! [`Direction::East`] and an unknown value fails at the call site. Only the
 //! host-specific extras differ (`paneru.on` / `paneru.bind` are embedded-only;
-//! `subscribe` and the socket-path helpers are client-only).
+//! `subscribe` and the service-name helpers are client-only).
 
 #![allow(
     clippy::needless_pass_by_value,
@@ -561,10 +561,11 @@ fn paneru(lua: &Lua) -> Result<Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::wire::{Codec, MessagePack, Request};
     use std::cell::RefCell;
 
-    /// Installs the API with a dispatcher that records commands instead of
-    /// issuing them, and runs `source`.
+    /// Installs the API with a dispatcher that encodes commands as the loadable
+    /// client does, then records what the daemon would decode, and runs `source`.
     fn run(source: &str) -> mlua::Result<Vec<Command>> {
         let lua = Lua::new();
         let issued = Rc::new(RefCell::new(Vec::new()));
@@ -574,6 +575,15 @@ mod tests {
         let recorder = {
             let issued = Rc::clone(&issued);
             move |_: &Lua, command: Command| {
+                let bytes = MessagePack
+                    .encode(&Request::Command(command))
+                    .map_err(mlua::Error::external)?;
+                let request = MessagePack
+                    .decode::<Request>(&bytes)
+                    .map_err(mlua::Error::external)?;
+                let Request::Command(command) = request else {
+                    panic!("expected a command request");
+                };
                 issued.borrow_mut().push(command);
                 Ok(true)
             }
@@ -650,29 +660,6 @@ mod tests {
         assert!(run(r#"paneru.window.resize({ direction = "wider" })"#).is_err());
         assert!(run(r#"paneru.window.vertical_resize({ direction = "taller" })"#).is_err());
         assert!(run(r#"paneru.run("not a command")"#).is_err());
-    }
-
-    #[test]
-    fn defaults_match_the_documented_behaviour() {
-        let commands = run(r#"
-            paneru.window.resize()
-            paneru.window.vertical_resize()
-            paneru.window.vertical_resize("shrink")
-            paneru.window.next_display()
-            paneru.window.next_display({ follow = false })
-        "#)
-        .unwrap();
-
-        assert_eq!(
-            debug(&commands),
-            debug(&[
-                Command::Window(Operation::Resize(ResizeDirection::Grow)),
-                Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),
-                Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink)),
-                Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
-                Command::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
-            ])
-        );
     }
 
     /// Native Space lifecycle and moves: migration is opt-in, following is

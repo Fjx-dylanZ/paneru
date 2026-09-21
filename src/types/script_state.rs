@@ -3,7 +3,7 @@
 //! restart.
 //!
 //! Shared by the daemon and its clients: the embedded runtime writes it via
-//! `paneru.state.*`, a client via the same spelling over the socket. Because
+//! `paneru.state.*`, a client via the same spelling over Mach IPC. Because
 //! there are two writers, a write carries what it [`Expected`] to find — that
 //! is what makes `paneru.state.mutate` a real read-modify-write.
 

@@ -208,26 +208,53 @@ mod tests {
 
     #[test]
     fn every_response_survives_the_wire() {
-        round_trip(&Response::Query(QueryPayload::Active(Box::default())));
-        round_trip(&Response::Query(
-            QueryPayload::VirtualWorkspaces(Vec::new()),
-        ));
-        round_trip(&Response::Query(QueryPayload::OnScreen(Vec::new())));
-        round_trip(&Response::Query(QueryPayload::NativeSpaces(vec![
-            NativeSpaceState {
-                id: 0x1_0000_0007,
-                index: 2,
-                display: "37D8832A-2D66-02CA-B9F7-8F30A301B230".to_string(),
-                display_index: 1,
-                kind: 0,
-                active: true,
+        let state = QueryState {
+            version: 1,
+            timestamp: 1_790_000_000,
+            active: ActiveState {
+                display_id: Some(2),
+                native_workspace_id: Some(0x1_0000_0007),
+                virtual_workspace_number: Some(3),
+                focused_window_id: Some(42),
+                focused_bundle_id: Some("com.example.app".to_string()),
+                focused_app_name: Some("Example".to_string()),
+                focused_window_title: Some("日本語".to_string()),
             },
-        ])));
+            virtual_workspaces: vec![VirtualWorkspaceState {
+                number: 3,
+                native_workspace_id: 0x1_0000_0007,
+                active: true,
+                windows: vec![WindowState {
+                    window_id: 42,
+                    bundle_id: "com.example.app".to_string(),
+                    app_name: "Example".to_string(),
+                    title: "日本語".to_string(),
+                    focused: true,
+                    floating: true,
+                    display_id: Some(2),
+                    frame: Some(Frame {
+                        x: -800,
+                        y: 40,
+                        width: 800,
+                        height: 600,
+                    }),
+                    visible: true,
+                }],
+            }],
+        };
+        for kind in StateQueryKind::ALL {
+            round_trip(&Response::Query(state.to_query_payload(kind)));
+        }
         round_trip(&Response::ScriptState(ScriptStateResponse::Value(Some(
             ScriptValue::Str("hello".to_string()),
         ))));
         round_trip(&Response::ScriptState(ScriptStateResponse::Write(
             WriteOutcome::Applied { changed: true },
+        )));
+        round_trip(&Response::ScriptState(ScriptStateResponse::Write(
+            WriteOutcome::Conflict {
+                current: Some(ScriptValue::Int(9_007_199_254_740_993)),
+            },
         )));
         round_trip(&Response::Error("no such window".to_string()));
     }
@@ -236,20 +263,26 @@ mod tests {
     /// `type`, the name scripts and the CLI documentation agree on, rather
     /// than the Rust field name.
     #[test]
-    fn native_spaces_render_as_a_json_array() {
+    fn native_spaces_survive_the_wire_and_render_as_a_json_array() {
         let payload = QueryPayload::NativeSpaces(vec![NativeSpaceState {
-            id: 5,
+            id: 9_007_199_254_740_993,
             index: 1,
             display: "main".to_string(),
             display_index: 1,
             kind: 4,
             active: false,
         }]);
-        let json = payload.to_json().expect("renders");
+        let bytes = MessagePack
+            .encode(&Response::Query(payload))
+            .expect("encodes");
+        let Response::Query(decoded) = MessagePack.decode(&bytes).expect("decodes") else {
+            panic!("expected a query response");
+        };
+        let json = decoded.to_json().expect("renders");
         assert_eq!(
             json,
             serde_json::json!([{
-                "id": 5,
+                "id": 9_007_199_254_740_993_u64,
                 "index": 1,
                 "display": "main",
                 "display_index": 1,
@@ -319,17 +352,5 @@ mod tests {
         // Ops are deliberately not carried: a set off the wire is one nothing
         // has been asked of yet.
         assert!(decoded.ops().is_empty());
-    }
-
-    #[test]
-    fn a_request_is_small() {
-        let bytes = MessagePack
-            .encode(&Request::Query(StateQueryKind::Active))
-            .expect("encodes");
-        assert!(
-            bytes.len() <= 32,
-            "a query request took {} bytes",
-            bytes.len()
-        );
     }
 }

@@ -17,7 +17,7 @@ use crate::ecs::state::{
     PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState, PaneruWindowState,
     QueryStateParams, StateEvent,
 };
-use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged};
+use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker};
 use crate::events::{Event, Reply};
 use crate::manager::WindowManager;
 use crate::platform::{PlatformCallbacks, WinID};
@@ -25,10 +25,9 @@ use crate::types::wire::{self, QueryPayload, Response};
 
 /// One connected `paneru subscribe` client.
 ///
-/// The channel is only ever touched from a task on the IO pool, since writing
-/// to a peer that may not be reading can block. `alive` lets the main thread
-/// learn a subscriber is gone via a plain atomic flag instead of a lock shared
-/// with that task.
+/// Sends use the channel's non-blocking `try_send`: a slow reader drops events
+/// rather than stalling the main thread. `alive` records a dead peer until the
+/// next broadcast reaps it.
 struct Subscriber {
     channel: Arc<wire::Subscriber>,
     alive: Arc<AtomicBool>,
@@ -216,7 +215,7 @@ fn reply(respond_to: &Reply, answer: Result<Response, String>) {
     _ = respond_to.try_send(answer.unwrap_or_else(Response::Error));
 }
 
-/// Answers socket queries that read the world: state documents and the window
+/// Answers IPC queries that read the world: state documents and the window
 /// set. Both live in one system so only one system holds [`QueryStateParams`]'s
 /// world access. The window set is a separate variant rather than folded into
 /// [`StateQueryKind`] since it projects a different value (the layout tree).
@@ -424,7 +423,7 @@ fn state_event_broadcast_handler(
                 .windows()
                 .find(*window_id)
                 .and_then(|(_, entity)| state.windows().get_managed(entity))
-                .is_some_and(|(_, _, unmanaged)| matches!(unmanaged, Some(Unmanaged::Floating)))
+                .is_some_and(|(_, _, flags)| flags.floating)
         }),
         window_focused: !focused_changes.is_empty(),
     };

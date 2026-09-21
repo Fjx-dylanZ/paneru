@@ -10,7 +10,7 @@ use crate::ecs::state::{
     PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
-use crate::ecs::{SpawnWindowTrigger, Unmanaged};
+use crate::ecs::{FloatingMarker, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size};
 use crate::platform::{ProcessSerialNumber, WorkspaceId};
@@ -534,7 +534,10 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
     let world = harness.world();
     let restored_window = crate::tests::harness::find_window_entity(0, world);
     assert!(
-        world.entity(restored_window).get::<Unmanaged>().is_none(),
+        world
+            .entity(restored_window)
+            .get::<FloatingMarker>()
+            .is_none(),
         "matched restore windows should not inherit floating config"
     );
     assert!(
@@ -545,10 +548,7 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
     );
 
     let unmatched_window = find_window_entity(1, world);
-    assert!(matches!(
-        world.get::<Unmanaged>(unmatched_window),
-        Some(Unmanaged::Floating)
-    ));
+    assert!(world.get::<FloatingMarker>(unmatched_window).is_some());
     assert!(
         world
             .entity(unmatched_window)
