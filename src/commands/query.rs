@@ -17,7 +17,7 @@ use crate::ecs::state::{
     PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState, PaneruWindowState,
     QueryStateParams, StateEvent,
 };
-use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged};
+use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker};
 use crate::events::{Event, Reply};
 use crate::manager::WindowManager;
 use crate::platform::{PlatformCallbacks, WinID};
@@ -424,7 +424,7 @@ fn state_event_broadcast_handler(
                 .windows()
                 .find(*window_id)
                 .and_then(|(_, entity)| state.windows().get_managed(entity))
-                .is_some_and(|(_, _, unmanaged)| matches!(unmanaged, Some(Unmanaged::Floating)))
+                .is_some_and(|(_, _, flags)| flags.floating)
         }),
         window_focused: !focused_changes.is_empty(),
     };

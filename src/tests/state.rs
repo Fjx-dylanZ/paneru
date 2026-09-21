@@ -2,6 +2,8 @@ use bevy::prelude::*;
 
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::native_spaces::DestroyedSpaceMarker;
+use crate::ecs::native_tabs::NativeTabGroups;
 use crate::ecs::params::Windows;
 use crate::ecs::restore::CurrentWindowIdentity;
 use crate::ecs::state::QueryState;
@@ -45,11 +47,12 @@ type QueryStateExtractionState<'w, 's> = SystemState<(
             &'static LayoutStrip,
             Has<ActiveWorkspaceMarker>,
             Has<SelectedVirtualMarker>,
+            Has<DestroyedSpaceMarker>,
         ),
     >,
     Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
     Windows<'w, 's>,
-    Query<'w, 's, &'static Application>,
+    Query<'w, 's, (&'static Application, Option<&'static NativeTabGroups>)>,
     Res<'w, WindowManager>,
     Res<'w, Config>,
 )>;
@@ -772,6 +775,158 @@ fn test_query_state_tracks_float_after_virtual_workspace_is_reaped() {
             assert!(live_workspace.windows[0].floating);
         })
         .run(commands);
+}
+
+fn merged_native_tab_query_harness() -> crate::tests::harness::TestHarness {
+    use crate::commands::Command;
+    use crate::tests::harness::{NATIVE_REACTION, TestHarness};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+    // Merge after startup, when both logical windows already have layout slots.
+    harness.mock_state.merge_native_tabs(&[0, 1], 0);
+    harness.advance(NATIVE_REACTION);
+    harness
+}
+
+#[test]
+fn test_query_state_projects_native_tab_selection_without_losing_members() {
+    use crate::tests::harness::NATIVE_REACTION;
+
+    let mut harness = merged_native_tab_query_harness();
+    let merged = extract_query_state(harness.world()).expect("query after native merge");
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    let switched = extract_query_state(harness.world()).expect("query after tab selection");
+
+    for (state, selected) in [(merged, 0), (switched, 1)] {
+        let row = state
+            .virtual_workspaces
+            .iter()
+            .find(|row| row.active)
+            .expect("active row");
+        assert_eq!(
+            row.windows.len(),
+            2,
+            "inactive logical tabs stay in the row"
+        );
+        assert_eq!(
+            state
+                .on_screen()
+                .iter()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>(),
+            vec![selected]
+        );
+        assert_eq!(state.active.focused_window_id, Some(selected));
+        assert_eq!(
+            state.active.focused_window_title,
+            Some(format!("Window {selected}"))
+        );
+        for id in [0, 1] {
+            let window = row
+                .windows
+                .iter()
+                .find(|window| window.window_id == id)
+                .expect("logical tab retained");
+            assert_eq!(window.title, format!("Window {id}"));
+            assert_eq!(window.bundle_id, "test");
+            assert_eq!(window.display_id, Some(TEST_DISPLAY_ID));
+            assert!(!window.floating);
+            assert_eq!(window.visible, id == selected);
+            assert_eq!(window.focused, id == selected);
+        }
+    }
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_window_set_projects_native_tab_selection_without_losing_columns() {
+    use crate::tests::harness::NATIVE_REACTION;
+    use paneru_shared_types::windowset::ColumnKind;
+
+    let mut harness = merged_native_tab_query_harness();
+    let merged = extract_window_set(harness.world()).expect("window set after native merge");
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    let switched = extract_window_set(harness.world()).expect("window set after tab selection");
+
+    for (set, selected) in [(merged, 0), (switched, 1)] {
+        let row = set.current().expect("active row");
+        assert_eq!(row.columns.len(), 1);
+        let column = &row.columns[0];
+        assert_eq!(column.kind, ColumnKind::Tabs);
+        assert_eq!(
+            column.windows.len(),
+            2,
+            "inactive logical tabs stay in their column"
+        );
+        assert_eq!(column.top().map(|window| window.id), Some(selected));
+        assert_eq!(
+            set.windows()
+                .filter(|window| window.visible)
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            vec![selected]
+        );
+        assert_eq!(set.focused(), Some(selected));
+        for id in [0, 1] {
+            let window = set.window(id).expect("logical tab retained");
+            assert_eq!(window.title, format!("Window {id}"));
+            assert_eq!(window.bundle_id, "test");
+            assert!(window.managed);
+            assert!(!window.floating);
+            assert_eq!(window.visible, id == selected);
+            assert_eq!(window.focused, id == selected);
+            assert_eq!(set.column_of(id), Some(0));
+        }
+    }
+}
+
+#[test]
+fn test_query_projections_reject_stale_focus_on_inactive_native_tab() {
+    use crate::ecs::FocusedMarker;
+    use crate::tests::harness::find_window_entity;
+
+    let mut harness = merged_native_tab_query_harness();
+    let world = harness.world();
+    let selected = find_window_entity(0, world);
+    let inactive = find_window_entity(1, world);
+    // A delayed focus marker must not overrule the fresh selected titlebar tab.
+    world.entity_mut(selected).remove::<FocusedMarker>();
+    world.entity_mut(inactive).insert(FocusedMarker);
+
+    let state = extract_query_state(world).expect("query with stale focus");
+    assert_eq!(state.active.focused_window_id, None);
+    assert_eq!(state.active.focused_bundle_id, None);
+    assert_eq!(state.active.focused_app_name, None);
+    assert_eq!(state.active.focused_window_title, None);
+    assert!(
+        state
+            .virtual_workspaces
+            .iter()
+            .flat_map(|row| &row.windows)
+            .all(|window| !window.focused)
+    );
+    assert_eq!(
+        state
+            .on_screen()
+            .iter()
+            .map(|window| window.window_id)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+
+    #[cfg(feature = "lua")]
+    {
+        let set = extract_window_set(world).expect("window set with stale focus");
+        assert_eq!(set.focused(), None);
+        assert!(set.windows().all(|window| !window.focused));
+        assert!(set.window(0).expect("selected tab").visible);
+        assert!(!set.window(1).expect("inactive tab").visible);
+    }
 }
 
 /// Builds the `WindowSet` a Lua handler would be given, from the live world.

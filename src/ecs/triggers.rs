@@ -14,13 +14,14 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FollowCurrentWorkspaceMarker, FreshMarker,
-    MissionControlActive, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    ActiveDisplayMarker, BProcess, FloatingMarker, FocusedMarker, FollowCurrentWorkspaceMarker,
+    FreshMarker, HiddenMarker, MinimizedMarker, MissionControlActive, PreviousManagedStrip,
+    RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::native_spaces::{DestroyedSpaceMarker, SpaceMovePending};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
@@ -210,7 +211,7 @@ pub(super) fn front_switched_trigger(
                 focused_id,
                 app,
                 &config_options,
-                mission_control_active.0,
+                mission_control_active.blocks_mutations(),
                 &window_manager,
                 &mut config,
             );
@@ -293,6 +294,7 @@ pub(super) fn window_focused_trigger(
     applications: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
+    moves: Query<&SpaceMovePending>,
     mut focus_history: ResMut<FocusHistory>,
     mission_control_active: Res<MissionControlActive>,
     window_manager: Res<WindowManager>,
@@ -334,8 +336,9 @@ pub(super) fn window_focused_trigger(
         // decided to show. Follow it to that window rather than dropping the
         // event: dropping it leaves the strip parked where it was, so Cmd-Tab
         // into a tabbed terminal looks like nothing happened.
-        let (window, entity, window_id) = match app.focused_window_id() {
-            Ok(current) if current != window_id => {
+        let confirmed_focus = app.focused_window_id().ok();
+        let (window, entity, window_id) = match confirmed_focus {
+            Some(current) if current != window_id => {
                 match ctx.windows.find_parent(current) {
                     Some((current_window, current_entity, current_parent))
                         if current_parent == parent =>
@@ -354,10 +357,51 @@ pub(super) fn window_focused_trigger(
             _ => (window, entity, window_id),
         };
 
+        let Some((_, _, flags)) = ctx.windows.get_managed(entity) else {
+            continue;
+        };
+        // A minimized window needs its own visibility transition. App hiding
+        // can miss ApplicationVisible, but the old AX focused id alone is not
+        // evidence of a resume: it must also be ordered on screen now.
+        if flags.minimized {
+            continue;
+        }
+        if flags.hidden {
+            if confirmed_focus == Some(window_id)
+                && !window.is_minimized()
+                && window_manager
+                    .windows_on_screen()
+                    .is_some_and(|visible| visible.contains(&window_id))
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<HiddenMarker>();
+                // Reconcile the saved row before processing focus. Inserting
+                // FocusedMarker while still suspended would discard the focus,
+                // and framing here would use the old parked window position.
+                ctx.commands
+                    .trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+            }
+            continue;
+        }
+
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys
         // remain stale from a previously focused window.
         update_passthrough(window, app, &ctx.config);
+
+        if moves.iter().any(|pending| pending.travels(entity)) {
+            // This is an OS observation, not a source replacement candidate.
+            // Keep actual child/tab focus so the pending move can later decide
+            // who keeps source focus, without activating or reshuffling a row
+            // that the native handoff still owns. Do not replace the remembered
+            // source candidate with a traveler either.
+            if confirmed_focus == Some(window_id)
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+            {
+                entity_commands.try_insert(FocusedMarker);
+            }
+            continue;
+        }
 
         let already_focused = ctx
             .windows
@@ -368,23 +412,10 @@ pub(super) fn window_focused_trigger(
             window_id,
             app,
             &ctx.config,
-            mission_control_active.0,
+            mission_control_active.blocks_mutations(),
             &window_manager,
             &mut global_state,
         );
-
-        let managed = ctx
-            .windows
-            .get_managed(entity)
-            .and_then(|(_, _, managed)| managed);
-        if matches!(managed, Some(Unmanaged::Hidden)) {
-            if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-                entity_commands.try_remove::<Unmanaged>();
-            }
-            ctx.commands
-                .trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
-            continue;
-        }
 
         // Handle tab switching: if the focused window is a tab, make it the leader.
         // Also reactivate the owning virtual strip before treating duplicate
@@ -409,7 +440,7 @@ pub(super) fn window_focused_trigger(
             }
         }
 
-        if owner.is_none() && managed.is_none() {
+        if owner.is_none() && flags.is_tiled() {
             // The window just spawned and has not yet been inserted into the strip.
             continue;
         }
@@ -425,8 +456,7 @@ pub(super) fn window_focused_trigger(
         // sets FocusedMarker synchronously, so OS-confirmed events for the
         // same entity would otherwise skip the write.
         if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
-            let unmanaged = ctx.windows.get_managed(entity).and_then(|(_, _, u)| u);
-            focus_history.record(workspace_id, entity, unmanaged);
+            focus_history.record(workspace_id, entity, flags);
         }
 
         // The restore guard absorbs the OS focus acknowledgment from a restore;
@@ -488,8 +518,10 @@ pub(super) fn mission_control_trigger(
         match event {
             Event::MissionControlShowAllWindows
             | Event::MissionControlShowFrontWindows
-            | Event::MissionControlShowDesktop => {
-                mission_control_active.as_mut().0 = true;
+            | Event::MissionControlShowDesktop
+            | Event::MissionControlStateUnknown => {
+                mission_control_active.as_mut().0 =
+                    (!matches!(event, Event::MissionControlStateUnknown)).then_some(true);
                 for (entity, _, _, scroll) in &workspaces {
                     if scroll.is_some()
                         && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -499,7 +531,7 @@ pub(super) fn mission_control_trigger(
                 }
             }
             Event::MissionControlExit => {
-                mission_control_active.as_mut().0 = false;
+                mission_control_active.as_mut().0 = Some(false);
 
                 // Check if some windows disappeared from the current workspace
                 // - e.g. they were moved away during mission control.
@@ -594,8 +626,6 @@ pub(super) fn dispatch_application_messages(
     mut messages: MessageReader<Event>,
     windows: Windows,
     applications: Query<(&Application, &Children)>,
-    unmanaged_query: Query<&Unmanaged>,
-    followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
@@ -606,20 +636,15 @@ pub(super) fn dispatch_application_messages(
                 if let Some((_, entity)) = find_window(*window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_insert(Unmanaged::Minimized);
+                    entity_commands.try_insert(MinimizedMarker);
                 }
             }
 
             Event::WindowDeminimized { window_id } => {
                 if let Some((_, entity)) = find_window(*window_id)
-                    && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    if followed.contains(entity) {
-                        entity_commands.try_insert(Unmanaged::Floating);
-                    } else {
-                        entity_commands.try_remove::<Unmanaged>();
-                    }
+                    entity_commands.try_remove::<MinimizedMarker>();
                 }
             }
 
@@ -630,12 +655,8 @@ pub(super) fn dispatch_application_messages(
                     continue;
                 };
                 for entity in children {
-                    // Only hide windows that are currently managed (no Unmanaged component).
-                    // Preserve existing Floating, Minimized, and Hidden states.
-                    if unmanaged_query.get(*entity).is_err()
-                        && let Ok(mut entity_commands) = commands.get_entity(*entity)
-                    {
-                        entity_commands.try_insert(Unmanaged::Hidden);
+                    if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                        entity_commands.try_insert(HiddenMarker);
                     }
                 }
             }
@@ -647,12 +668,8 @@ pub(super) fn dispatch_application_messages(
                     continue;
                 };
                 for entity in children {
-                    // Only restore windows that were hidden by the app hide/show cycle.
-                    // Preserve Floating and Minimized states.
-                    if matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden))
-                        && let Ok(mut entity_commands) = commands.get_entity(*entity)
-                    {
-                        entity_commands.try_remove::<Unmanaged>();
+                    if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                        entity_commands.try_remove::<HiddenMarker>();
                     }
                 }
             }
@@ -662,8 +679,8 @@ pub(super) fn dispatch_application_messages(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-pub(super) fn window_unmanaged_trigger(
-    trigger: On<Add, Unmanaged>,
+pub(super) fn window_floating_trigger(
+    trigger: On<Add, FloatingMarker>,
     apps: Query<(Entity, &Application)>,
     followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
@@ -713,7 +730,7 @@ pub(super) fn window_unmanaged_trigger(
     }
 
     let entity = trigger.event().entity;
-    let Some((_, _, Some(Unmanaged::Floating))) = ctx.windows.get_managed(entity) else {
+    let Some((_, _, flags)) = ctx.windows.get_managed(entity) else {
         return;
     };
 
@@ -733,6 +750,11 @@ pub(super) fn window_unmanaged_trigger(
         if strip.contains(entity) {
             strip.remove(entity);
         }
+    }
+    // Changing intent while suspended must not touch the saved/native frame.
+    // Resuming visibility never invokes this mode-entry observer again.
+    if flags.is_suspended() {
+        return;
     }
 
     let Some((display, dock)) = active_display.map(|display| *display) else {
@@ -804,54 +826,82 @@ fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Co
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_minimized_trigger(
-    trigger: On<Add, Unmanaged>,
+    trigger: On<Add, (MinimizedMarker, HiddenMarker)>,
     windows: Windows,
     workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    focused: Query<(), With<FocusedMarker>>,
+    moves: Query<&SpaceMovePending>,
+    active_display: Option<Single<&Display, With<ActiveDisplayMarker>>>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
-    if let Some((_, _, Some(Unmanaged::Minimized | Unmanaged::Hidden))) =
-        windows.get_managed(entity)
-    {
-        debug!("Entity {entity} is minimized or hidden.");
-        let display_bounds = active_display.bounds();
-
-        for (mut strip, active) in workspaces {
-            if active {
-                give_away_focus(
-                    entity,
-                    &windows,
-                    &strip,
-                    &display_bounds,
-                    &mut config,
-                    &mut commands,
-                );
-            }
-            if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, &mut commands);
-                strip.remove(entity);
-            }
+    let owns_focus = focused.contains(entity);
+    for (mut strip, active) in workspaces {
+        if active
+            && owns_focus
+            && let Some(display) = &active_display
+        {
+            give_away_focus(
+                entity,
+                &windows,
+                &strip,
+                &display.bounds(),
+                &mut config,
+                &mut commands,
+                &moves,
+            );
         }
+        if strip.contains(entity) {
+            remember_managed_strip(entity, &strip, &mut commands);
+            strip.remove(entity);
+        }
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands
+            .try_remove::<FocusedMarker>()
+            .try_remove::<super::RepositionMarker>()
+            .try_remove::<ResizeMarker>();
     }
 }
 
+/// Removal observers still see the old component. Defer reconciliation until
+/// all removals in the command batch have completed, then inspect final flags.
+#[derive(bevy::prelude::Event)]
+pub(super) struct WindowStateChanged {
+    entity: Entity,
+}
+
+pub(super) fn window_state_removed_trigger(
+    trigger: On<Remove, (FloatingMarker, MinimizedMarker, HiddenMarker)>,
+    mut commands: Commands,
+) {
+    commands.trigger(WindowStateChanged {
+        entity: trigger.event().entity,
+    });
+}
+
+type ManagedRows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static mut Position,
+        Has<ActiveWorkspaceMarker>,
+    ),
+    (Without<Window>, Without<DestroyedSpaceMarker>),
+>;
+
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_managed_trigger(
-    trigger: On<Remove, Unmanaged>,
-    active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
-    apps: Query<(Entity, &Application)>,
-    mut workspaces: Query<
-        (
-            Entity,
-            &mut LayoutStrip,
-            &mut Position,
-            Has<ActiveWorkspaceMarker>,
-        ),
-        Without<Window>,
-    >,
+    trigger: On<WindowStateChanged>,
+    window_manager: Res<WindowManager>,
+    selected: Query<(), With<super::SelectedVirtualMarker>>,
+    mut workspaces: ManagedRows,
     previous_strips: Query<&PreviousManagedStrip>,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
@@ -862,89 +912,76 @@ pub(super) fn window_managed_trigger(
     }
     let entity = trigger.event().entity;
 
-    if ctx
-        .windows
-        .get(entity)
-        .is_some_and(|window| window.role().is_err())
-    {
-        // The marker was removed because the windows was destroyed.
+    let Some((window, _, flags)) = ctx.windows.get_managed(entity) else {
+        return;
+    };
+    if !flags.is_tiled() || window.role().is_err() || window.is_full_screen() {
         return;
     }
-
-    debug!("Entity {entity} is managed again.");
-    let (display, dock) = *active_display;
-    let display_bounds = display.actual_display_bounds(dock, &ctx.config);
-    let mut insert_at = previous_strips
+    // Multiple visibility flags can be removed together. Their deferred
+    // reconciliations must not reinsert or reshuffle the same window twice.
+    if workspaces
+        .iter()
+        .any(|(_, strip, _, _)| strip.contains(entity))
+    {
+        return;
+    }
+    let native_space = match window_manager.window_workspaces(window.id()) {
+        Ok(spaces) if spaces.len() == 1 => spaces[0],
+        Ok(_) => return,
+        Err(err) => {
+            warn!("unable to place resumed window {}: {err}", window.id());
+            return;
+        }
+    };
+    // Never resurrect a deleted row or restore to the Space it used to own.
+    // A native move while hidden/minimized takes precedence over saved tiling.
+    // This also applies to a user tiling a traveler before it lands: represent
+    // its observed current Space, never the pending request's intended target.
+    // The pending move alone still owns native placement and activation.
+    let previous = previous_strips
         .get(entity)
         .ok()
-        .map(|previous| previous.index);
-
-    if let Some(window) = ctx.windows.get(entity)
-        && let Some((_, app)) = ctx
-            .windows
-            .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
-    {
-        let properties = WindowProperties::new(app, window, &ctx.config);
-
-        if let Some(width_ratio) = properties.width_ratio() {
-            let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
-            let padded_width = display_bounds.width() - pad_left - pad_right;
-            let width = round_px(f64::from(padded_width) * width_ratio);
-            let height = display_bounds.height();
-            ctx.commands.resize_entity(entity, Size::new(width, height));
-        }
-
-        insert_at = properties.insertion().or(insert_at);
-    }
-
-    let previous = previous_strips.get(entity).ok().copied();
-    for (_, mut strip, _, _) in &mut workspaces {
-        strip.remove(entity);
-    }
-
-    // The strip the window ended up in, and whether that strip is the one
-    // currently on screen.
-    let mut landed_in = None;
-    if let Some(previous) = previous {
-        for (strip_entity, mut strip, _, active) in &mut workspaces {
-            if strip.id() == previous.workspace_id && strip.virtual_index == previous.virtual_index
-            {
-                strip.insert_at(insert_at.unwrap_or(previous.index), entity);
-                landed_in = Some((strip_entity, active));
-                break;
-            }
-        }
-    }
-
-    if landed_in.is_none()
-        && let Some((strip_entity, mut active_strip, _, _)) =
-            workspaces.iter_mut().find(|(_, _, _, active)| *active)
-    {
-        landed_in = Some((strip_entity, true));
-        if let Some(index) = insert_at {
-            active_strip.insert_at(index, entity);
-        } else {
-            // Insert at the column the floating window visually overlaps so the
-            // strip doesn't have to scroll to the end to expose the new column.
-            let insertion = ctx.windows.frame(entity).and_then(|frame| {
-                let center_x = frame.center().x;
-                active_strip.all_columns().into_iter().position(|top| {
-                    ctx.windows
-                        .frame(top)
-                        .is_some_and(|col| col.center().x > center_x)
-                })
-            });
-            let insertion = insertion.unwrap_or(active_strip.len());
-            active_strip.insert_at(insertion, entity);
-        }
-    }
+        .copied()
+        .filter(|previous| previous.workspace_id == native_space);
+    let destination = workspaces
+        .iter()
+        .filter(|(_, strip, _, _)| strip.id() == native_space)
+        .min_by_key(|(strip_entity, strip, _, active)| {
+            (
+                previous.is_none_or(|previous| previous.virtual_index != strip.virtual_index),
+                !*active,
+                !selected.contains(*strip_entity),
+                strip.virtual_index,
+            )
+        })
+        .map(|(strip_entity, _, _, _)| strip_entity);
+    let Some(destination) = destination else {
+        return;
+    };
+    let Ok((strip_entity, mut strip, _, active)) = workspaces.get_mut(destination) else {
+        return;
+    };
+    let insertion = previous
+        .filter(|previous| previous.virtual_index == strip.virtual_index)
+        .map(|previous| previous.index)
+        .or_else(|| {
+            let center_x = ctx.windows.frame(entity)?.center().x;
+            strip.all_columns().into_iter().position(|top| {
+                ctx.windows
+                    .frame(top)
+                    .is_some_and(|column| column.center().x > center_x)
+            })
+        })
+        .unwrap_or(strip.len());
+    strip.insert_at(insertion, entity);
+    let landed_active = active;
 
     if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
         entity_commands.try_remove::<PreviousManagedStrip>();
     }
 
-    if let Some((strip_entity, false)) = landed_in {
+    if !landed_active {
         // This strip isn't on screen, so the window's current frame (possibly
         // popped onto the active display while unmanaged) must not be kept.
         // Marking the strip's position changed forces the layout to re-derive
@@ -977,6 +1014,7 @@ pub(super) fn window_managed_trigger(
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
@@ -984,6 +1022,7 @@ pub(super) fn window_destroyed_trigger(
     mut apps: Query<&mut Application>,
     mut global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
+    moves: Query<&SpaceMovePending>,
     windows: Windows,
     mut commands: Commands,
 ) {
@@ -1027,6 +1066,7 @@ pub(super) fn window_destroyed_trigger(
             &active_display.bounds(),
             &mut global_state,
             &mut commands,
+            &moves,
         );
         focus_history.forget(entity);
 
@@ -1054,6 +1094,7 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
 }
 
 /// Moves the focus away to a neighbour window.
+#[allow(clippy::too_many_arguments)]
 fn give_away_focus(
     entity: Entity,
     windows: &Windows,
@@ -1061,9 +1102,19 @@ fn give_away_focus(
     viewport: &IRect,
     config: &mut GlobalState,
     commands: &mut Commands,
+    moves: &Query<&SpaceMovePending>,
 ) {
+    if active_strip.tabbed(entity) {
+        // Cocoa chooses the surviving native tab, even when its group is
+        // inside a Paneru-tabbed stack. Do not override that selection.
+        return;
+    }
     if active_strip.is_tabbed_display(entity)
         && let Some(sibling) = active_strip.tab_display_sibling(entity)
+        && windows
+            .get_managed(sibling)
+            .is_some_and(|(_, _, flags)| flags.is_tiled())
+        && !moves.iter().any(|pending| pending.travels(sibling))
     {
         // Closing/losing focus on the active tab of a paneru-tabbed-display
         // stack must focus the next tab, not fall through to the
@@ -1076,16 +1127,17 @@ fn give_away_focus(
         return;
     }
 
-    if active_strip.tabbed(entity) {
-        // Do not give away focus for tabbed windows.
-        // Remaining tab gets the focus.
-        return;
-    }
     let display_center = viewport.center().x;
     let closest = active_strip
         .all_columns()
         .into_iter()
-        .filter(|&candidate| candidate != entity)
+        .filter(|&candidate| {
+            candidate != entity
+                && windows
+                    .get_managed(candidate)
+                    .is_some_and(|(_, _, flags)| flags.is_tiled())
+                && !moves.iter().any(|pending| pending.travels(candidate))
+        })
         .filter_map(|candidate| {
             let center = windows.moving_frame(candidate)?.center().x;
             let distance = (center - display_center).abs();
@@ -1098,10 +1150,13 @@ fn give_away_focus(
             // column in the strip. Without this, losing focus on the only
             // geometrically-known window would leave FocusedMarker unset and
             // silently break keybindings.
-            active_strip
-                .all_columns()
-                .into_iter()
-                .find(|&candidate| candidate != entity)
+            active_strip.all_columns().into_iter().find(|&candidate| {
+                candidate != entity
+                    && windows
+                        .get_managed(candidate)
+                        .is_some_and(|(_, _, flags)| flags.is_tiled())
+                    && !moves.iter().any(|pending| pending.travels(candidate))
+            })
         });
 
     if let Some(neighbour) = closest
@@ -1280,11 +1335,13 @@ pub(super) fn apply_window_defaults(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     apps: Query<&Application>,
+    moves: Query<&SpaceMovePending>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
@@ -1306,6 +1363,9 @@ pub(super) fn apply_window_positions(
         let Ok(app) = apps.get(parent) else {
             continue;
         };
+        if moves.iter().any(|pending| pending.travels(entity)) {
+            continue;
+        }
 
         if crate::ecs::restore::matches_startup_restore_state(
             window,
@@ -1329,11 +1389,18 @@ pub(super) fn apply_window_positions(
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
                 // Avoid managing window if it's floating.
                 if properties.follow() && !window.is_full_screen() {
-                    entity_commands.try_insert((FollowCurrentWorkspaceMarker, Unmanaged::Floating));
+                    entity_commands.try_insert((FollowCurrentWorkspaceMarker, FloatingMarker));
                 } else {
-                    entity_commands.try_insert(Unmanaged::Floating);
+                    entity_commands.try_insert(FloatingMarker);
                 }
             }
+            continue;
+        }
+        if ctx
+            .windows
+            .get_managed(entity)
+            .is_some_and(|(_, _, flags)| flags.is_suspended())
+        {
             continue;
         }
 

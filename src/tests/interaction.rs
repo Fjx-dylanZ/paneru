@@ -10,9 +10,9 @@ use crate::commands::{Command, Direction, MoveFocus, Operation, SpaceOperation, 
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, FollowCurrentWorkspaceMarker, Initializing,
-    InstantSpaceSwitch, ManualStripOffset, MissionControlActive, NativeFullscreenMarker, Position,
-    Unmanaged, layout::LayoutStrip,
+    ActiveWorkspaceMarker, FloatingMarker, FocusedMarker, FollowCurrentWorkspaceMarker,
+    HiddenMarker, Initializing, InstantSpaceSwitch, ManualStripOffset, MinimizedMarker,
+    MissionControlActive, NativeFullscreenMarker, Position, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -180,7 +180,7 @@ fn frontmost_floating_window_is_focused_after_setup() {
         .on_iteration(0, |world, _state| {
             assert_focused!(world, 0);
             let entity = find_window_entity(0, world);
-            assert!(world.entity(entity).contains::<Unmanaged>());
+            assert!(world.entity(entity).contains::<FloatingMarker>());
         })
         .run(vec![Event::MenuOpened { window_id: 0 }]);
 }
@@ -252,10 +252,7 @@ fn follow_command_preserves_frame_and_leaves_window_floating_when_disabled() {
                     .entity(entity)
                     .contains::<FollowCurrentWorkspaceMarker>()
             );
-            assert!(matches!(
-                world.get::<Unmanaged>(entity),
-                Some(Unmanaged::Floating)
-            ));
+            assert!(world.get::<FloatingMarker>(entity).is_some());
             assert_eq!(window_frame(world, 0), enabled_frame.get());
         })
         .on_iteration(2, move |world, _state| {
@@ -265,10 +262,7 @@ fn follow_command_preserves_frame_and_leaves_window_floating_when_disabled() {
                     .entity(entity)
                     .contains::<FollowCurrentWorkspaceMarker>()
             );
-            assert!(matches!(
-                world.get::<Unmanaged>(entity),
-                Some(Unmanaged::Floating)
-            ));
+            assert!(world.get::<FloatingMarker>(entity).is_some());
             assert_eq!(window_frame(world, 0), disabled_frame.get());
         })
         .run(vec![
@@ -307,10 +301,7 @@ fn configured_follower_moves_to_the_active_native_workspace() {
                     .entity(entity)
                     .contains::<FollowCurrentWorkspaceMarker>()
             );
-            assert!(matches!(
-                world.get::<Unmanaged>(entity),
-                Some(Unmanaged::Floating)
-            ));
+            assert!(world.get::<FloatingMarker>(entity).is_some());
             assert!(state.workspace_moves().is_empty());
             state.activate_workspace(TEST_DISPLAY_ID, NEXT_WORKSPACE_ID, false);
         })
@@ -467,7 +458,7 @@ fn native_space_commands_are_rejected_during_mission_control() {
         IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
         vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1],
     );
-    harness.world().resource_mut::<MissionControlActive>().0 = true;
+    harness.world().resource_mut::<MissionControlActive>().0 = Some(true);
 
     harness
         .on_iteration(0, |_world, state| {
@@ -1010,10 +1001,7 @@ fn follower_survives_its_destination_vanishing_mid_flight() {
             .entity(entity)
             .contains::<FollowCurrentWorkspaceMarker>()
     );
-    assert!(matches!(
-        world.get::<Unmanaged>(entity),
-        Some(Unmanaged::Floating)
-    ));
+    assert!(world.get::<FloatingMarker>(entity).is_some());
     assert_eq!(ecs_active_workspaces(world), vec![TEST_WORKSPACE_ID]);
 }
 
@@ -2335,50 +2323,6 @@ fn test_focus_recovers_when_focused_window_is_outside_strip() {
         .run(commands);
 }
 
-/// A background native tab that ended up with a column of its own is folded
-/// back into the column of the tab that is showing, so the strip stops holding
-/// a slot nothing can ever appear in.
-#[test]
-fn test_stray_background_tab_is_folded_into_the_visible_tab() {
-    use bevy::ecs::system::RunSystemOnce as _;
-
-    use crate::ecs::{Bounds, Position};
-
-    let mut harness = TestHarness::new().with_windows(2);
-    for _ in 0..3 {
-        harness.app.update();
-    }
-
-    // Window 1 is a background tab of window 0: same app, same frame, and the
-    // window server does not report it on screen.
-    harness.mock_state.update_window(1, |window| {
-        window.visible = false;
-    });
-
-    let world = harness.app.world_mut();
-    let leader = find_window_entity(0, world);
-    let background = find_window_entity(1, world);
-    let position = world.get::<Position>(leader).expect("a position").clone();
-    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
-    world.entity_mut(background).insert((position, bounds));
-
-    {
-        let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
-        let strip = strips.single(world).expect("one active strip");
-        assert_eq!(strip.len(), 2, "the tabs start out in columns of their own");
-    }
-
-    world
-        .run_system_once(crate::ecs::systems::regroup_stray_native_tabs)
-        .expect("the regrouping system runs");
-
-    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
-    let strip = strips.single(world).expect("one active strip");
-    assert_eq!(strip.len(), 1, "the stray column is gone");
-    assert!(strip.tabbed(background), "the background tab is a tab now");
-    assert!(strip.tabbed(leader));
-}
-
 /// An app with native tabs answers "which window is focused?" with whichever
 /// member of the tab group it decided to show, so the id on a focus event can
 /// already be out of date. Paneru has to follow the app to that window; drop
@@ -2622,7 +2566,7 @@ fn toggle_floating_layer_tracks_focused_tier() {
         .with_windows(2)
         .on_iteration(0, |world, _state| {
             let floating = find_window_entity(1, world);
-            world.entity_mut(floating).insert(Unmanaged::Floating);
+            world.entity_mut(floating).insert(FloatingMarker);
             assert!(!current_floating_layer(world).front);
         })
         .on_iteration(1, |world, _state| {
@@ -2657,10 +2601,7 @@ fn toggle_floating_layer_uses_nearest_tiled_window_after_floating_focus() {
         .on_iteration(1, |world, _state| assert_focused!(world, 2))
         .on_iteration(2, |world, _state| {
             let floating = find_window_entity(2, world);
-            assert!(matches!(
-                world.get::<Unmanaged>(floating),
-                Some(Unmanaged::Floating)
-            ));
+            assert!(world.get::<FloatingMarker>(floating).is_some());
             assert_focused!(world, 2);
         })
         .on_iteration(3, |world, _state| {
@@ -2692,7 +2633,7 @@ fn toggle_floating_layer_uses_mouse_refocused_tiled_window() {
         .with_windows(2)
         .on_iteration(0, |world, _state| {
             let floating = find_window_entity(1, world);
-            world.entity_mut(floating).insert(Unmanaged::Floating);
+            world.entity_mut(floating).insert(FloatingMarker);
         })
         .on_iteration(1, |world, state| {
             assert_focused!(world, 1);
@@ -2829,14 +2770,12 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
     harness
         .on_iteration(2, |world, _state| {
             let off_workspace_float = find_window_entity(99, world);
-            world
-                .entity_mut(off_workspace_float)
-                .insert(Unmanaged::Floating);
+            world.entity_mut(off_workspace_float).insert(FloatingMarker);
             assert_focused!(world, 0);
         })
         .on_iteration(3, |world, _state| {
             let active_float = find_window_entity(0, world);
-            world.entity_mut(active_float).insert(Unmanaged::Floating);
+            world.entity_mut(active_float).insert(FloatingMarker);
             assert_focused!(world, 0);
         })
         .on_iteration(4, |world, _state| {
@@ -2899,7 +2838,7 @@ fn test_swap_moves_focused_floating_window() {
         .with_windows(2)
         .on_iteration(1, |world, _state| {
             let entity = find_window_entity(0, world);
-            world.entity_mut(entity).insert(Unmanaged::Floating);
+            world.entity_mut(entity).insert(FloatingMarker);
         })
         .on_iteration(2, move |world, _state| {
             let frame = window_frame(world, 0);
@@ -2975,7 +2914,7 @@ fn test_movefloat_dedicated_keybind() {
             assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
 
             let entity = find_window_entity(0, world);
-            world.entity_mut(entity).insert(Unmanaged::Floating);
+            world.entity_mut(entity).insert(FloatingMarker);
         })
         .on_iteration(2, move |world, _state| {
             // Floating window 0 pops off the corner and the strip reshuffles
@@ -3020,7 +2959,7 @@ fn test_cyclefloat_rotates_through_floating_windows() {
         .on_iteration(1, |world, _state| {
             for id in [0, 1] {
                 let entity = find_window_entity(id, world);
-                world.entity_mut(entity).insert(Unmanaged::Floating);
+                world.entity_mut(entity).insert(FloatingMarker);
             }
             assert_focused!(world, 0);
         })
@@ -4784,10 +4723,7 @@ fn manual_center_survives_an_unrelated_touchpad_release() {
         command: Command::PrintState,
     }]);
     let float = find_window_entity(3, harness.world());
-    harness
-        .world()
-        .entity_mut(float)
-        .insert(Unmanaged::Floating);
+    harness.world().entity_mut(float).insert(FloatingMarker);
     harness.advance(Duration::from_millis(100));
     harness.run(vec![Event::Command {
         command: Command::Window(Operation::Center),
@@ -5304,4 +5240,395 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
         vec![true],
         "the moved window should land on a single recreated row 0"
     );
+}
+
+#[test]
+fn floating_visibility_restore_preserves_runtime_frame_and_query_mode() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    params.grid = Some("2:2:0:0:1:1".to_owned());
+    let mut harness = TestHarness::new()
+        .with_config((MainOptions::default(), vec![params]).into())
+        .with_windows(1)
+        .with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    let moved = IRect::new(137, 91, 548, 378);
+    harness.mock_state.os_move_window(0, moved.min);
+    harness.mock_state.os_resize_window(0, moved.size());
+    harness.advance(Duration::from_millis(500));
+    assert_eq!(window_frame(harness.world(), 0), moved);
+
+    harness.mock_state.os_minimize_window(0, true);
+    harness.advance(NATIVE_REACTION);
+    let entity = find_window_entity(0, harness.world());
+    assert!(harness.world().get::<FloatingMarker>(entity).is_some());
+    assert!(harness.world().get::<MinimizedMarker>(entity).is_some());
+    let mut query =
+        bevy::ecs::system::SystemState::<crate::ecs::state::QueryStateParams>::new(harness.world());
+    let snapshot = query
+        .get(harness.world())
+        .expect("query params")
+        .extract()
+        .expect("state");
+    let suspended = snapshot
+        .virtual_workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.windows)
+        .find(|window| window.window_id == 0)
+        .expect("floating window remains queryable");
+    assert!(suspended.floating);
+    assert!(!suspended.visible);
+    assert!(!suspended.focused);
+
+    // A duplicate minimize must not overwrite mode or saved geometry, and
+    // neither a normal restore nor a duplicate restore may reapply the grid.
+    harness.mock_state.os_minimize_window(0, true);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.os_minimize_window(0, false);
+    harness.advance(Duration::from_millis(500));
+    harness.mock_state.os_minimize_window(0, false);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(window_frame(harness.world(), 0), moved);
+    harness
+        .mock_state
+        .update_window(0, |window| assert_eq!(window.frame, moved));
+    assert!(harness.world().get::<FloatingMarker>(entity).is_some());
+    assert!(harness.world().get::<MinimizedMarker>(entity).is_none());
+    assert!(
+        !harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity))
+    );
+}
+
+#[test]
+fn tiled_minimize_restore_returns_to_its_original_column() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(1);
+    harness.advance(Duration::from_millis(500));
+    let entity = find_window_entity(1, harness.world());
+    let before = harness
+        .world()
+        .query::<&LayoutStrip>()
+        .iter(harness.world())
+        .find(|strip| strip.contains(entity))
+        .expect("original row")
+        .all_windows();
+    harness
+        .world()
+        .resource_mut::<crate::ecs::focus::FocusHistory>()
+        .pending_focus = Some(entity);
+    harness.mock_state.os_minimize_window(1, true);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.os_minimize_window(1, true);
+    harness.advance(NATIVE_REACTION);
+    assert!(
+        !harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity))
+    );
+    harness.mock_state.os_minimize_window(1, false);
+    harness.advance(Duration::from_millis(500));
+    let after = harness
+        .world()
+        .query::<&LayoutStrip>()
+        .iter(harness.world())
+        .find(|strip| strip.contains(entity))
+        .expect("restored row")
+        .all_windows();
+    assert_eq!(after, before);
+    assert!(harness.world().get::<FloatingMarker>(entity).is_none());
+}
+
+#[test]
+fn hiding_and_minimizing_require_both_visibility_transitions_to_resume() {
+    // Exercise both arrival orders and both mode intents. Clearing the first
+    // suspension must leave the other one intact rather than retiling early.
+    for hide_first in [true, false] {
+        let mut params = WindowParams::new(".*", None);
+        params.floating = Some(hide_first);
+        let mut harness = TestHarness::new()
+            .with_config((MainOptions::default(), vec![params]).into())
+            .with_windows(1)
+            .with_focused_window(0);
+        harness.advance(Duration::from_millis(500));
+        let entity = find_window_entity(0, harness.world());
+        let before = window_frame(harness.world(), 0);
+        let hide = Event::ApplicationHidden {
+            pid: TEST_PROCESS_ID,
+        };
+        let minimize = Event::WindowMinimized { window_id: 0 };
+        harness.run(if hide_first {
+            vec![hide, minimize]
+        } else {
+            vec![minimize, hide]
+        });
+        assert!(harness.world().get::<HiddenMarker>(entity).is_some());
+        assert!(harness.world().get::<MinimizedMarker>(entity).is_some());
+        assert!(harness.world().get::<FocusedMarker>(entity).is_none());
+
+        harness.run(vec![if hide_first {
+            Event::ApplicationVisible {
+                pid: TEST_PROCESS_ID,
+            }
+        } else {
+            Event::WindowDeminimized { window_id: 0 }
+        }]);
+        assert_eq!(
+            harness.world().get::<MinimizedMarker>(entity).is_some(),
+            hide_first
+        );
+        assert_eq!(
+            harness.world().get::<HiddenMarker>(entity).is_some(),
+            !hide_first
+        );
+        assert!(
+            !harness
+                .world()
+                .query::<&LayoutStrip>()
+                .iter(harness.world())
+                .any(|strip| strip.contains(entity))
+        );
+        assert!(harness.world().get::<FocusedMarker>(entity).is_none());
+        harness.run(vec![if hide_first {
+            Event::WindowDeminimized { window_id: 0 }
+        } else {
+            Event::ApplicationVisible {
+                pid: TEST_PROCESS_ID,
+            }
+        }]);
+        assert!(harness.world().get::<HiddenMarker>(entity).is_none());
+        assert!(harness.world().get::<MinimizedMarker>(entity).is_none());
+        assert_eq!(
+            harness.world().get::<FloatingMarker>(entity).is_some(),
+            hide_first
+        );
+        assert_eq!(
+            harness
+                .world()
+                .query::<&LayoutStrip>()
+                .iter(harness.world())
+                .any(|strip| strip.contains(entity)),
+            !hide_first
+        );
+        if hide_first {
+            assert_eq!(window_frame(harness.world(), 0), before);
+        }
+    }
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn lua_mode_changes_while_suspended_take_effect_without_resuming_visibility() {
+    use paneru_shared_types::windowset::LayoutOp;
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    let mut harness = TestHarness::new()
+        .with_config((MainOptions::default(), vec![params]).into())
+        .with_windows(1);
+    harness.advance(Duration::from_millis(500));
+    let entity = find_window_entity(0, harness.world());
+    harness.mock_state.os_minimize_window(0, true);
+    harness.advance(NATIVE_REACTION);
+    harness.run(vec![Event::Command {
+        command: Command::Layout(vec![LayoutOp::SetManaged {
+            window: 0,
+            managed: true,
+        }]),
+    }]);
+    assert!(harness.world().get::<MinimizedMarker>(entity).is_some());
+    assert!(harness.world().get::<FloatingMarker>(entity).is_none());
+    assert!(
+        !harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity))
+    );
+    harness.mock_state.os_minimize_window(0, false);
+    harness.advance(Duration::from_millis(500));
+    assert!(
+        harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity))
+    );
+    assert!(harness.world().get::<FloatingMarker>(entity).is_none());
+
+    let tiled_frame = window_frame(harness.world(), 0);
+    harness.run(vec![Event::ApplicationHidden {
+        pid: TEST_PROCESS_ID,
+    }]);
+    harness.run(vec![Event::Command {
+        command: Command::Layout(vec![LayoutOp::SetFloating {
+            window: 0,
+            floating: true,
+        }]),
+    }]);
+    assert!(harness.world().get::<HiddenMarker>(entity).is_some());
+    assert!(harness.world().get::<FloatingMarker>(entity).is_some());
+    harness.run(vec![Event::ApplicationVisible {
+        pid: TEST_PROCESS_ID,
+    }]);
+    assert!(harness.world().get::<FloatingMarker>(entity).is_some());
+    assert!(
+        !harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity))
+    );
+    assert_eq!(window_frame(harness.world(), 0), tiled_frame);
+}
+
+#[test]
+fn tiled_resume_uses_current_native_space_after_saved_row_is_deleted() {
+    const NEXT: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT],
+        )
+        .with_windows(1);
+    harness.advance(Duration::from_millis(500));
+    let entity = find_window_entity(0, harness.world());
+    let source = harness
+        .world()
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(harness.world())
+        .find_map(|(row, strip)| strip.contains(entity).then_some(row))
+        .expect("source row");
+    harness.mock_state.os_minimize_window(0, true);
+    harness.advance(NATIVE_REACTION);
+    harness
+        .mock_state
+        .remove_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID);
+    harness.advance(NATIVE_REACTION);
+    assert!(harness.world().get::<LayoutStrip>(source).is_none());
+    harness.mock_state.os_minimize_window(0, false);
+    harness.advance(Duration::from_millis(500));
+    let owners: Vec<_> = harness
+        .world()
+        .query::<&LayoutStrip>()
+        .iter(harness.world())
+        .filter(|strip| strip.contains(entity))
+        .map(LayoutStrip::id)
+        .collect();
+    assert_eq!(owners, vec![NEXT]);
+    assert!(harness.world().get::<FloatingMarker>(entity).is_none());
+    assert!(
+        !harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.id() == TEST_WORKSPACE_ID)
+    );
+}
+
+#[test]
+fn suspended_follower_observes_current_native_space_before_resuming_carry() {
+    const NEXT: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    let mut params = WindowParams::new(".*", None);
+    params.follow = Some(true);
+    let mut harness = TestHarness::new()
+        .with_config((MainOptions::default(), vec![params]).into())
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, NEXT],
+        )
+        .with_windows(1);
+    harness.advance(Duration::from_millis(500));
+    let before = window_frame(harness.world(), 0);
+    harness.mock_state.os_minimize_window(0, true);
+    harness.advance(NATIVE_REACTION);
+    user_switches_native_space(&mut harness, NEXT);
+    assert!(harness.mock_state.workspace_moves().is_empty());
+    // The OS/another tool carried it during suspension. Resuming must observe
+    // that fact, not submit the same carry again or reset floating geometry.
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = NEXT);
+    harness.mock_state.os_minimize_window(0, false);
+    harness.advance(Duration::from_millis(500));
+    assert!(harness.mock_state.workspace_moves().is_empty());
+    assert_eq!(harness.mock_state.window_workspace(0), NEXT);
+    let entity = find_window_entity(0, harness.world());
+    assert!(harness.world().get::<FloatingMarker>(entity).is_some());
+    assert!(
+        harness
+            .world()
+            .get::<FollowCurrentWorkspaceMarker>(entity)
+            .is_some()
+    );
+    assert_eq!(window_frame(harness.world(), 0), before);
+}
+
+#[test]
+fn app_hidden_focus_echo_waits_for_visibility_before_restoring_its_row() {
+    let mut harness = TestHarness::new().with_windows(1).with_focused_window(0);
+    harness.advance(Duration::from_millis(500));
+    let entity = find_window_entity(0, harness.world());
+    let original_frame = window_frame(harness.world(), 0);
+    let source = harness
+        .world()
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(harness.world())
+        .find_map(|(row, strip)| strip.contains(entity).then_some(row))
+        .expect("original row");
+
+    harness.mock_state.window_visible(0, false);
+    harness.run(vec![
+        Event::ApplicationHidden {
+            pid: TEST_PROCESS_ID,
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        // The app's AX focus still names its hidden window, and it can still
+        // report frontmost while a delayed focus notification is delivered.
+        Event::WindowFocused { window_id: 0 },
+    ]);
+    assert!(harness.world().get::<HiddenMarker>(entity).is_some());
+    assert!(harness.world().get::<FocusedMarker>(entity).is_none());
+    assert!(
+        harness
+            .world()
+            .get::<ActiveWorkspaceMarker>(source)
+            .is_none()
+    );
+    assert!(
+        !harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(entity))
+    );
+
+    // The real unhide arrives only as external focus, without an
+    // ApplicationVisible notification. Its positive visibility observation
+    // must restore the saved row before activation uses the window's frame.
+    harness.mock_state.window_visible(0, true);
+    harness.mock_state.focus_window(0);
+    harness.advance(Duration::from_millis(500));
+    assert!(harness.world().get::<HiddenMarker>(entity).is_none());
+    assert!(
+        harness
+            .world()
+            .get::<ActiveWorkspaceMarker>(source)
+            .is_some()
+    );
+    assert!(
+        harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .is_some_and(|strip| strip.contains(entity))
+    );
+    assert_focused!(harness.world(), 0);
+    assert_eq!(window_frame(harness.world(), 0), original_frame);
 }

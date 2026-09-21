@@ -43,11 +43,18 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 Desktop creation and destruction and explicit window moves between native Spaces (`space create` / `space destroy` / `window spacemove` / `window spacesend`) cross the same boundary in the other direction, and the window server applies them asynchronously. The design keeps that asynchrony visible instead of papering over it:
 
 - **Main-thread ABI bridge:** `src/manager/native_spaces.rs` drives the private SkyLight `WMBridge` operation objects. Every ABI is validated from the Objective-C method type encodings before a call, census reads fail closed on any structural surprise, and mutations run only on the process main thread in an unlocked console session. The module only *submits*: a failure after the first perform is reported as "may have applied", and the ID a synchronous create hands back is a receipt to confirm, not a confirmation.
+- **Fresh Mission Control guard:** `src/platform/mission_control.rs` observes the current Dock and WindowManager owners through typed AX/CG data. Startup and failed observations are unknown, never inactive. Active/unknown states schedule fresh observations and owner subscriptions rebind after process replacement; known-inactive idle does not poll. The ECS guard and native submission boundary both refuse mutations unless inactivity is verified.
+- **Destruction safety:** explicit migration refuses hidden application owners and attached window groups. Live macOS 27 testing found that the destroy bridge can leave these windows alive with no native Space; unhide the app or explicitly move the group first. Ownership/association reads fail closed, without guessing from on-screen status.
 - **Small pending Components:** `src/ecs/native_spaces.rs` records each accepted request on its own entity or on the moving window (`NativeSpaceCreatePending`, `NativeSpaceDestroyPending`, `NativeSpacePlacementPending`, `SpaceMovePending`). One native request is in flight at a time; a new one is refused, not queued, while any of them is still being confirmed.
 - **Asynchronous confirmation:** `Update` systems observe each pending on `Time` every `NATIVE_CHECK_INTERVAL` (50 ms) against a fresh Space census and per-window membership reads, bounded by `NATIVE_REQUEST_TIMEOUT` (2 s). The layout is rewritten only once the native state shows the request applied; a move is confirmed only when its whole batch (native tab group and associated windows) has landed.
+- **All-member ownership:** `SpaceMovePending` separates every tracked native batch member from logical placement groups. Associated children keep independent slots and visibility/mode flags. All travellers are excluded from source focus and competing follower carries. If the leader closes, surviving members retain the original observation deadlines but not its focus intent.
+- **Native tab identity:** `src/ecs/native_tabs.rs` reconciles fresh titlebar selection and uniquely resolved window identities, with bounded event-driven settling. Geometry is not identity. Previously established sibling identities can survive an inactive backing window remaining ordered in; first-time independent title matches cannot authorize a group. Every resolved tab is submitted explicitly and the initial native assignment is confirmed for the full batch. Unknown IDs refuse movement.
+- **Native tab observation cost:** focus/title/lifecycle notifications observe promptly and retain their bounded retry deadline. Movement/resize echoes independently settle for 150 ms before observation, so ongoing panning neither rescans every frame nor starves a pending selection change. Each application observation shares one fresh, fully validated global window census across all member existence checks; native mutation preflight and confirmation still acquire their own fresh observations.
+- **Native tab surfaces:** cached group selection and fresh native ordering guard AX geometry/raise writes on the main thread. A selection change replays the selected tiled window's desired geometry; inactive tab records remain logically present but not visible/focused.
 - **Truthful partial results:** a request that fails or times out after submission is reconciled against what the window server actually reports rather than assumed unmoved, and is never treated as complete or resubmitted. What could not be observed keeps its last known layout; nothing is floated, rowed or focused by guess, and a failed census read says nothing either way.
 - **Actual display ownership:** a new Desktop's row 0 is spawned under the display the census says owns it, never under the active display by assumption. The OS `SpaceCreated`/`SpaceDestroyed` notifications go through the same observers, so a Space the census cannot vouch for yet waits (bounded) instead of being placed by guess.
 - **Change-driven cleanup:** a row a destroyed Space keeps for windows whose new Space was never observed is tagged `DestroyedSpaceMarker` and reaped by `reap_destroyed_space_rows` only when such a row is added or its `LayoutStrip` changes — never by a periodic scan.
+- **Queryable uncertainty:** state and window-set extraction preserve unresolved windows in confirmed-destroyed rows as inactive, invisible and unfocused. They do not enumerate native occupancy for those rows; enumeration errors for present Spaces still propagate.
 
 The public `send-cmd` path is fire-and-forget: an accepted dispatch is not native completion, and refused or partially applied requests are logged rather than surfaced to the client.
 
@@ -87,10 +94,13 @@ The public `send-cmd` path is fire-and-forget: an accepted dispatch is not nativ
 - **`ActiveWorkspaceMarker`**: Identifies the currently active workspace.
 - **`SelectedVirtualMarker`**: Marks a virtual workspace that is currently selected by the user.
 - **`NativeFullscreenMarker`**: Marks a window that is in macOS native fullscreen mode.
-- **`Unmanaged`:** An enum identifying windows that are `Floating`, `Minimized`, or `Hidden`.
+- **`FloatingMarker`:** Persistent floating intent, independent of visibility.
+- **`MinimizedMarker` / `HiddenMarker`:** Independent suspension flags; either excludes a window from layout and focus without changing its mode.
+- **`PreviousManagedStrip`:** The tiled row to restore after suspension, used only while it still matches the window's native membership.
+- **`NativeTabGroups` / `NativeTabsDirty`:** Application-scoped native identity and bounded outstanding observation work.
 - **`RepositionMarker` / `ResizeMarker`**: Used to signal that a window needs to be moved or resized.
 - **`NativeSpaceCreatePending` / `NativeSpaceDestroyPending` / `NativeSpacePlacementPending`:** One submitted or OS-announced native Space change awaiting census confirmation, each on its own entity.
-- **`SpaceMovePending`:** An explicit native Space move in flight, carried by the leader window of the travelling tab group.
+- **`SpaceMovePending`:** An explicit native move's complete tracked membership, logical placement groups, and bounded confirmation phase; initially carried by its leader.
 - **`DestroyedSpaceMarker`:** A row of a Space the census no longer lists, kept only for windows whose new Space was not observed; reaped once empty.
 
 ### Resources
@@ -98,7 +108,7 @@ The public `send-cmd` path is fire-and-forget: an accepted dispatch is not nativ
 - **`Config`:** The current user configuration.
 - **`PaneruState`**: The durable snapshot of managed layout, display, native workspace, and virtual workspace state used for recovery after restarts.
 - **`SessionRestore`**: A short-lived startup resource that keeps loaded state and restore timing active until the startup grace period expires.
-- **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
+- **`MissionControlActive`:** `Some(true)` for active, `Some(false)` for verified inactive, `None` for unknown. Active and unknown both block native mutations.
 - **`FocusFollowsMouse`:** Tracks which window should gain focus based on mouse position.
 
 ## 5. Architectural Invariants

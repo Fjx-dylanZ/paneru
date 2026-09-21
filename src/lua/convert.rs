@@ -247,6 +247,7 @@ impl TryFrom<&Event> for LuaEvent {
             // internal plumbing.
             Event::InitialConfig(_)
             | Event::ConfigRefresh(_)
+            | Event::MissionControlStateUnknown
             | Event::ApplicationLaunched { .. }
             | Event::ApplicationTerminated { .. }
             | Event::ApplicationFrontSwitched { .. }

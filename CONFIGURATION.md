@@ -38,7 +38,7 @@ General behavior settings for the window manager.
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` (and their `window_vertical_*` counterparts) stop at the largest/smallest preset instead of cycling back. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
 | `reap_empty_workspaces` | Boolean | `false` | On virtual workspace switches, remove empty inactive rows in the same native Space. The active row and row 1 are always kept; surviving rows retain their numbers. |
-| `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a window into a tab group with an existing same-app sibling that shares its frame. Merging happens when the window is created, and again for a background tab that the window server stops showing while a sibling of the same app holds the same frame — an app that hides its old tab a moment late would otherwise leave a column nothing can appear in. Use this if you find unrelated windows being grouped together. |
+| `disable_native_tabs` | Boolean | `false` | Disables automatic reconciliation of native Cocoa tabs. With this option `false`, reconciliation uses fresh titlebar selection and uniquely resolved window identities, not matching frames. Focus and lifecycle changes are observed promptly; movement/resize notifications are coalesced until geometry settles. Leave this `false` to preserve native-tab grouping, selection, and whole-group native Space moves. |
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
@@ -257,8 +257,14 @@ independently of `skip_native_space_switch_animation`.
 Paneru requests the native show/hide/set-current sequence on the target's owning
 display, then confirms it without blocking the event loop. Cursor and display
 focus changes happen only after that confirmation. A Space already current on
-another display only needs the display-focus step. Commands are ignored while
-Mission Control is open or a prior instant transition is still pending.
+another display only needs the display-focus step. A prior instant transition
+must finish before another is submitted.
+
+Native changes are refused while Mission Control, App Exposé, or Show Desktop
+is active, or while their state cannot be verified. Paneru samples the current
+UI owners rather than assuming a missing exit notification means inactivity.
+This also covers starting Paneru with Mission Control already open and
+restarting Dock or WindowManager; commands resume after a verified exit.
 
 #### Creating and destroying Desktops
 
@@ -280,9 +286,16 @@ memberships they end up with and reconciles its layout to what it saw. On the
 single-display setups this has been exercised on, macOS moved them to the
 current Desktop; no particular destination is promised beyond that. Paneru
 never closes a window or moves windows by hand as part of destruction, and
-the guards above still apply. A Space that looks empty in Mission Control may
-still be refused because a hidden or sticky application window counts as
-present; inspect what is there before reaching for `_migrate`.
+the active/last/type guards still apply. Migration additionally refuses hidden
+applications and attached window groups: macOS can orphan those windows when
+destroying their Desktop. Unhide the application first, or explicitly move the
+whole group elsewhere before destroying the now-empty Desktop. Unverifiable
+ownership or associations also fail closed. A Space that looks empty in Mission
+Control may still contain hidden or sticky application windows.
+
+On macOS 27, a minimized survivor can temporarily have no native membership
+until restored. Destruction may therefore finish with an uncertain-migration
+warning even when restoring the window succeeds.
 
 #### Moving windows between Spaces
 
@@ -290,17 +303,30 @@ present; inspect what is there before reaching for `_migrate`.
 window to another Desktop. `next`/`prev` are relative to the Space the window
 is actually on, which need not be the Space you are looking at. Selecting the
 Space the window is already on is a no-op. The window keeps its tiled or
-floating state; its native tab group and associated child windows (sheets,
-popovers) are submitted as one batch and the destination row keeps the tab
-grouping. Nothing in the layout changes before native membership has been
-observed. If the batch could not be confirmed whole — an error after
-submission, or the deadline — the members the window server does report on
-the target are reconciled individually into the destination row, while the
-rest keep their last known layout; only a batch confirmed whole completes the
-move as such, and for `spacemove` only a whole batch triggers the switch to
-the destination.
+floating state. Every identified native tab and associated child window is
+submitted in one batch. Managed children retain their own layout slots and
+mode; they do not become tabs of their parent. Source focus excludes every
+travelling member, not just the focused window.
 
-Moves are refused for native-fullscreen windows, hidden windows, windows on
+Nothing in the layout changes before native membership has been observed.
+If the batch could not be confirmed whole — an error after submission, or the
+deadline — members observed on the target are reconciled there without
+following; unobserved members keep their last known layout. Closing the
+original window does not cancel observation of surviving members or transfer
+its focus request to a child.
+
+Native tab identity comes from fresh Cocoa titlebar data, not matching window
+rectangles. Late merges, selection changes, and detaches update the layout.
+Each identified tab is explicitly assigned to the destination, including
+inactive tabs with no current membership. Later selection can leave another
+tab with no membership or still ordered in; established member identities and
+fresh titlebar selection keep the logical group together. Inactive tabs are
+not individually raised or resized, and are not reported visible or focused.
+Ambiguous titles, unreadable identity, or tabs without a resolved window ID
+refuse a move. For an existing group discovered at startup, visit each tab
+first so Paneru can discover its real window.
+
+Moves are refused for native-fullscreen windows, minimized or hidden windows, windows on
 more than one Space (sticky/multi-Space), and a window whose previous move is
 still being confirmed. A window with `window_follow` turned on cannot be
 *sent* (it would just follow you back); turn follow off first. It can be
@@ -379,6 +405,12 @@ Floating windows are shared across all virtual rows in the same native macOS
 Space. Switching rows moves the tiled strips, not the floating windows. Floating
 layer focus and raise commands operate on those shared floats; they are not
 automatically kept above tiled windows.
+
+Floating intent is independent of minimization and application hiding.
+Minimizing or hiding a float does not tile it on restore; unhiding an app does
+not unminimize its windows. Suspended windows do not participate in layout or
+focus. A tiled window restores to its previous virtual row while that row and
+native Space still exist; changing its mode while suspended is respected.
 
 Shifting up or down goes to the previous or next strip of windows, without
 wrapping. South can create a new row at the end when
@@ -503,6 +535,8 @@ Ordinary floating windows already stay visible across virtual rows within their
 native Space; following additionally moves them when the active native Space
 changes. Paneru reassigns a followed window to that one Space without changing
 focus or reapplying its grid placement.
+Following pauses while the window is minimized or its application is hidden,
+then resumes on restore without discarding its floating mode.
 
 ```toml
 [windows.onepassword_quick_access]

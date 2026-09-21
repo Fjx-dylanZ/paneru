@@ -18,8 +18,7 @@ fn spawn_matching_native_tab(world: &mut World, state: &MockState, window_id: Wi
         .expect("frame should exist");
     let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, window_id + 1, frame);
 
-    // The previous window should now not be visible on screen.
-    state.window_visible(window_id, false);
+    state.merge_native_tabs(&[window_id, window_id + 1], window_id + 1);
 
     world.trigger(SpawnWindowTrigger(vec![window]));
 }
@@ -61,6 +60,9 @@ fn test_native_tab_resize_syncs_sibling_size() {
         Event::Command {
             command: Command::PrintState,
         },
+        Event::Command {
+            command: Command::PrintState,
+        },
     ];
 
     TestHarness::new()
@@ -74,16 +76,28 @@ fn test_native_tab_resize_syncs_sibling_size() {
             let mut bounds = query.get_mut(world, tab_one).expect("tab bounds missing");
             bounds.0.x = TEST_WINDOW_WIDTH + 160;
         })
-        .on_iteration(2, move |world, _state| {
-            assert_window_size!(
-                world,
-                0,
-                TEST_WINDOW_WIDTH + 160,
-                TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
+        .on_iteration(2, move |world, state| {
+            let inactive = find_window_entity(0, world);
+            assert_eq!(
+                world.get::<Bounds>(inactive).unwrap().0.x,
+                TEST_WINDOW_WIDTH + 160
+            );
+            assert_ne!(
+                world.get::<Window>(inactive).unwrap().frame().width(),
+                TEST_WINDOW_WIDTH + 160
             );
             assert_window_size!(
                 world,
                 1,
+                TEST_WINDOW_WIDTH + 160,
+                TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
+            );
+            state.focus_window(0);
+        })
+        .on_iteration(3, move |world, _state| {
+            assert_window_size!(
+                world,
+                0,
                 TEST_WINDOW_WIDTH + 160,
                 TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
             );
@@ -154,9 +168,8 @@ fn test_native_tab_removal_keeps_remaining_window_column() {
         .on_iteration(0, move |world, state| {
             spawn_matching_native_tab(world, &state, 0);
         })
-        .on_iteration(1, move |world, _state| {
-            let tab_one = find_window_entity(1, world);
-            world.entity_mut(tab_one).despawn();
+        .on_iteration(1, move |_world, state| {
+            state.os_close_window(1);
         })
         .on_iteration(2, move |world, _state| {
             let tab_zero = find_window_entity(0, world);
@@ -175,10 +188,8 @@ fn test_native_tab_removal_keeps_remaining_window_column() {
 
 #[test]
 fn test_offscreen_same_app_same_width_different_frame_not_tabbed() {
-    // Regression: a same-app sibling that happens to be off-screen (scrolled out of
-    // the strip, on another space, etc.) with merely the same width as the new
-    // window must not be misidentified as a native tab. Real native tabs share the
-    // leader's full frame; partial matches must not trigger conversion.
+    // An off-screen same-app window is not a native tab without positive
+    // native titlebar evidence, regardless of its size.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -202,8 +213,7 @@ fn test_offscreen_same_app_same_width_different_frame_not_tabbed() {
             frame.max.y = frame.min.y + leader_frame.height() / 2;
 
             let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
-            // Pretend the existing window is off-screen so the only thing preventing
-            // a false positive is the frame check.
+            // Visibility alone is not evidence of native tab membership.
             state.window_visible(0, false);
             world.trigger(SpawnWindowTrigger(vec![window]));
         })
@@ -227,8 +237,8 @@ fn test_offscreen_same_app_same_width_different_frame_not_tabbed() {
 
 #[test]
 fn test_disable_native_tabs_skips_detection() {
-    // Setting `disable_native_tabs = true` must short-circuit the detector even
-    // when the new window's frame matches the leader exactly.
+    // Explicitly disabling native tabs keeps windows separate even when
+    // the native provider reports a real tab group.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {

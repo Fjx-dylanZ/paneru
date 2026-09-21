@@ -3,7 +3,7 @@ use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
-use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
+use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
@@ -12,7 +12,7 @@ use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_foundation::NSPoint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -25,13 +25,13 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::layout::LayoutStrip;
+use crate::ecs::params::{ActiveDisplay, FrameActivity, NotSuspended, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker,
-    FollowCurrentWorkspaceMarker, Initializing, LowPowerMode, MissionControlActive, Position,
-    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    Unmanaged, WidthRatio, WindowProperties,
+    FollowCurrentWorkspaceMarker, HiddenMarker, Initializing, LowPowerMode, MinimizedMarker,
+    MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -59,10 +59,13 @@ type MovableWindows<'w, 's> = Query<
         &'static mut Window,
         &'static mut Position,
         &'static Bounds,
-        Option<&'static Unmanaged>,
         Has<RepositionMarker>,
     ),
-    Without<LayoutStrip>,
+    (
+        Without<LayoutStrip>,
+        Without<MinimizedMarker>,
+        Without<HiddenMarker>,
+    ),
 >;
 
 /// Windows as the resize handler rewrites them: the OS handle to re-read the
@@ -76,10 +79,13 @@ type ResizableWindows<'w, 's> = Query<
         Entity,
         &'static Position,
         &'static mut Bounds,
-        Option<&'static Unmanaged>,
         Has<ResizeMarker>,
     ),
-    Without<LayoutStrip>,
+    (
+        Without<LayoutStrip>,
+        Without<MinimizedMarker>,
+        Without<HiddenMarker>,
+    ),
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -257,7 +263,7 @@ pub(crate) fn add_existing_application(
 ///
 /// # Arguments
 ///
-/// * `windows` - A mutable query for all `Window` components, their `Entity`, and `Has<Unmanaged>` status.
+/// * `windows` - Window handles and their mode/visibility flags.
 /// * `displays` - A query for all `Display` entities, including whether they have the `ActiveDisplayMarker`.
 /// * `window_manager` - The `WindowManager` resource for refreshing displays and getting active space information.
 /// * `commands` - Bevy commands to insert components like `FocusedMarker`.
@@ -295,47 +301,75 @@ pub(crate) fn finish_setup(
         windows.iter().size_hint()
     );
 
+    // Native membership cannot distinguish virtual rows. Preserve an existing
+    // row assignment, or use the lowest row for an unassigned startup window;
+    // adding the native census to every row duplicates windows and makes focus
+    // choose a row according to archetype iteration order.
+    let mut first_rows = HashMap::new();
+    let mut assignments = HashMap::new();
+    for (strip, _, _) in &workspaces {
+        first_rows
+            .entry(strip.id())
+            .and_modify(|row: &mut u32| *row = (*row).min(strip.virtual_index))
+            .or_insert(strip.virtual_index);
+        for entity in strip.all_windows() {
+            assignments
+                .entry((strip.id(), entity))
+                .and_modify(|row: &mut u32| *row = (*row).min(strip.virtual_index))
+                .or_insert(strip.virtual_index);
+        }
+    }
+    let mut native_windows = HashMap::new();
     let mut focused_managed_window = false;
     for (mut strip, active_strip, _) in &mut workspaces {
-        debug!("space {}: before refresh {strip:?}", strip.id());
-        let workspace_windows = window_manager
-            .windows_in_workspace(strip.id())
-            .inspect_err(|err| {
-                warn!("failed to get windows on workspace {}: {err}", strip.id());
-            })
-            .ok()
-            .map(|workspace_windows| {
-                workspace_windows
-                    .into_iter()
-                    .filter_map(|window_id| windows.find_managed(window_id))
-                    .filter(|(window, entity)| {
-                        if window.is_minimized() {
-                            if let Ok(mut entity_commands) = commands.get_entity(*entity) {
-                                entity_commands.try_insert(Unmanaged::Minimized);
+        let workspace = strip.id();
+        let workspace_windows = native_windows.entry(workspace).or_insert_with(|| {
+            window_manager
+                .windows_in_workspace(workspace)
+                .inspect_err(|err| warn!("failed to get windows on workspace {workspace}: {err}"))
+                .ok()
+                .map(|ids| {
+                    ids.into_iter()
+                        .filter_map(|id| windows.find_managed(id))
+                        .filter_map(|(window, entity)| {
+                            if window.is_minimized() {
+                                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                                    entity_commands.try_insert(MinimizedMarker);
+                                }
+                                None
+                            } else {
+                                Some(entity)
                             }
-                            false
-                        } else {
-                            true
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            });
+                        })
+                        .collect::<Vec<_>>()
+                })
+        });
         let Some(workspace_windows) = workspace_windows else {
             continue;
         };
-
-        // Preserve the order - do not flush existing windows.
+        let row_index = strip.virtual_index;
+        let belongs_here = |entity: Entity| {
+            assignments
+                .get(&(workspace, entity))
+                .copied()
+                .unwrap_or(first_rows[&workspace])
+                == row_index
+        };
         for entity in strip.all_windows() {
-            if !workspace_windows.iter().any(|(_, e)| *e == entity) {
+            if !workspace_windows.contains(&entity) || !belongs_here(entity) {
                 strip.remove(entity);
             }
         }
-        for (_, entity) in workspace_windows {
+        for entity in workspace_windows
+            .iter()
+            .copied()
+            .filter(|entity| belongs_here(*entity))
+        {
             if !strip.contains(entity) {
                 strip.append(entity);
             }
         }
-        debug!("space {}: after refresh {strip:?}", strip.id());
+        debug!("space {workspace}: startup row {strip:?}");
 
         if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
             commands.focus_entity(entity, true);
@@ -584,7 +618,7 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<(&mut Position, Entity, &RepositionMarker), NotSuspended>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -632,7 +666,7 @@ pub(super) fn animate_entities(
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: Populated<(&mut Bounds, Entity, &ResizeMarker), NotSuspended>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -701,7 +735,7 @@ pub(crate) fn pump_events(
     // floor under how soon a pump could start, so an event landing right after
     // one returned had to wait out the rest of it. That latency is worse than
     // the redundant work skipping the wait costs.
-    platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
+    let cocoa_activity = platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
 
     let deadline = Instant::now() + PUMP_BUDGET;
     let mut received_events = Vec::new();
@@ -748,6 +782,11 @@ pub(crate) fn pump_events(
     };
 
     received_events.extend(pending_mouse.take());
+    if let Some(event) = platform.refresh_mission_control(
+        cocoa_activity || !received_events.is_empty() || activity.mid_frame(),
+    ) {
+        messages.write(event);
+    }
     messages.write_batch(received_events);
 
     if drained {
@@ -790,15 +829,12 @@ pub(super) fn window_resized_update_frame(
             continue;
         };
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing)) = windows
+        let Some((mut window, entity, position, mut bounds, resizing)) = windows
             .iter_mut()
             .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
-        }
         // Our own resize, echoed back: `commit_window_size` requested this size
         // and `animate_resize_entities` is still stepping toward it, so reading
         // the echo in here would fight the animation producing that difference.
@@ -847,7 +883,7 @@ pub(super) fn window_resized_update_frame(
         let diff = old_frame.min.y - new_frame.min.y;
         if diff.abs() > 0
             && let Some(above_entity) = strip.above(entity)
-            && let Ok((_, _, _, mut above_bounds, _, _)) = windows.get_mut(above_entity)
+            && let Ok((_, _, _, mut above_bounds, _)) = windows.get_mut(above_entity)
             && above_bounds.0.y - diff > 200
         {
             above_bounds.0.y -= diff;
@@ -865,15 +901,12 @@ pub(crate) fn window_moved_update_frame(
             continue;
         };
 
-        let Some((mut window, mut position, bounds, unmanaged, repositioning)) = windows
+        let Some((mut window, mut position, bounds, repositioning)) = windows
             .iter_mut()
             .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
-        }
         // Our own move, echoed back: `animate_entities` lerps from the current
         // `Position`, so overwriting it with the echoed frame mid-animation
         // restarts each step from behind, and the two chase each other.
@@ -1012,7 +1045,7 @@ pub(super) fn update_overlays(
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping || mission_control_active.blocks_mutations() || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }
@@ -1100,19 +1133,30 @@ pub(super) fn update_overlays(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+    mut moved_windows: Populated<
+        (Entity, &mut Window, &Position),
+        (Changed<Position>, NotSuspended),
+    >,
+    native_tabs: super::native_tabs::NativeTabSurfaces,
 ) {
-    moved_windows
-        .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+    for (entity, mut window, position) in &mut moved_windows {
+        if native_tabs.can_write(entity, window.id()) {
+            window.reposition(position.0);
+        }
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn verify_window_position(
     mut windows: Populated<(Entity, &mut Window, &Position, &mut VerifyWindowPosition)>,
     mut commands: Commands,
+    native_tabs: super::native_tabs::NativeTabSurfaces,
 ) {
     for (entity, mut window, position, mut verification) in &mut windows {
+        if !native_tabs.can_write(entity, window.id()) {
+            commands.entity(entity).try_remove::<VerifyWindowPosition>();
+            continue;
+        }
         if window
             .update_frame()
             .is_ok_and(|frame| frame.min == position.0)
@@ -1132,18 +1176,31 @@ pub(super) fn verify_window_position(
     }
 }
 
+type ResizedWindows<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Window,
+        &'static Bounds,
+        &'static mut WidthRatio,
+    ),
+    (Changed<Bounds>, NotSuspended),
+>;
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    mut resized_windows: ResizedWindows,
+    native_tabs: super::native_tabs::NativeTabSurfaces,
 ) {
     let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+    for (entity, mut window, size, mut width_ratio) in &mut resized_windows {
+        width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+        if native_tabs.can_write(entity, window.id()) {
             window.resize(size.0);
-        });
+        }
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
@@ -1152,13 +1209,17 @@ pub(super) fn commit_window_size(
 /// Followers keep their app/user-selected frame and current native Space.
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<(&mut Window, Has<FollowCurrentWorkspaceMarker>)>,
+    mut all_windows: Query<(Entity, &mut Window, Has<FollowCurrentWorkspaceMarker>)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    native_tabs: super::native_tabs::NativeTabSurfaces,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|(w, _)| w.id()).collect::<Vec<_>>();
+        let ids = all_windows
+            .iter()
+            .map(|(_, w, _)| w.id())
+            .collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
 
@@ -1171,8 +1232,8 @@ pub(super) fn cleanup_on_exit(
             return;
         }
 
-        for (mut window, followed) in &mut all_windows {
-            if followed {
+        for (entity, mut window, followed) in &mut all_windows {
+            if followed || !native_tabs.can_write(entity, window.id()) {
                 continue;
             }
             let frame = window.frame();
@@ -1296,203 +1357,6 @@ pub(crate) fn window_creation_event(mut messages: MessageReader<Event>, mut comm
             .map(|window| Window::new(Box::new(window)))
         {
             commands.trigger(SpawnWindowTrigger(vec![window]));
-        }
-    }
-}
-
-/// Managed windows whose geometry has settled: nothing in flight, so two of them
-/// sharing a frame really do share it.
-type SettledWindows<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static Window,
-        &'static Position,
-        &'static Bounds,
-        &'static ChildOf,
-    ),
-    (
-        Without<Unmanaged>,
-        Without<RepositionMarker>,
-        Without<ResizeMarker>,
-    ),
->;
-
-/// Folds a background native tab that ended up in a column of its own back into
-/// the column of the tab that is actually showing.
-///
-/// [`detect_tabbed_windows`] catches this when the tab window is created, but
-/// only when the app has already stopped showing the sibling by then. Ghostty
-/// does not always oblige, and the leftover column is a slot in the strip that
-/// can never show anything: focus lands in it, the strip scrolls to it, and
-/// there is nothing there.
-///
-/// Deliberately narrow. Two managed windows of one app share a frame exactly
-/// only when they share a column, which is what this is repairing, and the
-/// window server reports a background tab as not on screen while an occluded
-/// window still counts as on screen.
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn regroup_stray_native_tabs(
-    windows: SettledWindows,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    window_manager: Res<WindowManager>,
-    mission_control: Res<MissionControlActive>,
-    mut commands: Commands,
-) {
-    if mission_control.0 {
-        return;
-    }
-    let Some(mut strip) = workspaces
-        .iter_mut()
-        .find_map(|(strip, active)| active.then_some(strip))
-    else {
-        return;
-    };
-    let Some(on_screen) = window_manager.windows_on_screen() else {
-        return;
-    };
-
-    // Column tops only: a window sharing a column is already grouped, and
-    // stacked siblings never share a frame.
-    let tops = strip.all_columns();
-    // Only a column of its own can be a stray: pulling a window out of a stack
-    // or an existing tab group would break a grouping the user set up.
-    let strays = strip
-        .columns()
-        .filter_map(|column| match column {
-            Column::Single(entity) => Some(*entity),
-            Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
-        })
-        .collect::<Vec<_>>();
-    let columns = tops
-        .into_iter()
-        .filter_map(|entity| windows.get(entity).ok())
-        .map(
-            |(entity, window, Position(position), Bounds(bounds), child)| {
-                (
-                    entity,
-                    on_screen.contains(&window.id()),
-                    *position,
-                    *bounds,
-                    child.parent(),
-                )
-            },
-        )
-        .collect::<Vec<_>>();
-
-    let mut regrouped = Vec::new();
-    for (hidden, on_screen_now, position, bounds, app) in &columns {
-        if *on_screen_now || regrouped.contains(hidden) || !strays.contains(hidden) {
-            continue;
-        }
-        let Some((leader, ..)) = columns.iter().find(
-            |(
-                candidate,
-                candidate_on_screen,
-                candidate_position,
-                candidate_bounds,
-                candidate_app,
-            )| {
-                *candidate_on_screen
-                    && candidate != hidden
-                    && candidate_app == app
-                    && candidate_position.chebyshev_distance(*position) <= 1
-                    && candidate_bounds.chebyshev_distance(*bounds) <= 1
-            },
-        ) else {
-            continue;
-        };
-
-        debug!("stray native tab {hidden} folded into the column of {leader}");
-        if strip
-            .convert_to_tabs(*leader, *hidden)
-            .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
-            .is_ok()
-        {
-            regrouped.push(*hidden);
-        }
-    }
-
-    if let Some(leader) = regrouped.first() {
-        commands.reshuffle_around(*leader);
-    }
-}
-
-pub(crate) fn detect_tabbed_windows(
-    created: Populated<(Entity, &Position, &Bounds, &ChildOf), Added<Window>>,
-    windows: Query<(Entity, &Window, &Position, &Bounds, &ChildOf), With<Window>>,
-    apps: Query<Entity, With<Application>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    window_manager: Res<WindowManager>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
-    mut commands: Commands,
-) {
-    let display_bounds = active_display.bounds();
-    let Some(workspace_entities) = workspaces
-        .iter()
-        .find_map(|(strip, active)| active.then_some(strip.all_windows()))
-    else {
-        return;
-    };
-
-    for (entity, Position(position), Bounds(bounds), child) in created {
-        let Ok(app_entity) = apps.get(child.parent()) else {
-            continue;
-        };
-
-        // First find all the windows which have the same size and the same parent app.
-        // .. and in the same workspace.
-        let mut same_size = workspace_entities
-            .iter()
-            .filter_map(|e| windows.get(*e).ok())
-            .filter(|(leader, _, _, Bounds(leader_bounds), child)| {
-                *leader != entity
-                    && child.parent() == app_entity
-                    && leader_bounds.chebyshev_distance(*bounds) <= 1
-            })
-            .collect::<Vec<_>>();
-
-        // Now check whether any of these found windows have the same position?
-        let tabbed = same_size
-            .iter()
-            .find_map(|(leader, window, Position(leader_position), _, _)| {
-                // If the window has a positional match, it's tabbed!
-                (leader_position.chebyshev_distance(*position) <= 1)
-                    .then_some((*leader, window.id()))
-            })
-            .or_else(|| {
-                // Otherwise if no windows were found by position, sort all the windows by distance
-                // and then pick the one which is currently offscreen.
-                // This heuristic relaxes the position matching, because the window is bumped into view.
-                same_size.sort_by_key(|(_, _, Position(candidate_position), _, _)| {
-                    position.x.abs_diff(candidate_position.x)
-                });
-                same_size.into_iter().find_map(
-                    |(leader, window, Position(leader_position), Bounds(leader_bounds), _)| {
-                        let offscreen = !display_bounds.contains(*leader_position)
-                            || !display_bounds.contains(*leader_position + leader_bounds);
-                        offscreen.then_some((leader, window.id()))
-                    },
-                )
-            });
-
-        if let Some((leader, leader_id)) = tabbed
-            && window_manager
-                .windows_on_screen()
-                .is_some_and(|ids| !ids.contains(&leader_id))
-            && let Some((mut strip, _)) =
-                workspaces.iter_mut().find(|strip| strip.0.contains(leader))
-            && strip.contains(leader)
-        {
-            debug!("Tabbed window detected: adding {entity} to leader {leader}");
-            if strip
-                .convert_to_tabs(leader, entity)
-                .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
-                .is_ok()
-            {
-                commands.focus_entity(entity, false);
-            }
         }
     }
 }

@@ -6,18 +6,20 @@
 
 use std::time::Duration;
 
+use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 
-use crate::commands::{Command, MoveFocus, Operation, SpaceOperation, SpaceSelector};
+use crate::commands::{Command, Direction, MoveFocus, Operation, SpaceOperation, SpaceSelector};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_spaces::{
     DestroyedSpaceMarker, NativeSpaceCreatePending, NativeSpaceDestroyPending,
     NativeSpacePlacementPending, SpaceMovePending,
 };
+use crate::ecs::state::QueryStateParams;
 use crate::ecs::{
-    FocusedMarker, FollowCurrentWorkspaceMarker, Position, SelectedVirtualMarker,
-    SpawnWindowTrigger, Unmanaged,
+    FloatingMarker, FocusedMarker, FollowCurrentWorkspaceMarker, MinimizedMarker, Position,
+    SelectedVirtualMarker, SpawnWindowTrigger,
 };
 use crate::events::Event;
 use crate::manager::{Display, Window};
@@ -200,7 +202,7 @@ fn row_count(world: &mut World) -> usize {
 
 fn is_floating(world: &mut World, id: WinID) -> bool {
     let entity = find_window_entity(id, world);
-    matches!(world.get::<Unmanaged>(entity), Some(Unmanaged::Floating))
+    world.entity(entity).contains::<FloatingMarker>()
 }
 
 fn is_follower(world: &mut World, id: WinID) -> bool {
@@ -687,6 +689,26 @@ fn uncertain_creation_announced_before_the_census_is_placed_by_its_owner() {
         1,
         "an uncertain creation is observed, never blindly retried"
     );
+}
+
+#[test]
+fn startup_native_membership_assigns_each_tiled_window_to_one_virtual_row() {
+    let mut harness = display_with(vec![FIRST, SECOND])
+        .with_config(three_rows_config())
+        .with_windows(2);
+    boot(&mut harness);
+    for id in [0, 1] {
+        let entity = find_window_entity(id, harness.world());
+        let occupied = rows_of(harness.world(), FIRST)
+            .into_iter()
+            .filter_map(|(_, index, members)| members.contains(&entity).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            occupied,
+            vec![0],
+            "native membership does not imply every virtual row"
+        );
+    }
 }
 
 // --- Destruction ---
@@ -1396,6 +1418,106 @@ fn rows_kept_past_the_deadline_go_once_an_ordinary_refresh_empties_them() {
     assert_eq!(harness.mock_state.native_space_destroys().len(), 1);
 }
 
+#[test]
+fn query_state_keeps_unresolved_survivors_without_enumerating_the_destroyed_space() {
+    let mut harness = display_with(vec![FIRST, SECOND, THIRD])
+        .with_windows(1)
+        .with_workspace_window(HIDDEN, SECOND, |_| {});
+    boot(&mut harness);
+
+    let mut query = SystemState::<QueryStateParams>::new(harness.world());
+    let before = query
+        .get(harness.world())
+        .expect("query parameters")
+        .extract()
+        .expect("state before destruction");
+    let frame_before = before
+        .virtual_workspaces
+        .iter()
+        .flat_map(|row| &row.windows)
+        .find(|window| window.window_id == HIDDEN)
+        .expect("window on the second Desktop")
+        .frame
+        .expect("last-known frame");
+
+    // The user closes the Desktop, but its native group cannot report where
+    // it landed. Once the bounded observation ends, its last-known row stays.
+    harness.mock_state.set_window_queries_failing(HIDDEN, true);
+    harness.mock_state.remove_workspace(TEST_DISPLAY_ID, SECOND);
+    harness
+        .mock_state
+        .set_workspace_queries_failing(SECOND, true);
+    harness.advance(NATIVE_DEADLINE);
+    assert_eq!(destroyed_rows(harness.world()), 1);
+    assert_eq!(destructions_pending(harness.world()), 0);
+
+    let params = query.get(harness.world()).expect("query parameters");
+    let state = params
+        .extract()
+        .expect("a deleted Space must not make the state query unavailable");
+    let retained = state
+        .virtual_workspaces
+        .iter()
+        .find(|row| row.native_workspace_id == SECOND)
+        .expect("last-known row retained");
+    assert!(!retained.active);
+    let survivor = retained
+        .windows
+        .iter()
+        .find(|window| window.window_id == HIDDEN)
+        .expect("unresolved survivor retained");
+    assert_eq!(survivor.frame, Some(frame_before));
+    assert!(!survivor.floating);
+    assert!(!survivor.visible);
+    assert!(!survivor.focused);
+    let live = state
+        .virtual_workspaces
+        .iter()
+        .find(|row| row.native_workspace_id == FIRST)
+        .expect("unrelated live row available");
+    assert!(live.active);
+    assert!(live.windows.iter().any(|window| window.window_id == 0));
+    assert_eq!(state.active.native_workspace_id, Some(FIRST));
+    assert_ne!(state.active.focused_window_id, Some(HIDDEN));
+
+    let window_set = params
+        .extract_window_set()
+        .expect("the scripting view also remains available");
+    let retained = window_set.workspace_of(HIDDEN).expect("survivor's row");
+    assert_eq!(retained.native_id, SECOND);
+    assert!(!retained.active);
+    let survivor = window_set.window(HIDDEN).expect("last-known survivor");
+    assert_eq!(survivor.frame, Some(frame_before));
+    assert!(!survivor.visible);
+    assert!(!survivor.focused);
+    assert_eq!(window_set.current().map(|row| row.native_id), Some(FIRST));
+    assert_eq!(
+        window_set.workspace_of(0).map(|row| row.native_id),
+        Some(FIRST)
+    );
+    assert_ne!(window_set.focused(), Some(HIDDEN));
+
+    // With the destroyed row still retained, both the active Space and the
+    // selected row of another live Space must continue reporting real errors.
+    for workspace_id in [FIRST, THIRD] {
+        harness
+            .mock_state
+            .set_workspace_queries_failing(workspace_id, true);
+        let params = query.get(harness.world()).expect("query parameters");
+        assert!(matches!(
+            params.extract(),
+            Err(crate::errors::Error::Generic(_))
+        ));
+        assert!(matches!(
+            params.extract_window_set(),
+            Err(crate::errors::Error::Generic(_))
+        ));
+        harness
+            .mock_state
+            .set_workspace_queries_failing(workspace_id, false);
+    }
+}
+
 // --- Moving and sending windows ---
 
 #[test]
@@ -1680,6 +1802,43 @@ fn spacesend_leaves_layout_and_focus_alone_until_membership_is_confirmed() {
 }
 
 #[test]
+fn closing_a_display_tab_does_not_focus_a_sibling_being_sent_to_another_space() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.run(vec![
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToggleTabbedDisplay),
+        },
+    ]);
+    assert_focused!(harness.world(), 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
+
+    // The user returns to the remaining display tab before the send settles.
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert_focused!(harness.world(), 0);
+    harness.mock_state.os_close_window(0);
+    harness.advance(NATIVE_REACTION);
+
+    assert!(space_move_pending(harness.world(), 1));
+    assert_focused!(harness.world(), 2);
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), FIRST);
+    assert_focused!(harness.world(), 2);
+}
+
+#[test]
 fn spacemove_same_target_and_out_of_range_selectors_move_nothing() {
     let mut harness = display_with(vec![FIRST, SECOND, THIRD]).with_windows(2);
     boot(&mut harness);
@@ -1881,7 +2040,7 @@ fn spacemove_carries_the_native_tab_group_as_one_column() {
     let tab = harness
         .mock_state
         .spawn_window(TEST_PROCESS_ID, FIRST, 1, frame);
-    harness.mock_state.window_visible(0, false);
+    harness.mock_state.merge_native_tabs(&[0, 1], 1);
     harness.world().trigger(SpawnWindowTrigger(vec![tab]));
     harness.run(vec![print_state()]);
     assert!(share_a_tab_column(harness.world(), &[0, 1]));
@@ -1891,13 +2050,8 @@ fn spacemove_carries_the_native_tab_group_as_one_column() {
 
     harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
 
-    assert_eq!(
-        submitted_batch(&harness),
-        (vec![0, 1], SECOND),
-        "the whole tab group travels in one batch"
-    );
-    assert_eq!(harness.mock_state.window_workspace(0), SECOND);
-    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.window_memberships(0), vec![SECOND]);
+    assert_eq!(harness.mock_state.window_memberships(1), vec![SECOND]);
     let world = harness.world();
     assert_eq!(window_row(world, 0), Some((SECOND, 0)));
     assert_eq!(window_row(world, 1), Some((SECOND, 0)));
@@ -1907,6 +2061,297 @@ fn spacemove_carries_the_native_tab_group_as_one_column() {
     );
     assert!(rows_of(world, FIRST)[0].2.is_empty());
     assert_eq!(ecs_active_workspaces(world), vec![FIRST]);
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_memberships(0), vec![SECOND]);
+    assert!(harness.mock_state.window_memberships(1).is_empty());
+    assert_eq!(window_row(harness.world(), 0), Some((SECOND, 0)));
+}
+
+#[test]
+fn spacesend_reconciles_managed_children_without_tab_or_source_focus_aliasing() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
+    assert_eq!(window_row(harness.world(), 1), Some((FIRST, 0)));
+    // A child may take focus while the native request is still pending.
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    assert_focused!(harness.world(), 1);
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(0), SECOND);
+    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.window_workspace(2), FIRST);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), FIRST);
+    assert!(harness.mock_state.native_space_focuses().is_empty());
+    let world = harness.world();
+    assert_eq!(window_row(world, 0), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 1), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 2), Some((FIRST, 0)));
+    assert!(!share_a_tab_column(world, &[0, 1]));
+    assert_eq!(focused_windows(world), vec![2]);
+    assert!(!any_space_move_pending(world));
+}
+
+#[test]
+fn spacesend_of_parent_and_last_managed_child_stays_on_empty_source() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(2);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
+
+    assert_eq!(harness.mock_state.window_workspace(0), SECOND);
+    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), FIRST);
+    assert!(harness.mock_state.native_space_focuses().is_empty());
+    let world = harness.world();
+    assert_eq!(window_row(world, 0), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 1), Some((SECOND, 0)));
+    assert!(!share_a_tab_column(world, &[0, 1]));
+    assert!(rows_of(world, FIRST)[0].2.is_empty());
+    assert!(focused_windows(world).is_empty());
+    assert_eq!(ecs_active_workspaces(world), vec![FIRST]);
+}
+
+#[test]
+fn spacesend_keeps_native_tabs_separate_from_their_managed_child() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(2);
+    boot(&mut harness);
+    let frame = window_frame(harness.world(), 0);
+    let tab = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, FIRST, 2, frame);
+    harness.mock_state.merge_native_tabs(&[0, 2], 2);
+    harness.world().trigger(SpawnWindowTrigger(vec![tab]));
+    harness.run(vec![print_state()]);
+    assert!(share_a_tab_column(harness.world(), &[0, 2]));
+    harness.mock_state.associate_window(2, 1);
+    harness.mock_state.focus_window(2);
+    harness.advance(NATIVE_REACTION);
+
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
+
+    for id in [0, 1, 2] {
+        assert_eq!(window_row(harness.world(), id), Some((SECOND, 0)));
+    }
+    assert_eq!(harness.mock_state.window_memberships(0), vec![SECOND]);
+    assert_eq!(harness.mock_state.window_memberships(1), vec![SECOND]);
+    assert_eq!(harness.mock_state.window_memberships(2), vec![SECOND]);
+    let world = harness.world();
+    assert!(share_a_tab_column(world, &[0, 2]));
+    assert!(!share_a_tab_column(world, &[0, 1, 2]));
+    assert!(rows_of(world, FIRST)[0].2.is_empty());
+    assert!(focused_windows(world).is_empty());
+    assert_eq!(ecs_active_workspaces(world), vec![FIRST]);
+}
+
+#[test]
+fn partial_move_reconciles_only_the_managed_child_that_landed_without_following() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Follow)]);
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+
+    // Only the independently movable child reaches the target. The parent
+    // remains live on the source through the native confirmation deadline.
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = SECOND);
+    harness.advance(NATIVE_DEADLINE);
+
+    assert_eq!(harness.mock_state.window_workspace(0), FIRST);
+    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), FIRST);
+    assert!(harness.mock_state.native_space_focuses().is_empty());
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+    let world = harness.world();
+    assert_eq!(window_row(world, 0), Some((FIRST, 0)));
+    assert_eq!(window_row(world, 1), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 2), Some((FIRST, 0)));
+    assert_eq!(focused_windows(world), vec![2]);
+    assert!(!any_space_move_pending(world));
+    assert_eq!(ecs_active_workspaces(world), vec![FIRST]);
+}
+
+#[test]
+fn closing_move_leader_reconciles_surviving_child_without_following_or_focusing_it() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Follow)]);
+
+    harness.mock_state.os_close_window(0);
+    harness.advance(NATIVE_REACTION);
+    assert!(window_entity(harness.world(), 0).is_none());
+    assert_eq!(window_row(harness.world(), 1), Some((FIRST, 0)));
+    assert_eq!(focused_windows(harness.world()), vec![2]);
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+
+    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), FIRST);
+    assert!(harness.mock_state.native_space_focuses().is_empty());
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+    let world = harness.world();
+    assert_eq!(window_row(world, 1), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 2), Some((FIRST, 0)));
+    assert_eq!(focused_windows(world), vec![2]);
+    assert!(!any_space_move_pending(world));
+}
+
+#[test]
+fn closing_move_leader_does_not_restart_the_surviving_child_deadline() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    let submitted_at = harness.world().resource::<Time>().elapsed();
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Follow)]);
+    harness.advance(Duration::from_secs(1));
+    harness.mock_state.os_close_window(0);
+    harness.advance(NATIVE_REACTION);
+
+    let remaining = (submitted_at + NATIVE_DEADLINE)
+        .saturating_sub(harness.world().resource::<Time>().elapsed());
+    harness.advance(remaining);
+    assert_eq!(harness.mock_state.window_workspace(1), FIRST);
+    assert_eq!(window_row(harness.world(), 1), Some((FIRST, 0)));
+    assert!(!any_space_move_pending(harness.world()));
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+    assert!(harness.mock_state.native_space_focuses().is_empty());
+
+    // The expired handoff no longer blocks independent native commands.
+    harness.run(vec![create()]);
+    let created = created_space(&harness);
+    assert_eq!(rows_of(harness.world(), created).len(), 1);
+}
+
+#[test]
+fn closing_move_leader_preserves_submitted_activation_without_focusing_its_child() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_activation_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Follow)]);
+    assert_eq!(window_row(harness.world(), 1), Some((SECOND, 0)));
+    assert_eq!(harness.mock_state.native_space_focuses(), vec![SECOND]);
+
+    harness.mock_state.focus_window(2);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.os_close_window(0);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), SECOND);
+    assert_eq!(harness.mock_state.native_space_focuses(), vec![SECOND]);
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+    let world = harness.world();
+    assert_eq!(window_row(world, 1), Some((SECOND, 0)));
+    assert_eq!(focused_windows(world), vec![2]);
+    assert!(!any_space_move_pending(world));
+    assert!(!native_switch_pending(world));
+}
+
+#[test]
+fn managed_child_closing_in_flight_leaves_no_slot_or_focus_after_parent_lands() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(3);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
+    let child = find_window_entity(1, harness.world());
+
+    harness.mock_state.os_close_window(1);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+
+    assert_eq!(harness.mock_state.window_workspace(0), SECOND);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), FIRST);
+    assert!(harness.mock_state.native_space_focuses().is_empty());
+    let world = harness.world();
+    assert!(window_entity(world, 1).is_none());
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .all(|strip| !strip.contains(child))
+    );
+    assert_eq!(window_row(world, 0), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 2), Some((FIRST, 0)));
+    assert_eq!(focused_windows(world), vec![2]);
+    assert!(!any_space_move_pending(world));
+}
+
+#[test]
+fn managed_children_keep_in_flight_mode_changes_and_resume_on_destination() {
+    let mut harness = display_with(vec![FIRST, SECOND]).with_windows(4);
+    boot(&mut harness);
+    harness.mock_state.associate_window(0, 1);
+    harness.mock_state.associate_window(0, 2);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Stay)]);
+
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    harness.run(vec![toggle_float()]);
+    harness.mock_state.os_minimize_window(1, true);
+    harness.mock_state.os_minimize_window(2, true);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+
+    for id in [0, 1, 2] {
+        assert_eq!(harness.mock_state.window_workspace(id), SECOND);
+    }
+    let world = harness.world();
+    assert_eq!(window_row(world, 0), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 1), None);
+    assert_eq!(window_row(world, 2), None);
+    assert!(is_floating(world, 1));
+    assert!(!is_floating(world, 2));
+    for id in [1, 2] {
+        let entity = find_window_entity(id, world);
+        assert!(world.entity(entity).contains::<MinimizedMarker>());
+    }
+
+    harness.mock_state.os_minimize_window(1, false);
+    harness.mock_state.os_minimize_window(2, false);
+    harness.advance(NATIVE_REACTION);
+
+    let world = harness.world();
+    assert!(is_floating(world, 1));
+    assert_eq!(window_row(world, 1), None);
+    assert!(!is_floating(world, 2));
+    assert_eq!(window_row(world, 2), Some((SECOND, 0)));
+    assert_eq!(window_row(world, 3), Some((FIRST, 0)));
+    assert!(!share_a_tab_column(world, &[0, 2]));
 }
 
 #[test]
@@ -2030,10 +2475,7 @@ fn floating_window_stays_floating_across_a_spacesend() {
     let mut harness = display_with(vec![FIRST, SECOND]).with_windows(2);
     boot(&mut harness);
     let entity = find_window_entity(0, harness.world());
-    harness
-        .world()
-        .entity_mut(entity)
-        .insert(Unmanaged::Floating);
+    harness.world().entity_mut(entity).insert(FloatingMarker);
     harness.advance(NATIVE_REACTION);
     harness.mock_state.focus_window(0);
     harness.advance(NATIVE_REACTION);
@@ -2261,6 +2703,44 @@ fn spacemove_of_a_follower_with_an_unmovable_sheet_switches_nothing() {
     assert!(!native_switch_pending(world));
     assert_eq!(ecs_active_workspaces(world), vec![FIRST]);
     assert_focused!(world, 0);
+}
+
+#[test]
+fn spacemove_owns_a_managed_follower_child_while_the_user_switches_away() {
+    let mut harness = display_with(vec![FIRST, SECOND, THIRD]).with_windows(2);
+    boot(&mut harness);
+    harness.mock_state.focus_window(1);
+    harness.advance(NATIVE_REACTION);
+    harness.run(vec![toggle_float(), follow(true)]);
+    harness.mock_state.focus_window(0);
+    harness.advance(NATIVE_REACTION);
+    harness.mock_state.associate_window(0, 1);
+    harness
+        .mock_state
+        .set_native_move_outcome(NativeRequestOutcome::Deferred);
+
+    harness.run(vec![space_move(SpaceSelector::Next, MoveFocus::Follow)]);
+    user_switches_native_space(&mut harness, THIRD);
+    harness.advance(NATIVE_REACTION);
+    assert_eq!(harness.mock_state.window_workspace(0), FIRST);
+    assert_eq!(harness.mock_state.window_workspace(1), FIRST);
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+    assert_eq!(ecs_active_workspaces(harness.world()), vec![THIRD]);
+
+    harness.mock_state.settle_native_requests();
+    harness.advance(NATIVE_REACTION);
+
+    assert_eq!(harness.mock_state.window_workspace(0), SECOND);
+    assert_eq!(harness.mock_state.window_workspace(1), SECOND);
+    assert_eq!(harness.mock_state.active_workspace(TEST_DISPLAY_ID), SECOND);
+    assert_eq!(harness.mock_state.workspace_moves().len(), 1);
+    let world = harness.world();
+    assert_eq!(window_row(world, 0), Some((SECOND, 0)));
+    assert!(is_floating(world, 1));
+    assert!(is_follower(world, 1));
+    assert_eq!(window_row(world, 1), None);
+    assert_eq!(focused_windows(world), vec![0]);
+    assert!(!any_space_move_pending(world));
 }
 
 #[test]

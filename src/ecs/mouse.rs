@@ -34,7 +34,7 @@ pub struct MouseEventsPlugin;
 impl Plugin for MouseEventsPlugin {
     fn build(&self, app: &mut App) {
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
-            mission_control.is_none_or(|active| !active.0)
+            mission_control.is_none_or(|active| !active.blocks_mutations())
         };
 
         // `run_if` also skips fetching each system's parameters (Windows

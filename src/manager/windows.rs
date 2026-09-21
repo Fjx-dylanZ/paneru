@@ -1,8 +1,8 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
-    kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef, AXValueCreate,
+    AXValueGetValue, kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction,
+    kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -10,8 +10,8 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
-    kCFBooleanFalse, kCFBooleanTrue,
+    CFArray, CFBoolean, CFGetTypeID, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect,
+    CGSize, kCFBooleanFalse, kCFBooleanTrue,
 };
 use std::collections::{HashMap, HashSet};
 use std::ptr::null_mut;
@@ -75,12 +75,23 @@ pub enum WindowPadding {
     Horizontal(i32),
 }
 
+/// A fresh native titlebar tab observation. AX tab buttons identify the selected
+/// window, not the inactive `NSWindows`; callers must resolve titles conservatively.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeTabSnapshot {
+    pub titles: Vec<String>,
+    pub selected: usize,
+}
+
 #[automock]
 pub trait WindowApi: Send + Sync {
     fn id(&self) -> WinID;
     fn frame(&self) -> IRect;
     fn element(&self) -> Option<CFRetained<AXUIWrapper>>;
     fn title(&self) -> Result<String>;
+    /// `None` is a complete observation without a native titlebar tab group.
+    /// Unreadable or malformed AX data is an error, never evidence of detachment.
+    fn native_tab_snapshot(&self) -> Result<Option<NativeTabSnapshot>>;
     /// Drops the cached title so the next [`Self::title`] reads it afresh.
     /// Called when the app reports the title changed.
     fn invalidate_title(&self);
@@ -490,6 +501,57 @@ impl WindowOS {
     }
 }
 
+fn tab_attribute(
+    element: &CFRetained<AXUIWrapper>,
+    window_id: WinID,
+    name: &'static str,
+) -> Result<CFRetained<CFType>> {
+    element
+        .get_attribute::<CFType>(&CFString::from_static_str(name))
+        .map_err(|err| Error::Generic(format!("window {window_id} native tab {name}: {err}")))
+}
+
+fn tab_string(
+    element: &CFRetained<AXUIWrapper>,
+    window_id: WinID,
+    name: &'static str,
+) -> Result<String> {
+    tab_attribute(element, window_id, name)?
+        .downcast_ref::<CFString>()
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            Error::Generic(format!(
+                "window {window_id} native tab {name} is not a string"
+            ))
+        })
+}
+
+fn tab_elements(
+    element: &CFRetained<AXUIWrapper>,
+    window_id: WinID,
+    name: &'static str,
+) -> Result<Vec<CFRetained<AXUIWrapper>>> {
+    let value = tab_attribute(element, window_id, name)?;
+    let array = value.downcast_ref::<CFArray>().ok_or_else(|| {
+        Error::Generic(format!(
+            "window {window_id} native tab {name} is not an array"
+        ))
+    })?;
+    // The array and every element are checked before casting an AX reference.
+    let array = unsafe { array.cast_unchecked::<CFType>() };
+    array
+        .iter()
+        .map(|value| {
+            if CFGetTypeID(Some(&value)) != unsafe { AXUIElementGetTypeID() } {
+                return Err(Error::Generic(format!(
+                    "window {window_id} native tab {name} contains a non-AX element"
+                )));
+            }
+            AXUIWrapper::retain(NonNull::from(&*value).as_ptr())
+        })
+        .collect()
+}
+
 impl WindowApi for WindowOS {
     /// Returns the ID of the window.
     ///
@@ -527,13 +589,76 @@ impl WindowApi for WindowOS {
         if let Some(cached) = self.title.force_read().clone() {
             return Ok(cached);
         }
-        let title = self.ax_element.title()?;
+        let title = self
+            .ax_element
+            .title()
+            .map_err(|err| Error::Generic(format!("window {} AXTitle: {err}", self.id)))?;
         *self.title.force_write() = Some(title.clone());
         Ok(title)
     }
 
     fn invalidate_title(&self) {
         self.title.force_write().take();
+    }
+
+    fn native_tab_snapshot(&self) -> Result<Option<NativeTabSnapshot>> {
+        if objc2::MainThreadMarker::new().is_none() {
+            return Err(Error::Generic(
+                "native tab observation requires the main thread".into(),
+            ));
+        }
+        if tab_string(&self.ax_element, self.id, "AXRole")? != "AXWindow" {
+            return Ok(None);
+        }
+        let mut snapshot = None;
+        // Only direct AXWindow children count. Never recurse into web/content tabs.
+        for child in tab_elements(&self.ax_element, self.id, "AXChildren")? {
+            if tab_string(&child, self.id, "AXRole")? != "AXTabGroup" {
+                continue;
+            }
+            if tab_string(&child, self.id, "AXTitle")? != "tab bar" {
+                continue;
+            }
+            if snapshot.is_some() {
+                return Err(Error::Generic("multiple native titlebar tab groups".into()));
+            }
+            let tabs = tab_elements(&child, self.id, "AXTabs")?;
+            if tabs.is_empty() {
+                return Err(Error::Generic("native titlebar tab group is empty".into()));
+            }
+            let selected_value = tab_attribute(&child, self.id, "AXValue")?;
+            if CFGetTypeID(Some(&selected_value)) != unsafe { AXUIElementGetTypeID() } {
+                return Err(Error::Generic(
+                    "native tab group selection is not an AX element".into(),
+                ));
+            }
+            let mut titles = Vec::with_capacity(tabs.len());
+            let mut selected = None;
+            for (index, tab) in tabs.iter().enumerate() {
+                if tab_string(tab, self.id, "AXRole")? != "AXRadioButton"
+                    || tab_string(tab, self.id, "AXSubrole")? != "AXTabButton"
+                    || ax_window_id(tab.as_ptr()).map_err(|err| {
+                        Error::Generic(format!("window {} native tab window ID: {err}", self.id))
+                    })? != self.id
+                {
+                    return Err(Error::Generic("invalid native titlebar tab button".into()));
+                }
+                titles.push(tab_string(tab, self.id, "AXTitle")?);
+                // The group identifies its selected AX element. AppKit can
+                // fail AXValue reads on inactive buttons across processes;
+                // a failed button read is not evidence of a false value.
+                let candidate = unsafe { &*tab.as_ptr::<CFType>() };
+                if objc2_core_foundation::CFEqual(Some(&selected_value), Some(candidate))
+                    && selected.replace(index).is_some()
+                {
+                    return Err(Error::Generic("multiple selected native tabs".into()));
+                }
+            }
+            let selected =
+                selected.ok_or_else(|| Error::Generic("no selected native tab".into()))?;
+            snapshot = Some(NativeTabSnapshot { titles, selected });
+        }
+        Ok(snapshot)
     }
 
     fn identifier(&self) -> Result<String> {

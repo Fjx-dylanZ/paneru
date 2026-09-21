@@ -211,10 +211,23 @@ or fail transiently while macOS converges; query again once it has settled.
 | `app_name` | string | Display name for the owning application, or an empty string if unknown. |
 | `title` | string | Window title, or an empty string if unknown. |
 | `focused` | boolean | Whether this window is focused. |
-| `floating` | boolean | Whether this window is unmanaged/floating. |
+| `floating` | boolean | Persistent floating mode; remains true while a floating window is minimized or its application is hidden. |
 
 Paneru may include empty `windows` arrays for missing virtual workspace numbers
 inside a native workspace so integrations can render stable numbered slots.
+
+Minimized and application-hidden windows are not reported visible or focused.
+Unhiding an application does not imply that its minimized windows were restored.
+Inactive members of an identified native tab group remain in the logical row,
+but are also reported invisible and unfocused, even when macOS still lists
+their backing windows as ordered in.
+
+A confirmed-destroyed native Space can retain a last-known virtual row while
+Paneru cannot establish where one of its windows went. Queries preserve that
+row and its window metadata, but report it inactive and its windows invisible
+and unfocused. This does not mean the native Space still exists; use the native
+census for topology. A native enumeration failure for a present Space remains
+an error.
 
 ## Subscribe Command
 

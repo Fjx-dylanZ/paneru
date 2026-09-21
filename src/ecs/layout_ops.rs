@@ -19,9 +19,10 @@ use crate::commands::{Command, MoveFocus, Operation};
 use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
-use crate::ecs::workspace::VirtualMoveMarker;
+use crate::ecs::workspace::{FollowSpacePending, VirtualMoveMarker};
 use crate::ecs::{
-    ActiveWorkspaceMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, Window,
+    ActiveWorkspaceMarker, FloatingMarker, FollowCurrentWorkspaceMarker, SendMessageTrigger,
+    SpawnCommandsExt, WidthRatio, Window,
 };
 use crate::events::Event;
 use crate::manager::{Origin, Size};
@@ -44,7 +45,7 @@ pub(crate) fn apply_layout_ops(
         .collect();
 
     for ops in batches {
-        // `Unmanaged` inserts don't take effect until commands flush, so track
+        // Marker inserts don't take effect until commands flush, so track
         // what this batch floated to tell a just-floated window from one still
         // genuinely tiled (needed by `SetFrame`).
         let mut floated: HashSet<Entity> = HashSet::new();
@@ -146,7 +147,7 @@ fn apply(
             } else {
                 floated.remove(&entity);
             }
-            set_floating(entity, floating, workspaces, commands);
+            set_floating(entity, floating, commands);
         }
 
         LayoutOp::SetManaged { managed, .. } => {
@@ -156,7 +157,7 @@ fn apply(
             } else {
                 floated.insert(entity);
             }
-            set_floating(entity, !managed, workspaces, commands);
+            set_floating(entity, !managed, commands);
         }
 
         LayoutOp::SetWidth { ratio, .. } => {
@@ -211,7 +212,7 @@ fn apply(
             if !floated.contains(&entity)
                 && windows
                     .get_managed(entity)
-                    .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+                    .is_some_and(|(_, _, flags)| flags.is_tiled())
             {
                 debug!(
                     target: "paneru::lua",
@@ -261,28 +262,17 @@ fn apply(
     }
 }
 
-/// Takes a window out of the tiling layout or puts it back. Mirrors
-/// `manage_window`: floating→tiled has to re-append the window to a strip
-/// itself, since nothing downstream does it automatically.
-fn set_floating(
-    entity: Entity,
-    floating: bool,
-    workspaces: &mut Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>), Without<Window>>,
-    commands: &mut Commands,
-) {
+/// Updates persistent layout intent. State observers detach floating windows
+/// and restore tiled windows only when neither visibility flag is present.
+fn set_floating(entity: Entity, floating: bool, commands: &mut Commands) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if floating {
-            entity_commands.try_insert(Unmanaged::Floating);
+            entity_commands.try_insert(FloatingMarker);
         } else {
-            entity_commands.try_remove::<Unmanaged>();
+            entity_commands
+                .try_remove::<FollowCurrentWorkspaceMarker>()
+                .try_remove::<FollowSpacePending>()
+                .try_remove::<FloatingMarker>();
         }
-    }
-
-    if !floating
-        && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
-        && let Some((mut strip, _)) = workspaces.iter_mut().find(|(_, active)| *active)
-    {
-        strip.append(entity);
-        commands.reshuffle_around(entity);
     }
 }

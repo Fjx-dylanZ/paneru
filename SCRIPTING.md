@@ -243,6 +243,11 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:next(id)` / `ws:prev(id)` | The next/previous window, wrapping |
 
 A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `managed`, `visible` and `focused`.
+`floating` records persistent mode, including while minimized or hidden.
+`managed` means currently participating in tiling: suspension can make both
+`floating` and `managed` false for a tiled window. Suspended windows and inactive
+native tabs are not reported visible or focused. Native tab members remain in
+their logical workspace across selection changes.
 
 `paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
 
@@ -303,9 +308,12 @@ Every `target` is the scalar `space focus` takes: `"next"`, `"prev"` (or `"previ
 | `paneru.space.focus(target)` | `space focus <target>` | Switch to a native Space. |
 | `paneru.space.create()` | `space create` | Create a new Desktop without switching to it. |
 | `paneru.space.destroy(target[, migrate])` | `space destroy <target> [migrate]` | Destroy a Desktop. `migrate` defaults to `false`: a Desktop that still holds application windows is refused. `true` opts into macOS's native migration; Paneru reconciles the observed memberships without closing windows or issuing a manual migration loop. |
-| `paneru.space.move_window(target[, follow])` | `window spacemove <target>` / `window spacesend <target>` | Move the focused window, with its native tab group, to a Space. `follow` defaults to `true` (switch along with it); `false` stays where you are, even when it was the last window on the current Space. |
+| `paneru.space.move_window(target[, follow])` | `window spacemove <target>` / `window spacesend <target>` | Move the focused window, every resolved native tab, and associated children to a Space. Children retain independent slots and mode. `follow` defaults to `true`; `false` stays on the source even if it becomes empty. Only a fully confirmed batch can follow. |
 
-The optional flags must be real booleans: `paneru.space.destroy(3, "migrate")` and `paneru.space.move_window(2, 0)` raise rather than being coerced by Lua truthiness into "yes". Destruction is refused for the Space currently shown on any display, the last Desktop of its display, and anything that is not an ordinary Desktop; `migrate` lifts only the occupancy guard. Hidden or sticky application windows can keep an apparently empty Desktop occupied, so know what is on it before reaching for `migrate`.
+The optional flags must be real booleans: `paneru.space.destroy(3, "migrate")` and `paneru.space.move_window(2, 0)` raise rather than being coerced by Lua truthiness into "yes". Destruction is refused for the Space currently shown on any display, the last Desktop of its display, and anything that is not an ordinary Desktop; `migrate` lifts only the occupancy guard. Migration also refuses hidden applications and attached window groups because macOS can orphan their windows: unhide the app or explicitly move the group elsewhere first. Hidden or sticky application windows can keep an apparently empty Desktop occupied.
+Native mutations also refuse active or unverifiable Mission Control/App Exposé/
+Show Desktop state. Native tab movement requires unambiguous, resolved window
+identities; visit unexposed startup tabs before moving their group.
 
 ```lua
 paneru.bind("ctrl + alt - n",         function() paneru.space.create() end)

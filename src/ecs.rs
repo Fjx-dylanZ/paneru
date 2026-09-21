@@ -47,6 +47,7 @@ pub mod layout;
 pub mod layout_ops;
 pub mod mouse;
 pub mod native_spaces;
+pub(crate) mod native_tabs;
 pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
@@ -109,9 +110,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Native Space lifecycle and explicit moves ride along here rather than
     // in `setup_bevy_app` so the mock harness, which composes the same
     // registration functions, drives them too.
-    app.add_plugins(native_spaces::NativeSpacesPlugin);
-    let native_tabs_enabled =
-        |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
+    app.add_plugins((
+        native_spaces::NativeSpacesPlugin,
+        native_tabs::NativeTabsPlugin,
+    ));
 
     app.add_systems(
         Startup,
@@ -131,6 +133,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::window_creation_event,
             systems::pump_events,
             systems::demux_input_events.after(systems::pump_events),
+            triggers::mission_control_trigger
+                .after(systems::pump_events)
+                .before(crate::commands::command_focus_native_space),
+            triggers::invalidate_window_title
+                .after(systems::pump_events)
+                .before(native_tabs::reconcile_native_tabs),
         ),
     );
     app.add_systems(
@@ -138,7 +146,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
         (
             (
                 triggers::apply_window_defaults,
-                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
             )
                 .chain()
@@ -155,10 +162,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
             workspace::cleanup_unordered_windows
-                .run_if(not(resource_exists::<Initializing>))
-                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
-            systems::regroup_stray_native_tabs
-                .run_if(native_tabs_enabled)
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::auto_discover_unmanaged_focused_windows,
@@ -216,18 +219,17 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         (
             triggers::front_switched_trigger,
             triggers::window_focused_trigger,
-            triggers::mission_control_trigger,
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
             triggers::window_destroyed_trigger,
-            triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
             triggers::window_resize_verifier,
         ),
     );
-    app.add_observer(triggers::window_unmanaged_trigger)
+    app.add_observer(triggers::window_floating_trigger)
         .add_observer(triggers::window_managed_trigger)
+        .add_observer(triggers::window_state_removed_trigger)
         .add_observer(triggers::window_minimized_trigger)
         .add_observer(triggers::spawn_window_trigger)
         .add_observer(triggers::send_message_trigger)
@@ -357,16 +359,17 @@ pub struct FullWidthMarker {
     pub width_ratio: f64,
 }
 
-/// Enum component indicating the unmanaged state of a window.
-#[derive(Component, Debug)]
-pub enum Unmanaged {
-    /// The window is floating and not part of the tiling layout.
-    Floating,
-    /// The window is minimized.
-    Minimized,
-    /// The window is hidden.
-    Hidden,
-}
+/// Persistent floating intent, independent of whether the window is visible.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct FloatingMarker;
+
+/// The window is minimized and does not participate in tiling or focus.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct MinimizedMarker;
+
+/// The owning application is hidden. May coexist with minimization.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct HiddenMarker;
 
 #[derive(Clone, Component, Copy, Debug)]
 pub struct PreviousManagedStrip {
@@ -484,9 +487,15 @@ pub struct SkipReshuffle(pub bool);
 #[derive(Component)]
 pub struct MouseHeldMarker(pub Entity);
 
-/// Resource indicating whether Mission Control is currently active.
+/// Last Mission Control observation; unknown blocks mutations until refreshed.
 #[derive(Resource)]
-pub struct MissionControlActive(pub bool);
+pub struct MissionControlActive(pub Option<bool>);
+
+impl MissionControlActive {
+    pub fn blocks_mutations(&self) -> bool {
+        self.0 != Some(false)
+    }
+}
 
 /// Resource holding the `WinID` of a window that should gain focus when focus-follows-mouse is enabled.
 #[derive(Resource)]
@@ -841,7 +850,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(SystemTheme {
             is_dark: crate::util::is_dark_mode(),
         })
-        .insert_resource(MissionControlActive(false))
+        .insert_resource(MissionControlActive(None))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(InstantSpaceSwitch::default())
         .insert_resource(Initializing)

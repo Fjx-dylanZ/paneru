@@ -26,6 +26,7 @@ use crate::platform::process::PinnedProcessHandler;
 use display::DisplayHandler;
 use input::InputHandler;
 use mission_control::MissionControlHandler;
+pub use mission_control::mission_control_is_active;
 use process::ProcessHandler;
 pub use process::ProcessSerialNumber;
 pub use workspace::WorkspaceObserver;
@@ -331,7 +332,7 @@ impl PlatformCallbacks {
         self.process_handler = Some(
             ProcessHandler::new(self.events.clone(), self.workspace_observer.clone()).start()?,
         );
-        self.mission_control_observer.observe()?;
+        self.mission_control_observer.observe();
         self.workspace_observer.start();
 
         self.events.send(Event::ProcessesLoaded)
@@ -348,10 +349,18 @@ impl PlatformCallbacks {
         unsafe { handler.as_mut().get_unchecked_mut() }.ensure_tap_alive()
     }
 
+    /// Refresh before publishing a pump batch so command consumers see the
+    /// current observation. Active/unknown idle states use a bounded cadence;
+    /// known-inactive idle performs no Mission Control queries.
+    pub fn refresh_mission_control(&mut self, activity: bool) -> Option<Event> {
+        self.mission_control_observer.refresh(activity)
+    }
+
     /// Returns `true` when at least one event was dispatched this pass.
     pub fn pump_cocoa_event_loop(&mut self, timeout: f64) -> bool {
         // Re-armed before the wait, not after it — see [`EventLoopWaker::rearm`].
         self.events.waker().rearm();
+        let timeout = self.mission_control_observer.limit_wait(timeout);
 
         autoreleasepool(|_| {
             // Only the *first* dequeue may block. Once something has arrived,

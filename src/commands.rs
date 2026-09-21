@@ -21,13 +21,13 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
 use crate::ecs::native_spaces::NativeInFlight;
-use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
+use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, WindowStateData, Windows};
 use crate::ecs::workspace::FollowSpacePending;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FollowCurrentWorkspaceMarker, FullWidthMarker, InstantSpaceSwitch, ManualStripOffset,
-    MissionControlActive, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FloatingMarker,
+    FocusedMarker, FollowCurrentWorkspaceMarker, FullWidthMarker, InstantSpaceSwitch,
+    ManualStripOffset, MissionControlActive, NativeFullscreenMarker, RaiseWindow,
+    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout,
 };
 use crate::errors::Error;
 use crate::events::Event;
@@ -190,8 +190,8 @@ pub(crate) fn command_focus_native_space(
         };
         Some(*selector)
     }) {
-        if mission_control.0 {
-            warn!("native Space focus is unavailable during Mission Control");
+        if mission_control.blocks_mutations() {
+            warn!("native Space focus is unavailable while Mission Control is active or unknown");
             continue;
         }
         let now = time.elapsed();
@@ -344,10 +344,8 @@ fn visible_floating_entities(
     windows
         .iter()
         .filter_map(|(_, entity)| {
-            let (window, _, Some(Unmanaged::Floating)) = windows.get_managed(entity)? else {
-                return None;
-            };
-            if !workspace_window_ids.contains(&window.id()) {
+            let (window, _, flags) = windows.get_managed(entity)?;
+            if !flags.is_floating() || !workspace_window_ids.contains(&window.id()) {
                 return None;
             }
             let frame = windows.frame(entity)?;
@@ -433,7 +431,9 @@ fn command_move_focus(
         return;
     };
 
-    if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity)
+    if windows
+        .get_managed(focused_entity)
+        .is_some_and(|(_, _, flags)| flags.is_floating())
         && !matches!(direction, Direction::Nth(_))
     {
         if let Some(entity) = nearest_float_in_direction(
@@ -909,7 +909,7 @@ fn mark_manual_offset(
 /// `Operation::Swap` messages as `command_swap_focus`, so the `window_swap_*`
 /// keybinds serve both tiers. The two handlers are disjoint by window state:
 /// swap requires tiling-column membership, while this one requires
-/// `Unmanaged::Floating`, which is detached from those columns.
+/// a visible `FloatingMarker` window, detached from those columns.
 ///
 /// The step is `float_move_step` of the viewport width (east/west) or height
 /// (north/south); `First`/`Last` snap to the left/right viewport edge. The
@@ -932,12 +932,15 @@ fn command_move_floating(
         return;
     };
 
-    let Some((_, entity, Some(Unmanaged::Floating))) = windows
+    let Some((_, entity, flags)) = windows
         .focused()
         .and_then(|(_, entity)| windows.get_managed(entity))
     else {
         return;
     };
+    if !flags.is_floating() {
+        return;
+    }
     let Some(frame) = windows.moving_frame(entity) else {
         return;
     };
@@ -1274,19 +1277,18 @@ fn full_width_window(
     }
 }
 
-/// Toggles the managed state of the focused window.
-/// If the window is currently unmanaged, it becomes managed. If managed, it becomes unmanaged (floating).
+/// Toggles the persistent tiled/floating intent of the focused window.
 ///
-/// # Arguments
+/// Visibility flags remain untouched; the state observer restores tiling
+/// only after the window is no longer suspended.
 ///
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
+/// * `windows` - Window handles and their mode/visibility flags.
 /// * `commands` - Bevy commands to modify entities.
 fn manage_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    focused: Query<Entity, With<FocusedMarker>>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Manage))
@@ -1296,48 +1298,31 @@ fn manage_window(
         return;
     }
 
-    let Some((window, entity, unmanaged)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
+    let Some((window, entity, flags)) = focused
+        .single()
+        .ok()
+        .and_then(|entity| windows.get_managed(entity))
     else {
         return;
     };
     debug!(
-        "window: {} {entity} unmanaged: {}.",
+        "window: {} {entity} floating: {}.",
         window.id(),
-        unmanaged.is_some()
+        flags.floating
     );
-    let was_unmanaged = unmanaged.is_some();
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if was_unmanaged {
+        if flags.floating {
             entity_commands
                 .try_remove::<FollowCurrentWorkspaceMarker>()
                 .try_remove::<FollowSpacePending>()
-                .try_remove::<Unmanaged>();
+                .try_remove::<FloatingMarker>();
         } else {
-            entity_commands.try_insert(Unmanaged::Floating);
+            entity_commands.try_insert(FloatingMarker);
         }
     }
 
-    if was_unmanaged && followed.contains(entity) {
+    if flags.floating && followed.contains(entity) {
         debug!("disabled follow while managing window {}", window.id());
-    }
-
-    // Going floating -> managed only flips the component. Nothing else in
-    // the pipeline reinserts the window into a strip, so if it had been
-    // stripped of membership (spawn-floating path in window_unmanaged_trigger
-    // strip.removes; orphan rescue in find_orphaned_workspaces despawns the
-    // strip) the toggle is invisible — the window stays where it floated
-    // and the user thinks the keybind is broken. Append to the active
-    // strip and reshuffle so the layout pipeline tiles it.
-    if was_unmanaged
-        && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
-        && let Some(mut strip) = workspaces
-            .iter_mut()
-            .find_map(|(strip, active)| active.then_some(strip))
-    {
-        strip.append(entity);
-        commands.reshuffle_around(entity);
     }
 }
 
@@ -1398,6 +1383,7 @@ fn follow_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     followed: Query<(), With<FollowCurrentWorkspaceMarker>>,
+    focused: Query<Entity, With<FocusedMarker>>,
     mut commands: Commands,
 ) {
     let Some(Operation::Follow(requested)) =
@@ -1406,7 +1392,11 @@ fn follow_window(
         return;
     };
 
-    let Some((window, entity)) = windows.focused() else {
+    let Some((window, entity, _)) = focused
+        .single()
+        .ok()
+        .and_then(|entity| windows.get_managed(entity))
+    else {
         return;
     };
     if window.is_full_screen() {
@@ -1422,7 +1412,7 @@ fn follow_window(
     if enable {
         if !currently_following {
             debug!("window {} will follow the current workspace", window.id());
-            entity_commands.try_insert((FollowCurrentWorkspaceMarker, Unmanaged::Floating));
+            entity_commands.try_insert((FollowCurrentWorkspaceMarker, FloatingMarker));
         }
     } else if currently_following {
         debug!(
@@ -1441,7 +1431,7 @@ fn follow_window(
 /// # Arguments
 ///
 /// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
+/// * `windows` - Window handles and their mode/visibility flags.
 /// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
 /// * `commands` - Bevy commands to modify entities and trigger events.
 fn to_next_display(
@@ -1468,7 +1458,7 @@ fn to_next_display(
     else {
         return;
     };
-    if unmanaged.is_some() {
+    if !unmanaged.is_tiled() {
         return;
     }
 
@@ -1771,7 +1761,7 @@ pub fn stack_windows_handler(
     if let Some((_, entity, unmanaged)) = windows
         .focused()
         .and_then(|(_, entity)| windows.get_managed(entity))
-        && unmanaged.is_none()
+        && unmanaged.is_tiled()
     {
         if windows.full_width(entity).is_some()
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -1817,7 +1807,7 @@ pub fn toggle_tabbed_display_handler(
     if let Some((_, entity, unmanaged)) = windows
         .focused()
         .and_then(|(_, entity)| windows.get_managed(entity))
-        && unmanaged.is_none()
+        && unmanaged.is_tiled()
     {
         let strip = active_display.active_strip();
         // `None` means the toggle wasn't applicable (not in a multi-window
@@ -1840,7 +1830,7 @@ pub fn toggle_tabbed_display_handler(
 /// # Arguments
 ///
 /// * `trigger` - The `On<CommandTrigger>` event trigger containing the command to process.
-/// * `windows` - A query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
+/// * `windows` - Window handles and their mode/visibility flags.
 /// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
 /// * `window_manager` - The `WindowManager` resource for interacting with the window management logic.
 /// * `commands` - Bevy commands to trigger events and modify entities.
@@ -1881,7 +1871,7 @@ pub fn command_restart_handler(mut messages: MessageReader<Event>) {
 fn print_internal_state_handler(
     mut messages: MessageReader<Event>,
     focused: Query<(&Window, Entity), With<FocusedMarker>>,
-    windows: Query<(&Window, Entity, &ChildOf, Option<&Unmanaged>)>,
+    windows: Query<WindowStateData>,
     apps: Query<&Application>,
     workspaces: StripsWithVisibility,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
@@ -1898,11 +1888,13 @@ fn print_internal_state_handler(
     }
 
     let focused = focused.single().ok();
-    let print_window = |(window, entity, child, unmanaged): (
+    let print_window = |(window, entity, child, floating, minimized, hidden): (
         &Window,
         Entity,
         &ChildOf,
-        Option<_>,
+        bool,
+        bool,
+        bool,
     )| {
         let bundle_id = apps
             .get(child.parent())
@@ -1910,18 +1902,17 @@ fn print_internal_state_handler(
             .and_then(|app| app.bundle_id())
             .unwrap_or_default();
         format!(
-            "\tid: {}, {entity}, {}:{}, {}x{}{}{}, bundle: {}, role: {}, subrole: {}, title: '{:.70}'",
+            "\tid: {}, {entity}, {}:{}, {}x{}{}, floating: {floating}, minimized: {minimized}, hidden: {hidden}, bundle: {}, role: {}, subrole: {}, title: '{:.70}'",
             window.id(),
             window.frame().min.x,
             window.frame().min.y,
             window.frame().width(),
             window.frame().height(),
-            if focused.is_some_and(|(_, focus)| focus == entity) {
+            if !minimized && !hidden && focused.is_some_and(|(_, focus)| focus == entity) {
                 ", focused"
             } else {
                 ""
             },
-            unmanaged.map(|m| format!(", {m:?}")).unwrap_or_default(),
             bundle_id,
             window.role().unwrap_or_default(),
             window.subrole().unwrap_or_default(),
@@ -1940,7 +1931,7 @@ fn print_internal_state_handler(
                 .all_windows()
                 .iter()
                 .filter_map(|entity| windows.get(*entity).ok())
-                .inspect(|(_, entity, _, _)| {
+                .inspect(|(_, entity, _, _, _, _)| {
                     seen.insert(*entity);
                 })
                 .map(print_window)

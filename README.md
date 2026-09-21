@@ -298,7 +298,7 @@ $ paneru send-cmd <command> [args...]
 | `space focus next\|prev`   | Focus the adjacent native macOS Space without wrapping |
 | `space focus <n>`          | Focus a native Space by global Mission Control number |
 | `space create`             | Create a new native Desktop without switching to it |
-| `space destroy <next\|prev\|n> [migrate]` | Destroy an inactive, non-last native Desktop; `migrate` lets macOS move its windows |
+| `space destroy <next\|prev\|n> [migrate]` | Destroy an inactive, non-last native Desktop; migration refuses hidden apps and attached window groups |
 | `window spacemove <next\|prev\|n>` | Move the focused window to a native Space and follow it |
 | `window spacesend <next\|prev\|n>` | Send the focused window to a native Space but stay here |
 | `window snap`              | Snap the focused window into the visible viewport |
@@ -365,7 +365,7 @@ $ paneru send-cmd window spacesend prev
 # Destroy native Space 3 once it is empty and not shown on any display...
 $ paneru send-cmd space destroy 3
 
-# ...or let macOS migrate its remaining windows itself.
+# ...or let macOS migrate eligible windows (unhide apps and move attached groups first).
 $ paneru send-cmd space destroy 3 migrate
 
 # send-cmd only reports that the daemon accepted the request; confirm the

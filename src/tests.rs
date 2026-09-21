@@ -4,6 +4,7 @@ mod harness;
 mod interaction;
 mod mocks;
 mod native_spaces;
+mod native_tabs;
 mod session_restore;
 mod state;
 mod tabbed_display;

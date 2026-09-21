@@ -179,6 +179,8 @@ pub enum Event {
     MissionControlShowDesktop,
     /// Mission Control: Exit.
     MissionControlExit,
+    /// Mission Control could not be authoritatively observed; suspend mutations.
+    MissionControlStateUnknown,
 
     /// Dock preferences have changed.
     DockDidChangePref { msg: String },

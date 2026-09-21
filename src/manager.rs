@@ -17,6 +17,7 @@ use objc2_core_graphics::{
     CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
 };
 use paneru_shared_types::state::NativeSpaceState;
+use std::collections::HashSet;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
@@ -51,7 +52,7 @@ pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_
 #[cfg(test)]
 pub use process::MockProcessApi;
 #[cfg(test)]
-pub use windows::MockWindowApi;
+pub use windows::{MockWindowApi, NativeTabSnapshot};
 
 pub(crate) mod app;
 mod display;
@@ -152,9 +153,10 @@ pub trait WindowManagerApi: Send + Sync {
     /// its display, is its display's last ordinary Desktop, is not a Desktop,
     /// or, unless `migrate`, hosts any normal, floating or modal application
     /// window (minimized included; a window whose metadata cannot be read
-    /// counts as present). `migrate` lifts only that occupancy guard: macOS
-    /// migrates the windows to the current Desktop itself; no window is moved
-    /// or closed here.
+    /// counts as present). Migration additionally refuses hidden applications
+    /// and attached window groups because macOS can orphan their windows.
+    /// Unhide the application or explicitly move the group elsewhere first.
+    /// macOS performs migration; no window is moved, unhidden or closed here.
     ///
     /// `Ok(windows)` means the request was submitted, not applied, and
     /// returns the application windows sampled on the Space by the preflight.
@@ -192,6 +194,10 @@ pub trait WindowManagerApi: Send + Sync {
     /// from the window list. `Ok(false)` is definitive absence; a lookup that
     /// cannot be completed is an error, never absence.
     fn window_exists(&self, window_id: WinID) -> Result<bool>;
+    /// A fresh, fully validated census of live window IDs, on and off screen.
+    /// One session check and one global window-list read serve the entire batch.
+    /// Keep it local to one observation; never reuse it to confirm a later mutation.
+    fn window_census(&self) -> Result<HashSet<WinID>>;
     /// Returns whether `workspace_id` is the current Space of the display that
     /// owns it, independent of which display holds the menu bar. Errors when
     /// no present display owns the Space.
@@ -245,7 +251,7 @@ pub trait WindowManagerApi: Send + Sync {
     /// `Ok(Vec<WinID>)` containing the list of window IDs, otherwise `Err(Error)`.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
     /// Returns `true` when a window is no longer ordered into the window list.
-    fn window_is_unordered(&self, window_id: WinID) -> bool;
+    fn window_is_unordered(&self, window_id: WinID) -> Result<bool>;
 
     /// Submits one native request assigning every window in `windows` to
     /// exactly `workspace_id`.
@@ -255,8 +261,15 @@ pub trait WindowManagerApi: Send + Sync {
     /// [`Self::window_workspaces`] and must not resubmit while the request is
     /// merely unobserved. `Error::NativeSpaceRequest` reports whether a
     /// failed request may nevertheless have applied.
-    fn move_windows_to_workspace(&self, windows: &[WinID], workspace_id: WorkspaceId)
-    -> Result<()>;
+    /// `inactive_tabs` is a subset with freshly verified native titlebar identity.
+    /// Such live, ordered-out application windows may have no Space yet; they
+    /// must still be assigned explicitly or later selection returns to the source.
+    fn move_windows_to_workspace(
+        &self,
+        windows: &[WinID],
+        workspace_id: WorkspaceId,
+        inactive_tabs: &[WinID],
+    ) -> Result<()>;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -586,6 +599,10 @@ impl WindowManagerApi for WindowManagerOS {
         native_spaces::window_exists(window_id)
     }
 
+    fn window_census(&self) -> Result<HashSet<WinID>> {
+        native_spaces::window_census()
+    }
+
     fn native_space_is_active(&self, workspace_id: WorkspaceId) -> Result<bool> {
         native_spaces::workspace_is_active(self.main_cid, workspace_id)
     }
@@ -738,20 +755,31 @@ impl WindowManagerApi for WindowManagerOS {
         space_window_list_for_connection(self.main_cid, &[space_id], None, true)
     }
 
-    fn window_is_unordered(&self, window_id: WinID) -> bool {
+    fn window_is_unordered(&self, window_id: WinID) -> Result<bool> {
         let mut ordered_in = 0;
         let ordered_status =
             unsafe { SLSWindowIsOrderedIn(self.main_cid, window_id, &mut ordered_in) };
 
-        ordered_status == 0 && ordered_in == 0
+        if ordered_status != 0 {
+            return Err(Error::Generic(format!(
+                "could not read ordering for window {window_id}: {ordered_status}"
+            )));
+        }
+        Ok(ordered_in == 0)
     }
 
     fn move_windows_to_workspace(
         &self,
         windows: &[WinID],
         workspace_id: WorkspaceId,
+        inactive_tabs: &[WinID],
     ) -> Result<()> {
-        native_spaces::move_windows_to_workspace(self.main_cid, windows, workspace_id)
+        native_spaces::move_windows_to_workspace(
+            self.main_cid,
+            windows,
+            workspace_id,
+            inactive_tabs,
+        )
     }
 
     fn quit(&self) -> Result<()> {

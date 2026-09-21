@@ -47,6 +47,7 @@
 //!   private class lookups (which may run `+resolveInstanceMethod:`),
 //!   initializers and performs all run under it.
 
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
@@ -55,13 +56,14 @@ use objc2::MainThreadMarker;
 use objc2::exception::{Exception, catch};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, CGSessionCopyCurrentDictionary,
     CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowLayer,
-    kCGWindowNumber,
+    kCGWindowNumber, kCGWindowOwnerPID,
 };
 use tracing::trace;
 
@@ -72,7 +74,8 @@ use crate::platform::{ConnID, WinID, WorkspaceId};
 use crate::util::create_array;
 
 use super::skylight::{
-    SLSCopyManagedDisplaySpaces, SLSCopySpacesForWindows, SLSCopyWindowsWithOptionsAndTags,
+    SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopySpacesForWindows,
+    SLSCopyWindowsWithOptionsAndTags, SLSWindowIsOrderedIn,
 };
 
 /// The dispatch selector shared by every bridged operation. Asynchronous
@@ -405,6 +408,30 @@ fn require_main_thread(what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Only a fresh, successful inactive observation authorizes a native write.
+/// Keep these failures at the pre-submission boundary, including the original
+/// observation error: an unknown state is not a request that may have applied.
+fn require_mission_control_inactive(
+    workspace_id: WorkspaceId,
+    observation: Result<bool>,
+) -> Result<()> {
+    match observation {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(request_error(
+            workspace_id,
+            false,
+            "Mission Control is active; native Space mutation was not submitted".to_string(),
+        )),
+        Err(error) => Err(request_error(
+            workspace_id,
+            false,
+            format!(
+                "Mission Control state is unknown; native Space mutation was not submitted: {error}"
+            ),
+        )),
+    }
+}
+
 /// Reads a session flag stored as either a `CFBoolean` or an integer
 /// `CFNumber`. `Ok(None)` when the key is absent; an error when it is present
 /// in an unexpected representation.
@@ -633,10 +660,20 @@ fn window_listed(entries: &CFArray<CFType>, window_id: WinID) -> Option<bool> {
     Some(false)
 }
 
+/// Parse the complete batch before any missing ID can count as absent.
+fn listed_window_ids(entries: &CFArray<CFType>) -> Option<HashSet<WinID>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let number = untyped_dictionary(&entry).and_then(window_number)?;
+            WinID::try_from(number).ok().filter(|id| *id > 0)
+        })
+        .collect()
+}
+
 /// Window levels of `windows` from the `CoreGraphics` window list, in the same
 /// order; `None` where the window has no metadata.
-fn window_layers(windows: &[WinID]) -> Result<Vec<Option<i64>>> {
-    let entries = window_list()?;
+fn window_layers(windows: &[WinID], entries: &CFArray<CFType>) -> Vec<Option<i64>> {
     let layer_key: &CFType = unsafe { kCGWindowLayer };
     let mut layers = vec![None; windows.len()];
     for entry in entries.iter() {
@@ -653,7 +690,7 @@ fn window_layers(windows: &[WinID]) -> Result<Vec<Option<i64>>> {
             }
         }
     }
-    Ok(layers)
+    layers
 }
 
 /// Normal, floating, and modal application window levels.
@@ -724,11 +761,90 @@ fn application_windows(windows: &[WinID], layers: &[Option<i64>]) -> Result<Vec<
 }
 
 /// Fresh sample of the normal, floating and modal windows on `workspace_id`,
-/// minimized included.
-fn space_application_windows(connection: ConnID, workspace_id: WorkspaceId) -> Result<Vec<WinID>> {
+/// minimized included. Migration refuses hidden applications and attached
+/// groups: on macOS 27, destroying their Desktop can leave live windows with
+/// no Space membership even after the application is unhidden.
+fn space_application_windows(
+    connection: ConnID,
+    workspace_id: WorkspaceId,
+    migrate: bool,
+) -> Result<Vec<WinID>> {
     let windows = space_windows(connection, workspace_id)?;
-    let layers = window_layers(&windows)?;
-    application_windows(&windows, &layers)
+    let entries = window_list()?;
+    let sampled = application_windows(&windows, &window_layers(&windows, &entries))?;
+    if migrate {
+        require_visible_owners(&sampled, &entries, |pid| {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                .map(|app| app.isHidden())
+        })?;
+        for &window in &sampled {
+            // Copy-family ownership; this API includes the window itself.
+            let associated =
+                unsafe { CFRetained::from_raw(SLSCopyAssociatedWindows(connection, window)) };
+            require_independent_window(window, unsafe { associated.cast_unchecked::<CFType>() })?;
+        }
+    }
+    Ok(sampled)
+}
+
+/// Checks application visibility, not window on-screen status: windows on an
+/// inactive Desktop are normally off screen. Unknown ownership fails closed.
+fn require_visible_owners(
+    windows: &[WinID],
+    entries: &CFArray<CFType>,
+    mut app_hidden: impl FnMut(i32) -> Option<bool>,
+) -> Result<()> {
+    let owner_key: &CFType = unsafe { kCGWindowOwnerPID };
+    let mut checked = Vec::new();
+    for &window in windows {
+        let owner = entries.iter().find_map(|entry| {
+            let entry = untyped_dictionary(&entry)?;
+            (window_number(entry)? == i64::from(window))
+                .then(|| entry.get(owner_key).and_then(|pid| integer(&pid)))
+                .flatten()
+        });
+        let owner = owner
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| {
+                Error::Generic(format!(
+                    "cannot verify the owner of window {window}; refusing native Desktop migration"
+                ))
+            })?;
+        if checked.contains(&owner) {
+            continue;
+        }
+        match app_hidden(owner) {
+            Some(false) => checked.push(owner),
+            Some(true) => {
+                return Err(Error::InvalidInput(format!(
+                    "window {window} belongs to hidden application {owner}; unhide the application before destroying its native Desktop, even with migrate"
+                )));
+            }
+            None => {
+                return Err(Error::Generic(format!(
+                    "cannot verify visibility of application {owner} for window {window}; refusing native Desktop migration"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The destroy bridge can orphan attached children instead of migrating them.
+/// Moving the group explicitly first is safe; implicit migration is not.
+fn require_independent_window(window: WinID, associated: &CFArray<CFType>) -> Result<()> {
+    if associated.len() == 1
+        && associated
+            .iter()
+            .next()
+            .is_some_and(|member| integer(&member) == Some(i64::from(window)))
+    {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "window {window} has attached windows or unverifiable associations; move the window group elsewhere before destroying its native Desktop, even with migrate"
+    )))
 }
 
 // MARK: - Operations
@@ -787,6 +903,7 @@ pub(super) fn activate_workspace(connection: ConnID, workspace_id: WorkspaceId) 
             ])
         },
     )?;
+    require_mission_control_inactive(workspace_id, crate::platform::mission_control_is_active())?;
     submit(workspace_id, &operations)?;
     trace!(
         workspace_id,
@@ -844,6 +961,7 @@ pub(super) fn create_workspace(connection: ConnID) -> Result<WorkspaceId> {
             )
         },
     )?;
+    require_mission_control_inactive(0, crate::platform::mission_control_is_active())?;
     let created = submit_create(&operation)?;
     if created == 0 {
         return Err(request_error(
@@ -870,8 +988,10 @@ pub(super) fn create_workspace(connection: ConnID) -> Result<WorkspaceId> {
 /// current on its display, the last ordinary Desktop of its display, not a
 /// Desktop, or, unless `migrate`, hosts any normal, floating or modal window
 /// (minimized included; a window without metadata counts as present).
-/// `migrate` lifts only that occupancy guard: macOS moves the windows to the
-/// current Desktop itself; nothing here moves or closes a window.
+/// `migrate` lifts only that occupancy guard; hidden applications must first
+/// be unhidden, and attached groups explicitly moved elsewhere, to avoid
+/// orphaning their windows. macOS migrates the remaining windows; nothing here
+/// moves, unhides or closes a window.
 ///
 /// `Ok(windows)` is the sample of application windows taken by the preflight,
 /// which the caller confirms later: the Space gone from the census and every
@@ -916,7 +1036,7 @@ pub(super) fn destroy_workspace(
         "native Space destruction is unavailable or its ABI changed",
         || resolve_operation(DESTROY_SPACE),
     )?;
-    let windows = space_application_windows(connection, workspace_id)?;
+    let windows = space_application_windows(connection, workspace_id, migrate)?;
     if !migrate && !windows.is_empty() {
         return Err(Error::InvalidInput(format!(
             "native Space {workspace_id} hosts {} application window(s), e.g. window {}; move them elsewhere or request migration",
@@ -935,6 +1055,7 @@ pub(super) fn destroy_workspace(
             )?])
         },
     )?;
+    require_mission_control_inactive(workspace_id, crate::platform::mission_control_is_active())?;
     submit(workspace_id, &operations)?;
     trace!(
         workspace_id,
@@ -953,7 +1074,8 @@ fn movable_source(
     census: &[SpaceRecord],
     window_id: WinID,
     layer: Option<i64>,
-) -> Result<WorkspaceId> {
+    inactive_tab: bool,
+) -> Result<Option<WorkspaceId>> {
     let layer = layer.ok_or_else(|| {
         Error::Generic(format!(
             "window {window_id} has no window metadata; refusing to move an unclassified window"
@@ -966,6 +1088,16 @@ fn movable_source(
     }
     let memberships = window_memberships(connection, window_id)?;
     let source = match memberships.as_slice() {
+        [] if inactive_tab => {
+            let mut ordered = 0;
+            let status = unsafe { SLSWindowIsOrderedIn(connection, window_id, &mut ordered) };
+            if status != 0 || ordered != 0 {
+                return Err(Error::InvalidInput(format!(
+                    "unassigned native tab {window_id} is not verifiably ordered out"
+                )));
+            }
+            return Ok(None);
+        }
         [] => {
             return Err(Error::NotFound(format!(
                 "window {window_id} has no native Space membership; it may not exist"
@@ -984,19 +1116,20 @@ fn movable_source(
             "window {window_id} is on native Space {source}, which is not an ordinary Desktop"
         )));
     }
-    Ok(source)
+    Ok(Some(source))
 }
 
 /// Submits one asynchronous request assigning `windows` to exactly one native
 /// Space. This is movement, not stickiness. The whole batch is validated
 /// before anything is submitted: every window must be an ordinary application
-/// window (levels 0, 3, 8) on exactly one ordinary Desktop, and the destination
-/// must be an ordinary Desktop. Windows already on the destination are left
-/// out; when nothing remains, nothing is submitted.
+/// window (levels 0, 3, 8) on exactly one ordinary Desktop, or a positively
+/// identified inactive native tab that is verifiably ordered out. The destination
+/// must be an ordinary Desktop. Already-assigned windows need no write.
 pub(super) fn move_windows_to_workspace(
     connection: ConnID,
     windows: &[WinID],
     workspace_id: WorkspaceId,
+    inactive_tabs: &[WinID],
 ) -> Result<()> {
     if windows.is_empty() {
         return Ok(());
@@ -1021,10 +1154,17 @@ pub(super) fn move_windows_to_workspace(
         )));
     }
 
-    let layers = window_layers(windows)?;
+    let layers = window_layers(windows, &*window_list()?);
     let mut pending = Vec::with_capacity(windows.len());
     for (window_id, layer) in windows.iter().copied().zip(layers) {
-        if movable_source(connection, &census, window_id, layer)? != workspace_id {
+        if movable_source(
+            connection,
+            &census,
+            window_id,
+            layer,
+            inactive_tabs.contains(&window_id),
+        )? != Some(workspace_id)
+        {
             pending.push(window_id);
         }
     }
@@ -1048,6 +1188,7 @@ pub(super) fn move_windows_to_workspace(
             )?])
         },
     )?;
+    require_mission_control_inactive(workspace_id, crate::platform::mission_control_is_active())?;
     submit(workspace_id, &operations)?;
     trace!(windows = ?pending, workspace_id, "submitted native window move");
     Ok(())
@@ -1087,6 +1228,17 @@ pub(super) fn window_exists(window_id: WinID) -> Result<bool> {
     })
 }
 
+/// The same fresh, session-validated global metadata as `window_exists`, but
+/// parsed once for all existence checks in a single application observation.
+pub(super) fn window_census() -> Result<HashSet<WinID>> {
+    require_main_thread("native window queries")?;
+    require_unlocked_session()?;
+    let entries = window_list()?;
+    listed_window_ids(&entries).ok_or_else(|| {
+        Error::Generic("window metadata is malformed; cannot establish a live census".into())
+    })
+}
+
 /// Posts a left click at `point` to complete display focus once a native
 /// Space switch has been observed on another display.
 pub(super) fn post_left_click(point: CGPoint) -> Result<()> {
@@ -1105,6 +1257,33 @@ mod tests {
     use objc2::sel;
 
     use super::*;
+
+    #[test]
+    fn mission_control_preflight_requires_a_successful_inactive_observation() {
+        let active = require_mission_control_inactive(7, Ok(true)).unwrap_err();
+        assert!(matches!(
+            active,
+            Error::NativeSpaceRequest {
+                workspace_id: 7,
+                request_may_have_applied: false,
+                ..
+            }
+        ));
+        let unreadable = require_mission_control_inactive(
+            7,
+            Err(Error::PermissionDenied("AX read denied".to_string())),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            unreadable,
+            Error::NativeSpaceRequest {
+                workspace_id: 7,
+                request_may_have_applied: false,
+                ref message,
+            } if message.contains("AX read denied")
+        ));
+        assert!(require_mission_control_inactive(7, Ok(false)).is_ok());
+    }
 
     /// Sends a selector `NSObject` does not implement through the same raw
     /// `objc_msgSend` cast the dispatch path uses, so the runtime throws a
@@ -1416,6 +1595,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn desktop_migration_refuses_hidden_or_unverifiable_application_owners() {
+        let number = CFNumber::new_i64(8);
+        let owner = CFNumber::new_i64(44);
+        let entry = dictionary(&[
+            (&unsafe { kCGWindowNumber }.to_string(), &number),
+            (&unsafe { kCGWindowOwnerPID }.to_string(), &owner),
+        ]);
+        let entries = CFArray::<CFType>::from_objects(&[&*entry]);
+        assert!(matches!(
+            require_visible_owners(&[8], &entries, |_| Some(true)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(require_visible_owners(&[8], &entries, |_| None).is_err());
+        assert!(require_visible_owners(&[9], &entries, |_| Some(false)).is_err());
+        // An off-screen window is safe when its application is not hidden.
+        assert!(require_visible_owners(&[8], &entries, |_| Some(false)).is_ok());
+        // Unrelated hidden applications are not occupants of this Desktop.
+        assert!(require_visible_owners(&[], &entries, |_| Some(true)).is_ok());
+    }
+
+    #[test]
+    fn desktop_migration_requires_an_independent_window() {
+        let parent = CFNumber::new_i64(8);
+        let child = CFNumber::new_i64(9);
+        let independent = CFArray::<CFType>::from_objects(&[&*parent]);
+        let attached = CFArray::<CFType>::from_objects(&[&*parent, &*child]);
+        assert!(require_independent_window(8, &independent).is_ok());
+        assert!(require_independent_window(8, &attached).is_err());
+        assert!(require_independent_window(9, &attached).is_err());
+        assert!(require_independent_window(8, &CFArray::empty()).is_err());
+    }
+
     fn window_entry(number: &CFType) -> CFRetained<CFDictionary<CFString, CFType>> {
         let key = unsafe { kCGWindowNumber }.to_string();
         dictionary(&[(&key, number)])
@@ -1423,6 +1635,20 @@ mod tests {
 
     fn listed(entries: &[&CFType], window_id: WinID) -> Option<bool> {
         window_listed(&CFArray::<CFType>::from_objects(entries), window_id)
+    }
+
+    #[test]
+    fn window_census_refuses_partial_results_after_a_malformed_entry() {
+        let first = window_entry(&CFNumber::new_i64(5));
+        let second = window_entry(&CFNumber::new_i64(8));
+        let complete = CFArray::<CFType>::from_objects(&[&*first, &*second]);
+        assert_eq!(listed_window_ids(&complete), Some(HashSet::from([5, 8])));
+
+        // Never turn a malformed row after a known live window into a partial
+        // successful census: callers could mistake every omitted sibling for dead.
+        let malformed = dictionary(&[]);
+        let partial = CFArray::<CFType>::from_objects(&[&*first, &*malformed, &*second]);
+        assert!(listed_window_ids(&partial).is_none());
     }
 
     #[test]

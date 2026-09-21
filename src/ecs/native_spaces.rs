@@ -36,7 +36,9 @@ use bevy::app::{App, Plugin, PreUpdate, Update};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::Remove;
 use bevy::ecs::message::MessageReader;
+use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, Or, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, NonSend, Populated, Query, Res, ResMut, SystemParam};
@@ -48,12 +50,14 @@ use tracing::{Level, debug, instrument, warn};
 
 use super::focus::FocusHistory;
 use super::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
+use super::native_tabs::{NativeTabGroup, observe_app_groups};
 use super::params::Windows;
 use super::workspace::{FollowSpacePending, workspace_created_handler};
 use super::{
     ActiveWorkspaceMarker, DockPosition, FocusedMarker, FollowCurrentWorkspaceMarker,
-    InstantSpaceSwitch, MissionControlActive, NativeFullscreenMarker, Position, RepositionMarker,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
+    InstantSpaceSwitch, MissionControlActive, NativeFullscreenMarker, Position,
+    PreviousManagedStrip, RepositionMarker, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt,
 };
 use crate::commands::{
     Command, MoveFocus, Operation, SpaceOperation, SpaceSelector, command_focus_native_space,
@@ -78,6 +82,7 @@ pub struct NativeSpacesPlugin;
 
 impl Plugin for NativeSpacesPlugin {
     fn build(&self, app: &mut App) {
+        app.add_observer(handoff_space_move);
         // Ordered after the `space focus` handler so a switch and a lifecycle
         // or move request arriving in the same frame serialize: the switch is
         // recorded on `InstantSpaceSwitch` at once and refuses the request
@@ -85,7 +90,9 @@ impl Plugin for NativeSpacesPlugin {
         // component was still a deferred command when the switch looked.
         app.add_systems(
             PreUpdate,
-            command_native_space_request.after(command_focus_native_space),
+            command_native_space_request
+                .after(command_focus_native_space)
+                .after(super::native_tabs::reconcile_native_tabs),
         );
         app.add_systems(
             Update,
@@ -100,7 +107,7 @@ impl Plugin for NativeSpacesPlugin {
                 place_native_desktops.after(confirm_native_space_creation),
                 confirm_native_space_destruction,
                 reap_destroyed_space_rows,
-                observe_space_moves,
+                observe_space_moves.after(super::native_tabs::reconcile_native_tabs),
             ),
         );
     }
@@ -137,20 +144,19 @@ type LeaderFlags<'w, 's> = Query<
     With<Window>,
 >;
 
-/// Every explicit move in flight with what settling it reads: the leader's
-/// window, whether it is focused and follows the current Space, and any
-/// reposition already under way for it.
-type MovingLeaders<'w, 's> = Populated<
+/// Every explicit move in flight, carried by its leader.
+type MovingLeaders<'w, 's> =
+    Populated<'w, 's, (Entity, &'static Window, &'static mut SpaceMovePending)>;
+
+/// Current follow intent and frame of every tracked move member.
+type MemberFlags<'w, 's> = Query<
     'w,
     's,
     (
-        Entity,
-        &'static Window,
-        &'static mut SpaceMovePending,
-        Has<FocusedMarker>,
         Has<FollowCurrentWorkspaceMarker>,
         Option<&'static RepositionMarker>,
     ),
+    With<Window>,
 >;
 
 /// The rows of destroyed Spaces that were just marked as such or rewritten
@@ -215,8 +221,18 @@ impl NativeMoveRequest {
         anchor: WinID,
         now: Duration,
     ) -> Option<bool> {
+        let result = batch_landed(window_manager, &mut self.windows, anchor, self.target);
+        self.observe_result(result, anchor, now)
+    }
+
+    fn observe_result(
+        &mut self,
+        result: Result<bool>,
+        anchor: WinID,
+        now: Duration,
+    ) -> Option<bool> {
         let target = self.target;
-        match batch_landed(window_manager, &mut self.windows, anchor, target) {
+        match result {
             Ok(true) => {
                 debug!(
                     window_id = anchor,
@@ -297,8 +313,9 @@ pub(super) fn submit_native_move(
     batch: &[WinID],
     desired: WorkspaceId,
     anchor: WinID,
+    inactive_tabs: &[WinID],
 ) -> Option<WorkspaceId> {
-    match window_manager.move_windows_to_workspace(batch, desired) {
+    match window_manager.move_windows_to_workspace(batch, desired, inactive_tabs) {
         Ok(()) => {
             debug!(
                 window_id = anchor,
@@ -557,27 +574,97 @@ enum MovePhase {
 }
 
 /// An explicit `spacemove`/`spacesend` in flight for the window entity that
-/// carries it — the leader of the native tab group that travels together.
-/// Dropped once the move has been applied, given up on, or the leader closes.
-/// While it exists the leader is this move's alone: the follow machinery
-/// neither queues nor carries a window that has one. Whether a member is
-/// tiled or floating is read when the batch lands, not captured here, so a
-/// float or follow toggled in flight is respected.
+/// carries it — the leader of the native batch. Every tracked tab or associated
+/// child belongs to this move until it settles; none may be carried by follow
+/// machinery or chosen as the source's replacement focus. A closing leader
+/// hands bounded reconciliation to a survivor, but never its activation or
+/// focus intent. Current mode is read at landing, so in-flight toggles survive.
 #[derive(Component, Debug)]
 pub(crate) struct SpaceMovePending {
     source: WorkspaceId,
     target: WorkspaceId,
     focus: MoveFocus,
-    /// The native tab group travelling together, in the strip's tab order,
-    /// so the destination row keeps the grouping. A lone window is a group
-    /// of one.
-    group: Vec<(Entity, WinID)>,
+    /// All submitted native IDs that resolve to existing window entities,
+    /// including independently managed associated children.
+    members: Vec<(Entity, WinID)>,
+    /// Logical placement groups, preserving actual tab order without turning
+    /// independently tracked children into tabs of their parent.
+    groups: Vec<Vec<Entity>>,
+    /// Native groups are revalidated after the initial all-member assignment,
+    /// so later selection changes do not split their logical placement.
+    native_groups: Vec<NativeTabGroup>,
     phase: MovePhase,
 }
 
 impl SpaceMovePending {
-    fn travels(&self, entity: Entity) -> bool {
-        self.group.iter().any(|(member, _)| *member == entity)
+    pub(crate) fn travels(&self, entity: Entity) -> bool {
+        self.members.iter().any(|(member, _)| *member == entity)
+    }
+
+    pub(crate) fn has_native_tabs(&self) -> bool {
+        !self.native_groups.is_empty()
+    }
+
+    /// Transfers buffers without cloning them or restarting either deadline.
+    /// Called only while this component's window is being removed.
+    fn take_for_survivor(&mut self) -> Self {
+        let phase = match &mut self.phase {
+            MovePhase::Landing(request) => MovePhase::Landing(NativeMoveRequest {
+                target: request.target,
+                windows: std::mem::take(&mut request.windows),
+                requested_at: request.requested_at,
+                next_check: request.next_check,
+            }),
+            MovePhase::Placing(placing) => MovePhase::Placing(Placing {
+                landed: std::mem::take(&mut placing.landed),
+                whole: placing.whole,
+                since: placing.since,
+                next_check: placing.next_check,
+                reconciliation_requested: placing.reconciliation_requested,
+            }),
+            MovePhase::Activating { neighbour } => MovePhase::Activating {
+                neighbour: *neighbour,
+            },
+        };
+        Self {
+            source: self.source,
+            target: self.target,
+            focus: MoveFocus::Stay,
+            members: std::mem::take(&mut self.members),
+            groups: std::mem::take(&mut self.groups),
+            native_groups: std::mem::take(&mut self.native_groups),
+            phase,
+        }
+    }
+}
+
+/// Keeps observing surviving tracked members when the original leader closes.
+/// Native effects already submitted remain owned; nothing is resubmitted and
+/// a surviving child is never promoted into the command's focus intent.
+fn handoff_space_move(
+    trigger: On<Remove, Window>,
+    mut moves: Query<&mut SpaceMovePending>,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let closing = trigger.event().entity;
+    let Ok(mut pending) = moves.get_mut(closing) else {
+        return;
+    };
+    let survivor = pending.members.iter().find_map(|(member, id)| {
+        (*member != closing
+            && windows
+                .get(*member)
+                .is_some_and(|window| window.id() == *id)
+            && !matches!(window_manager.window_exists(*id), Ok(false)))
+        .then_some(*member)
+    });
+    if let Some(survivor) = survivor
+        && let Ok(mut entity_commands) = commands.get_entity(survivor)
+    {
+        debug!("window {closing} closed; move reconciliation handed to {survivor}");
+        entity_commands.try_insert(pending.take_for_survivor());
     }
 }
 
@@ -667,6 +754,7 @@ fn command_native_space_request(
     time: Res<Time>,
     in_flight: NativeInFlight,
     instant_space_switch: Res<InstantSpaceSwitch>,
+    _platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
     mut commands: Commands,
 ) {
     let mut requests = messages.read().filter_map(native_request);
@@ -680,7 +768,7 @@ fn command_native_space_request(
             repeats, "only one native Space request is submitted per tick; ignoring the repeats"
         );
     }
-    if mission_control.0 {
+    if mission_control.blocks_mutations() {
         warn!(
             ?request,
             "native Space requests are unavailable during Mission Control"
@@ -878,7 +966,7 @@ fn submit_move(
     now: Duration,
     commands: &mut Commands,
 ) {
-    let Some((window, entity, unmanaged)) = windows
+    let Some((window, entity, flags)) = windows
         .focused()
         .and_then(|(_, entity)| windows.get_managed(entity))
     else {
@@ -893,45 +981,39 @@ fn submit_move(
         );
         return;
     }
-    match unmanaged {
-        Some(Unmanaged::Minimized) => {
-            warn!(window_id, "a minimized window is not moved between Spaces");
-            return;
-        }
-        Some(Unmanaged::Hidden) => {
-            warn!(window_id, "a hidden window is not moved between Spaces");
-            return;
-        }
-        Some(Unmanaged::Floating) | None => {}
-    }
-    let (following, carrying, moving) = leaders.get(entity).unwrap_or((false, false, false));
-    if moving {
+    if flags.is_suspended() {
         warn!(
             window_id,
-            "window's previous move between native Spaces is still being confirmed"
+            "a minimized or hidden window is not moved between Spaces"
         );
         return;
     }
-    if following {
-        if matches!(focus, MoveFocus::Stay) {
+
+    let observed_groups = match window
+        .pid()
+        .and_then(|pid| observe_app_groups(windows, window_manager, pid))
+    {
+        Ok(groups) => groups,
+        Err(err) => {
             warn!(
                 window_id,
-                "window follows the current Space; turn follow off (window_follow) before sending it to another Space"
+                "native tab identity could not be established before move: {err}"
             );
             return;
         }
-        if carrying {
-            warn!(
-                window_id,
-                "window's follow move is still being confirmed; retry once it has landed"
-            );
-            return;
-        }
-    }
+    };
+    let native_group = observed_groups
+        .iter()
+        .find(|group| group.members.iter().any(|(member, _)| *member == entity));
+    let representative = native_group.map_or(entity, |group| group.selected);
+    let Some(representative_window) = windows.get(representative) else {
+        return;
+    };
+    let representative_id = representative_window.id();
 
     // The actual source, read fresh: relative selectors count from where the
     // window really is, not from the Space on screen.
-    let source = match window_manager.window_workspaces(window_id) {
+    let source = match window_manager.window_workspaces(representative_id) {
         Ok(spaces) => match spaces.as_slice() {
             [source] => *source,
             [] => {
@@ -977,34 +1059,65 @@ fn submit_move(
         return;
     }
 
-    // The native tab group travels together, in its strip order.
-    let group = strips
-        .iter()
-        .find_map(|strip| strip.tab_group(entity))
-        .unwrap_or_else(|| vec![entity])
-        .into_iter()
-        .filter_map(|member| {
-            if member == entity {
-                Some((member, window_id))
-            } else {
-                windows.iter().find_map(|(sibling, sibling_entity)| {
-                    (sibling_entity == member).then(|| (member, sibling.id()))
-                })
-            }
-        })
-        .collect::<Vec<_>>();
+    // Every native tab needs an explicit assignment, including ordered-out
+    // windows with no membership. Moving the selected tab alone is insufficient.
+    let group = native_group.map_or_else(
+        || {
+            strips
+                .iter()
+                .find_map(|strip| strip.tab_group(entity))
+                .unwrap_or_else(|| vec![entity])
+                .into_iter()
+                .filter_map(|member| windows.get(member).map(|window| (member, window.id())))
+                .collect::<Vec<_>>()
+        },
+        |group| group.members.clone(),
+    );
 
     let mut batch = Vec::with_capacity(group.len());
     for (_, member_id) in &group {
         batch.push(*member_id);
         batch.extend(window_manager.get_associated_windows(*member_id));
     }
+    let native_groups = observed_groups
+        .into_iter()
+        .filter(|group| group.members.iter().any(|(_, id)| batch.contains(id)))
+        .collect::<Vec<_>>();
+    if native_groups
+        .iter()
+        .any(|group| group.identity.iter().any(|(_, id)| id.is_none()))
+    {
+        warn!(
+            window_id,
+            "native tab group contains unresolved windows; select each tab before moving it"
+        );
+        return;
+    }
+    let inactive_tabs = native_groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .members
+                .iter()
+                .filter_map(|(member, id)| (*member != group.selected).then_some(*id))
+        })
+        .collect::<Vec<_>>();
+    let mut logical_members = Vec::new();
+    for group in &native_groups {
+        logical_members.extend_from_slice(&group.members);
+        // Associations of every logical member are independent unless they are
+        // themselves positively identified as Cocoa tabs.
+        for (_, id) in &group.members {
+            batch.push(*id);
+            batch.extend(window_manager.get_associated_windows(*id));
+        }
+    }
     batch.sort_unstable();
     batch.dedup();
     // Associated windows that have since closed leave the batch; any live
     // member the window server cannot answer for fails the request closed
     // before anything is submitted.
-    if let Err(err) = batch_landed(window_manager, &mut batch, window_id, target) {
+    if let Err(err) = batch_landed(window_manager, &mut batch, representative_id, target) {
         warn!(
             window_id,
             workspace_id = target,
@@ -1012,7 +1125,62 @@ fn submit_move(
         );
         return;
     }
-    let Some(observed) = submit_native_move(window_manager, &batch, target, window_id) else {
+
+    let mut members = batch
+        .iter()
+        .filter_map(|id| windows.find(*id).map(|(_, entity)| (entity, *id)))
+        .collect::<Vec<_>>();
+    for member in logical_members {
+        if !members.contains(&member) {
+            members.push(member);
+        }
+    }
+    for (member, member_id) in &members {
+        let (following, carrying, moving) = leaders.get(*member).unwrap_or((false, false, false));
+        if carrying || moving {
+            warn!(
+                window_id = member_id,
+                "a batch member's native move is still being confirmed"
+            );
+            return;
+        }
+        if following && matches!(focus, MoveFocus::Stay) {
+            warn!(
+                window_id = member_id,
+                "a batch member follows the current Space; turn follow off before sending it"
+            );
+            return;
+        }
+    }
+
+    let mut groups = native_groups
+        .iter()
+        .map(|group| {
+            group
+                .members
+                .iter()
+                .map(|(entity, _)| *entity)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (member, _) in &members {
+        if groups.iter().any(|group| group.contains(member)) {
+            continue;
+        }
+        let mut group = strips
+            .iter()
+            .find_map(|strip| strip.tab_group(*member))
+            .unwrap_or_else(|| vec![*member]);
+        group.retain(|entity| members.iter().any(|(member, _)| member == entity));
+        groups.push(group);
+    }
+    let Some(observed) = submit_native_move(
+        window_manager,
+        &batch,
+        target,
+        representative_id,
+        &inactive_tabs,
+    ) else {
         return;
     };
 
@@ -1021,7 +1189,9 @@ fn submit_move(
             source,
             target,
             focus,
-            group,
+            members,
+            groups,
+            native_groups,
             phase: MovePhase::Landing(NativeMoveRequest::new(observed, batch, now)),
         });
     }
@@ -2003,44 +2173,52 @@ fn keep_placing(
 }
 
 /// Takes the landed members out of every row but the target's and forgets
-/// their focus history. Returns the window left to focus on the source when
-/// a row held the leader: its neighbour, or whatever remains in that row.
+/// every traveling member's source focus history. Replacement focus must not
+/// be another member of the same move, even when that member did not land.
 fn leave_source_rows(
     leader: Entity,
-    target: WorkspaceId,
+    pending: &SpaceMovePending,
     moved: &[Entity],
     strips: &mut NativeStrips,
     focus_history: &mut FocusHistory,
 ) -> Option<Entity> {
     let mut source_focus = None;
     for (_, mut strip, _, _, _) in &mut *strips {
-        if strip.id() == target || !moved.iter().any(|entity| strip.contains(*entity)) {
+        if strip.id() == pending.target || !moved.iter().any(|entity| strip.contains(*entity)) {
             continue;
         }
         let held_leader = strip.contains(leader);
         if held_leader {
             source_focus = strip
                 .left_neighbour(leader)
-                .or_else(|| strip.right_neighbour(leader));
+                .filter(|entity| !pending.travels(*entity))
+                .or_else(|| {
+                    strip
+                        .right_neighbour(leader)
+                        .filter(|entity| !pending.travels(*entity))
+                });
         }
         for entity in moved {
             strip.remove(*entity);
         }
         if held_leader && source_focus.is_none() {
-            source_focus = strip.all_columns().first().copied();
+            source_focus = strip
+                .all_columns()
+                .into_iter()
+                .find(|entity| !pending.travels(*entity));
         }
     }
-    for entity in moved {
+    for (entity, _) in &pending.members {
         focus_history.forget(*entity);
     }
     source_focus
 }
 
-/// Rows the landed members that are tiled now on the target, as one tab
-/// group, in the resolved row.
+/// Rows the landed members that are tiled now on the target, preserving
+/// each logical tab group and keeping independent associated children separate.
 fn join_target_row(
     target: WorkspaceId,
-    rowed: &[Entity],
+    rowed: &[Vec<Entity>],
     placement: Placement,
     strips: &mut NativeStrips,
     commands: &mut Commands,
@@ -2048,7 +2226,9 @@ fn join_target_row(
     match placement {
         Placement::Row(row) => {
             if let Ok((_, mut strip, _, _, _)) = strips.get_mut(row) {
-                strip.append_tab_group(rowed);
+                for group in rowed {
+                    strip.append_tab_group(group);
+                }
             }
         }
         Placement::NewRow {
@@ -2060,7 +2240,9 @@ fn join_target_row(
                 "row 0 for the move's destination on display {display_entity}"
             );
             let mut strip = LayoutStrip::new(target, 0);
-            strip.append_tab_group(rowed);
+            for group in rowed {
+                strip.append_tab_group(group);
+            }
             commands.spawn_layout_strip(strip, origin, display_entity, false);
         }
     }
@@ -2109,6 +2291,7 @@ fn keep_source_focus(
     pending: &SpaceMovePending,
     neighbour: Option<Entity>,
     strips: &NativeStrips,
+    windows: &Windows,
     focus_history: &FocusHistory,
     commands: &mut Commands,
 ) {
@@ -2116,9 +2299,13 @@ fn keep_source_focus(
         .iter()
         .any(|(_, strip, _, active, _)| active && strip.id() == pending.source);
     let on_source = |entity: Entity| {
-        strips
-            .iter()
-            .any(|(_, strip, _, _, _)| strip.id() == pending.source && strip.contains(entity))
+        !pending.travels(entity)
+            && windows
+                .get_managed(entity)
+                .is_some_and(|(_, _, flags)| flags.is_tiled())
+            && strips
+                .iter()
+                .any(|(_, strip, _, _, _)| strip.id() == pending.source && strip.contains(entity))
     };
     let remembered = focus_history
         .last_managed(pending.source)
@@ -2126,9 +2313,18 @@ fn keep_source_focus(
         .or_else(|| {
             focus_history
                 .last_floating(pending.source)
-                .filter(|entity| !pending.travels(*entity))
+                .filter(|entity| {
+                    !pending.travels(*entity)
+                        && windows
+                            .get_managed(*entity)
+                            .is_some_and(|(_, _, flags)| flags.is_floating())
+                })
         });
-    if let Some(entity) = neighbour.or(remembered).filter(|_| source_on_screen) {
+    if let Some(entity) = neighbour
+        .filter(|entity| on_source(*entity))
+        .or(remembered)
+        .filter(|_| source_on_screen)
+    {
         debug!(
             workspace_id = pending.source,
             "focus stays on {entity} after sending {leader} away"
@@ -2139,8 +2335,10 @@ fn keep_source_focus(
             workspace_id = pending.source,
             source_on_screen, "nothing to focus on the source Space after sending {leader} away"
         );
-        if let Ok(mut entity_commands) = commands.get_entity(leader) {
-            entity_commands.try_remove::<FocusedMarker>();
+        for (entity, _) in &pending.members {
+            if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                entity_commands.try_remove::<FocusedMarker>();
+            }
         }
     }
 }
@@ -2165,50 +2363,230 @@ fn members_on_target(
         .collect()
 }
 
-/// Drops the leader's move. A leader the follow machinery would carry now —
-/// one that follows the current Space and floats, as read at release, not
-/// as it was when the move was submitted — is handed back to it: one carry
-/// to the Space the OS shows on the active display is queued for it, the
-/// carry a Space change would have queued while the move held the window.
-/// That Space being the one the move was for is no reason to skip it: the
-/// request is not evidence the move landed, and the follow machinery reads
-/// the window's membership before writing, so a window already there costs
-/// no native write. Nothing is queued on a window the follow machinery
-/// would not observe, so no carry is ever left dormant.
+fn live_native_members(
+    group: &NativeTabGroup,
+    windows: &Windows,
+    manager: &WindowManager,
+) -> Result<Vec<(Entity, WinID)>> {
+    group
+        .members
+        .iter()
+        .copied()
+        .filter_map(|(entity, id)| match manager.window_exists(id) {
+            Ok(false) => None,
+            Ok(true) if windows.get(entity).is_some_and(|window| window.id() == id) => {
+                Some(Ok((entity, id)))
+            }
+            Ok(true) => Some(Err(Error::Generic("live native tab is not tracked".into()))),
+            Err(err) => Some(Err(err)),
+        })
+        .collect()
+}
+
+/// Only authoritative closure of a known ID removes an identity obligation.
+/// An unexposed title has no ID with which closure could be proved.
+fn live_native_identity<'a>(
+    group: &'a NativeTabGroup,
+    live: &'a [(Entity, WinID)],
+) -> impl Iterator<Item = &'a (String, Option<WinID>)> {
+    group
+        .identity
+        .iter()
+        .filter(move |(_, id)| id.is_none_or(|id| live.iter().any(|(_, live_id)| *live_id == id)))
+}
+
+/// Resolves only the Cocoa members of the submitted move. Detaching a member
+/// restores strict per-window confirmation; merging with a new, unsubmitted
+/// window is not evidence that the original logical group traveled intact.
+fn logical_landing(
+    known: &[NativeTabGroup],
+    windows: &Windows,
+    manager: &WindowManager,
+    target: WorkspaceId,
+) -> Result<(Vec<Entity>, Vec<Vec<Entity>>, bool)> {
+    let mut landed = Vec::new();
+    let mut placement = Vec::new();
+    let mut whole = true;
+    for old in known {
+        let live = live_native_members(old, windows, manager)?;
+        let Some(&(first, _)) = live.first() else {
+            whole &= old.identity.iter().all(|(_, id)| id.is_some());
+            continue;
+        };
+        let pid = windows.get(first).ok_or(Error::InvalidWindow)?.pid()?;
+        let observed = observe_app_groups(windows, manager, pid)?;
+        let mut accounted = Vec::new();
+        for group in observed
+            .iter()
+            .filter(|group| group.members.iter().any(|member| live.contains(member)))
+        {
+            if group.members.iter().any(|member| !live.contains(member)) {
+                return Err(Error::Generic(
+                    "native tab group merged with an unsubmitted window during move".into(),
+                ));
+            }
+            // Known members alone are insufficient: a startup titlebar can
+            // include tabs that have never had an AXWindow or an ECS entity.
+            // Fresh selection was validated against the current representative;
+            // every logical title and resolved ID must still match submission.
+            if !group.identity.iter().eq(live_native_identity(old, &live)) {
+                return Err(Error::Generic(
+                    "native tab identity changed during move".into(),
+                ));
+            }
+            accounted.extend(group.members.iter().map(|(entity, _)| *entity));
+            if group.workspace == target {
+                let entities = group
+                    .members
+                    .iter()
+                    .map(|(entity, _)| *entity)
+                    .collect::<Vec<_>>();
+                landed.extend_from_slice(&entities);
+                placement.push(entities);
+            } else {
+                whole = false;
+            }
+        }
+        // Closing the other known tabs can leave one ordinary AXWindow with
+        // no titlebar at all. Its exact native membership is sufficient;
+        // unknown startup titles cannot take this path.
+        let single_known_survivor =
+            live.len() == 1 && live_native_identity(old, &live).count() == 1;
+        for (entity, id) in live {
+            if accounted.contains(&entity) {
+                continue;
+            }
+            let spaces = manager.window_workspaces(id)?;
+            let on_target = matches!(spaces.as_slice(), [space] if *space == target);
+            whole &= single_known_survivor && on_target;
+            if on_target {
+                landed.push(entity);
+                placement.push(vec![entity]);
+            }
+        }
+    }
+    Ok((landed, placement, whole))
+}
+
+fn reconcile_move_groups(
+    groups: &mut Vec<Vec<Entity>>,
+    known: &[NativeTabGroup],
+    observed: Vec<Vec<Entity>>,
+    manager: &WindowManager,
+    target: WorkspaceId,
+) {
+    if known.is_empty() {
+        return;
+    }
+    for group in &mut *groups {
+        group.retain(|member| {
+            !known
+                .iter()
+                .any(|native| native.members.iter().any(|(entity, _)| entity == member))
+        });
+    }
+    groups.retain(|group| !group.is_empty());
+    groups.extend(observed);
+    // Unreadable titlebars revoke grouping/follow authority, not a physical
+    // landing already proved by exact native membership. Keep those rows.
+    for &(entity, id) in known.iter().flat_map(|group| &group.members) {
+        if !groups.iter().any(|group| group.contains(&entity))
+            && matches!(manager.window_workspaces(id).as_deref(), Ok([space]) if *space == target)
+        {
+            groups.push(vec![entity]);
+        }
+    }
+}
+
+fn move_focus_target(
+    leader: Entity,
+    pending: &SpaceMovePending,
+    windows: &Windows,
+    manager: &WindowManager,
+) -> Option<Entity> {
+    let target = if let Some(group) = pending
+        .native_groups
+        .iter()
+        .find(|group| group.members.iter().any(|(member, _)| *member == leader))
+    {
+        let pid = group
+            .members
+            .iter()
+            .find_map(|(entity, _)| windows.get(*entity).and_then(|window| window.pid().ok()))?;
+        let live = live_native_members(group, windows, manager).ok()?;
+        let observed = observe_app_groups(windows, manager, pid).ok()?;
+        if let Some(current) = observed.iter().find(|current| {
+            current
+                .members
+                .iter()
+                .any(|member| group.members.contains(member))
+        }) {
+            if current.workspace != pending.target
+                || !current
+                    .identity
+                    .iter()
+                    .eq(live_native_identity(group, &live))
+                || current
+                    .members
+                    .iter()
+                    .any(|member| !group.members.contains(member))
+            {
+                return None;
+            }
+            current.selected
+        } else if live.len() == 1 && live_native_identity(group, &live).count() == 1 {
+            live[0].0
+        } else {
+            return None;
+        }
+    } else {
+        leader
+    };
+    let (window, _, flags) = windows.get_managed(target)?;
+    (!flags.is_suspended()
+        && matches!(manager.window_workspaces(window.id()).as_deref(), Ok([space]) if *space == pending.target))
+        .then_some(target)
+}
+
+/// Drops the move and hands every current floating follower back to its own
+/// carry, including associated children whose carry was withheld in flight.
+/// The active native Space is read once and the follower machinery confirms
+/// membership before writing, so already-landed members need no extra write.
 fn release_move(
     entity: Entity,
-    follows: bool,
+    pending: &SpaceMovePending,
+    member_flags: &MemberFlags,
     windows: &Windows,
     window_manager: &WindowManager,
     commands: &mut Commands,
 ) {
-    let Ok(mut entity_commands) = commands.get_entity(entity) else {
-        return;
-    };
-    entity_commands.try_remove::<SpaceMovePending>();
-    let carried = follows
-        && windows
-            .get_managed(entity)
-            .is_some_and(|(window, _, unmanaged)| {
-                matches!(unmanaged, Some(Unmanaged::Floating)) && !window.is_full_screen()
-            });
-    if !carried {
-        return;
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<SpaceMovePending>();
     }
-    match window_manager
-        .active_display_id()
-        .and_then(|display_id| window_manager.active_display_space(display_id))
-    {
-        Ok(current) => {
-            debug!(
-                workspace_id = current,
-                "followed window {entity} handed back to its follow carry"
-            );
-            entity_commands.try_insert(FollowSpacePending::new(current));
+    let mut current = None;
+    for (member, _) in &pending.members {
+        let carried = member_flags.get(*member).is_ok_and(|(follows, _)| follows)
+            && windows
+                .get_managed(*member)
+                .is_some_and(|(window, _, flags)| flags.is_floating() && !window.is_full_screen());
+        if !carried {
+            continue;
         }
-        Err(err) => warn!(
-            "unable to read the current native Space to hand followed window {entity} back: {err}"
-        ),
+        let workspace = current.get_or_insert_with(|| {
+            window_manager
+                .active_display_id()
+                .and_then(|display_id| window_manager.active_display_space(display_id))
+        });
+        match workspace {
+            Ok(current) => {
+                if let Ok(mut entity_commands) = commands.get_entity(*member) {
+                    entity_commands.try_insert(FollowSpacePending::new(*current));
+                }
+            }
+            Err(err) => warn!(
+                "unable to read the current native Space to hand followed window {member} back: {err}"
+            ),
+        }
     }
 }
 
@@ -2237,6 +2615,7 @@ fn observe_space_moves(
     mut strips: NativeStrips,
     displays: Displays,
     windows: Windows,
+    member_flags: MemberFlags,
     config: Res<Config>,
     mut focus_history: ResMut<FocusHistory>,
     mut instant_space_switch: ResMut<InstantSpaceSwitch>,
@@ -2244,28 +2623,31 @@ fn observe_space_moves(
     mut commands: Commands,
 ) {
     let now = time.elapsed();
-    for (entity, window, mut pending, focused, follows, moving) in pending {
+    for (entity, window, mut pending) in pending {
         let window_id = window.id();
         let pending = &mut *pending;
         let target = pending.target;
+        let follow_focus = matches!(pending.focus, MoveFocus::Follow);
+        let focused_member = windows
+            .focused()
+            .map(|(_, member)| member)
+            .filter(|member| pending.travels(*member));
 
         let (landed, whole) = match &mut pending.phase {
             MovePhase::Activating { neighbour } => {
-                // `confirm_native_space_focus` owns the observation; only once
-                // it has settled the request is the target asked about one
-                // more time, so the OS, not a marker, decides.
+                // The native switch observer owns activation confirmation.
                 if instant_space_switch.pending_target() == Some(target) {
                     continue;
                 }
                 let neighbour = *neighbour;
                 let activated = match window_manager.native_space_is_active(target) {
                     Ok(true) => {
-                        debug!(
-                            window_id,
-                            workspace_id = target,
-                            "native Space active after move; focusing the moved window"
-                        );
-                        commands.focus_entity(entity, true);
+                        if follow_focus
+                            && let Some(focus) =
+                                move_focus_target(entity, pending, &windows, &window_manager)
+                        {
+                            commands.focus_entity(focus, true);
+                        }
                         true
                     }
                     Ok(false) => {
@@ -2285,91 +2667,146 @@ fn observe_space_moves(
                         false
                     }
                 };
-                // A leader that still holds the focus marker on a Space that
-                // never came on screen would keep it, invisible, and block
-                // the lost-focus recovery; the source settles its focus as
-                // after a `Stay` move. One the user has since focused away
-                // from is left to that choice.
-                if !activated && focused {
+                // Respect a user focus change to a non-traveling window, but
+                // never strand focus on a child that left with the leader.
+                if !activated && focused_member.is_some() {
                     keep_source_focus(
                         entity,
                         pending,
-                        neighbour.filter(|neighbour| windows.get(*neighbour).is_some()),
+                        neighbour,
                         &strips,
+                        &windows,
                         &focus_history,
                         &mut commands,
                     );
                 }
-                release_move(entity, follows, &windows, &window_manager, &mut commands);
+                release_move(
+                    entity,
+                    pending,
+                    &member_flags,
+                    &windows,
+                    &window_manager,
+                    &mut commands,
+                );
                 continue;
             }
             MovePhase::Landing(request) => {
                 if !request.due(now) {
                     continue;
                 }
-                let Some(confirmed) = request.observe(&window_manager, window_id, now) else {
+                let logical =
+                    logical_landing(&pending.native_groups, &windows, &window_manager, target);
+                let strict = batch_landed(
+                    &window_manager,
+                    &mut request.windows,
+                    window_id,
+                    request.target,
+                );
+                let result = match &logical {
+                    Ok((_, _, whole)) => strict.map(|landed| landed && *whole),
+                    Err(err) => Err(Error::Generic(err.to_string())),
+                };
+                let Some(confirmed) = request.observe_result(result, window_id, now) else {
                     continue;
                 };
-
-                // Only members whose window still exists can be laid out; a
-                // closed one leaves with its own removal.
+                let (logical_landed, logical_groups, _) = logical.unwrap_or_default();
+                reconcile_move_groups(
+                    &mut pending.groups,
+                    &pending.native_groups,
+                    logical_groups,
+                    &window_manager,
+                    target,
+                );
+                // Native closure can be observed before the ECS removal. A
+                // member pruned from the request must not be placed as landed.
                 let live = pending
-                    .group
+                    .members
                     .iter()
-                    .filter(|(_, member_id)| windows.find(*member_id).is_some())
+                    .filter(|(member, member_id)| {
+                        (request.windows.contains(member_id) || logical_landed.contains(member))
+                            && windows
+                                .get(*member)
+                                .is_some_and(|window| window.id() == *member_id)
+                    })
                     .map(|(member, _)| *member)
                     .collect::<Vec<_>>();
                 let landed = if confirmed {
-                    live.clone()
+                    live
                 } else {
-                    let landed = members_on_target(&pending.group, target, &window_manager)
+                    let mut landed = members_on_target(&pending.members, target, &window_manager)
                         .into_iter()
                         .filter(|member| live.contains(member))
                         .collect::<Vec<_>>();
+                    for member in logical_landed {
+                        if !landed.contains(&member) {
+                            landed.push(member);
+                        }
+                    }
                     warn!(
                         window_id,
                         workspace_id = target,
                         ?landed,
-                        group = ?live,
+                        members = ?live,
                         "reconciling the members that did reach the native Space"
                     );
                     landed
                 };
-                // Only a batch confirmed as submitted — associated windows
-                // included, which the entity-bearing group alone cannot vouch
-                // for — is whole.
-                let whole = confirmed && landed.len() == live.len() && landed.contains(&entity);
+                // All native IDs, including untracked associated windows,
+                // must confirm before following is allowed.
+                let whole = confirmed && landed.contains(&entity);
                 (landed, whole)
             }
             MovePhase::Placing(placing) => {
                 if now < placing.next_check {
                     continue;
                 }
-                // A member that closed while its row was owed leaves with its
-                // own removal.
+                let logical =
+                    logical_landing(&pending.native_groups, &windows, &window_manager, target);
+                let (logical_landed, logical_groups, logical_whole) = logical.unwrap_or_default();
+                reconcile_move_groups(
+                    &mut pending.groups,
+                    &pending.native_groups,
+                    logical_groups,
+                    &window_manager,
+                    target,
+                );
                 let landed = pending
-                    .group
+                    .members
                     .iter()
                     .filter(|(member, member_id)| {
-                        placing.landed.contains(member) && windows.find(*member_id).is_some()
+                        placing.landed.contains(member)
+                            && (!pending.native_groups.iter().any(|native| {
+                                native.members.iter().any(|(entity, _)| entity == member)
+                            }) || logical_landed.contains(member)
+                                || matches!(window_manager.window_workspaces(*member_id).as_deref(), Ok([space]) if *space == target))
+                            && windows
+                                .get(*member)
+                                .is_some_and(|window| window.id() == *member_id)
                     })
                     .map(|(member, _)| *member)
                     .collect::<Vec<_>>();
-                (landed, placing.whole)
+                (landed, placing.whole && logical_whole)
             }
         };
 
-        // Tiled or floating is what each member is now, not what it was at
-        // submission: a member floated in flight joins no row, and a leader
-        // floating now is framed for the target's display instead.
-        let rowed = landed
+        // Current visibility and persistent mode decide participation at
+        // landing, independently for every member and logical group.
+        let rowed = pending
+            .groups
             .iter()
-            .copied()
-            .filter(|member| {
-                windows
-                    .get_managed(*member)
-                    .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+            .map(|group| {
+                group
+                    .iter()
+                    .copied()
+                    .filter(|member| {
+                        landed.contains(member)
+                            && windows
+                                .get_managed(*member)
+                                .is_some_and(|(_, _, flags)| flags.is_tiled())
+                    })
+                    .collect::<Vec<_>>()
             })
+            .filter(|group| !group.is_empty())
             .collect::<Vec<_>>();
         let placement = if rowed.is_empty() {
             None
@@ -2377,8 +2814,7 @@ fn observe_space_moves(
             resolve_placement(target, &strips, &displays, &window_manager)
         };
         if !rowed.is_empty() && placement.is_none() {
-            // Nothing is rewritten until the row is known: the members keep
-            // their last known layout, tiled where they were.
+            // Keep the last known layout until the destination row is known.
             if let MovePhase::Placing(placing) = &mut pending.phase {
                 if past_deadline(placing.since, now) {
                     warn!(
@@ -2388,7 +2824,14 @@ fn observe_space_moves(
                         waited = ?now.saturating_sub(placing.since),
                         "no row or display the ECS knows for the native Space before the deadline; the moved windows keep their last known layout"
                     );
-                    release_move(entity, follows, &windows, &window_manager, &mut commands);
+                    release_move(
+                        entity,
+                        pending,
+                        &member_flags,
+                        &windows,
+                        &window_manager,
+                        &mut commands,
+                    );
                 } else {
                     keep_placing(
                         placing,
@@ -2424,17 +2867,37 @@ fn observe_space_moves(
             None
         } else {
             let neighbour =
-                leave_source_rows(entity, target, &landed, &mut strips, &mut focus_history);
+                leave_source_rows(entity, pending, &landed, &mut strips, &mut focus_history);
             if let Some(placement) = placement {
                 join_target_row(target, &rowed, placement, &mut strips, &mut commands);
             }
-            let leader_floats = landed.contains(&entity)
-                && windows
-                    .get_managed(entity)
-                    .is_some_and(|(_, _, unmanaged)| {
-                        matches!(unmanaged, Some(Unmanaged::Floating))
+            let (virtual_index, index) = destination_row(&strips, target, &[])
+                .and_then(|row| strips.get(row).ok())
+                .map_or((0, 0), |(_, strip, _, _, _)| {
+                    (strip.virtual_index, strip.len())
+                });
+            for member in &landed {
+                let Some((window, _, flags)) = windows.get_managed(*member) else {
+                    continue;
+                };
+                if !flags.is_tiled()
+                    && let Ok(mut entity_commands) = commands.get_entity(*member)
+                {
+                    // A later unsuspend or tile toggle must not restore the
+                    // pre-move slot on the source Space.
+                    entity_commands.try_insert(PreviousManagedStrip {
+                        workspace_id: target,
+                        virtual_index,
+                        index,
                     });
-            if leader_floats {
+                }
+                if !flags.is_floating() {
+                    continue;
+                }
+                let moving = member_flags
+                    .get(*member)
+                    .ok()
+                    .and_then(|(_, moving)| moving);
                 let frame = moving.map_or_else(
                     || window.frame(),
                     |RepositionMarker(origin)| {
@@ -2442,7 +2905,7 @@ fn observe_space_moves(
                     },
                 );
                 reframe_landed_float(
-                    entity,
+                    *member,
                     target,
                     frame,
                     &window_manager,
@@ -2454,28 +2917,47 @@ fn observe_space_moves(
             neighbour
         };
         let stay = matches!(pending.focus, MoveFocus::Stay);
-        if focused && landed.contains(&entity) && (stay || !whole) {
+        if focused_member
+            .is_some_and(|member| landed.contains(&member) || !pending.native_groups.is_empty())
+            && (stay || !whole)
+        {
             keep_source_focus(
                 entity,
                 pending,
                 neighbour,
                 &strips,
+                &windows,
                 &focus_history,
                 &mut commands,
             );
         }
         if stay || !whole {
-            // A partial outcome neither switches Spaces nor takes focus
-            // anywhere; the layout already reflects the truth.
-            release_move(entity, follows, &windows, &window_manager, &mut commands);
+            // Partial outcomes reconcile truth, but never activate the target.
+            release_move(
+                entity,
+                pending,
+                &member_flags,
+                &windows,
+                &window_manager,
+                &mut commands,
+            );
             continue;
         }
 
         match submit_activation(&window_manager, target, &mut instant_space_switch, now) {
             Activation::Pending => pending.phase = MovePhase::Activating { neighbour },
             Activation::Current => {
-                commands.focus_entity(entity, true);
-                release_move(entity, follows, &windows, &window_manager, &mut commands);
+                if let Some(focus) = move_focus_target(entity, pending, &windows, &window_manager) {
+                    commands.focus_entity(focus, true);
+                }
+                release_move(
+                    entity,
+                    pending,
+                    &member_flags,
+                    &windows,
+                    &window_manager,
+                    &mut commands,
+                );
             }
             Activation::Refused => {
                 warn!(
@@ -2483,20 +2965,25 @@ fn observe_space_moves(
                     workspace_id = target,
                     "window moved but its native Space could not be activated; it is not focused there"
                 );
-                // The leader has left the screen with the focus marker; the
-                // source settles its focus as after a `Stay` move, so no
-                // invisible window keeps it.
-                if focused {
+                if focused_member.is_some() {
                     keep_source_focus(
                         entity,
                         pending,
                         neighbour,
                         &strips,
+                        &windows,
                         &focus_history,
                         &mut commands,
                     );
                 }
-                release_move(entity, follows, &windows, &window_manager, &mut commands);
+                release_move(
+                    entity,
+                    pending,
+                    &member_flags,
+                    &windows,
+                    &window_manager,
+                    &mut commands,
+                );
             }
         }
     }

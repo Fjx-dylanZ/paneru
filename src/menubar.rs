@@ -22,8 +22,8 @@ use crate::config::decorations::{
     DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::ActiveDisplay;
-use crate::ecs::{Bounds, FocusedMarker, Unmanaged};
+use crate::ecs::params::{ActiveDisplay, NotSuspended};
+use crate::ecs::{Bounds, FloatingMarker, FocusedMarker};
 use crate::events::{Event, EventSender};
 use crate::manager::request_ax_privilege;
 use crate::util::round_px;
@@ -625,10 +625,13 @@ impl Drop for MenuBarManager {
     }
 }
 
+type MenuBarWindow<'w, 's> =
+    Query<'w, 's, (&'static Bounds, Has<FloatingMarker>), (With<FocusedMarker>, NotSuspended)>;
+
 pub fn update_menu_bar(
     active_display: ActiveDisplay,
     workspaces: Query<&LayoutStrip>,
-    focused: Query<(&Bounds, Has<Unmanaged>), With<FocusedMarker>>,
+    focused: MenuBarWindow,
     config: Res<Config>,
     menu_bar: Option<NonSendMut<MenuBarManager>>,
 ) {
@@ -646,8 +649,8 @@ pub fn update_menu_bar(
     let viewport = active_display.actual_bounds(&config);
 
     let focused_window = focused.iter().next();
-    let focused_width_ratio = focused_window.and_then(|(bounds, unmanaged)| {
-        (!unmanaged).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
+    let focused_width_ratio = focused_window.and_then(|(bounds, floating)| {
+        (!floating).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
     });
 
     menu_bar.update(

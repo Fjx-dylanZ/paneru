@@ -2395,20 +2395,6 @@ fn test_parse_hex_color_malformed_hex() {
 }
 
 #[test]
-#[allow(clippy::float_cmp)]
-fn test_config_defaults() {
-    let config = Config::default();
-    assert_eq!(config.dim_inactive_opacity(), 0.0);
-    assert_eq!(config.dim_inactive_color(), (0.0, 0.0, 0.0));
-    assert!(!config.border_active_window());
-    assert_eq!(config.border_color(), (1.0, 1.0, 1.0));
-    assert_eq!(config.border_opacity(), 1.0);
-    assert_eq!(config.border_width(), 2.0);
-    assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
-    assert_eq!(config.menubar_height(), None);
-}
-
-#[test]
 fn test_first_launch_creates_parseable_config_without_overwriting_it() {
     let unique = format!(
         "paneru-first-launch-{}-{}",

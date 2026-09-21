@@ -2,7 +2,7 @@ use bevy::{
     ecs::{
         entity::Entity,
         hierarchy::ChildOf,
-        query::{With, Without},
+        query::{Has, Or, With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
         world::Mut,
     },
@@ -16,14 +16,15 @@ use super::{ActiveDisplayMarker, FocusFollowsMouse, InstantSpaceSwitch, SkipResh
 use crate::{
     config::Config,
     ecs::{
-        ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
-        Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio,
+        ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FloatingMarker, FocusedMarker,
+        FullWidthMarker, HiddenMarker, Initializing, LayoutPosition, MinimizedMarker,
+        NativeFullscreenMarker, Position, RepositionMarker, ResizeMarker, Scrolling, WidthRatio,
         layout::LayoutStrip,
         native_spaces::{
             NativeSpaceCreatePending, NativeSpaceDestroyPending, NativeSpacePlacementPending,
             SpaceMovePending,
         },
+        native_tabs::{NativeTabGroups, NativeTabsDirty},
         workspace::FollowSpacePending,
     },
     manager::{Application, Display, Origin, Size, Window},
@@ -232,6 +233,17 @@ impl ActiveDisplayMut<'_, '_> {
     }
 }
 
+pub(crate) type NotSuspended = (Without<MinimizedMarker>, Without<HiddenMarker>);
+pub(crate) type Suspended = Or<(With<MinimizedMarker>, With<HiddenMarker>)>;
+pub(crate) type WindowStateData = (
+    &'static Window,
+    Entity,
+    &'static ChildOf,
+    Has<FloatingMarker>,
+    Has<MinimizedMarker>,
+    Has<HiddenMarker>,
+);
+
 /// Markers indicating something is still in motion — frames to draw, or a
 /// native Space request whose confirmation has yet to be observed; used by the
 /// event pump to decide how long it may sleep.
@@ -242,11 +254,12 @@ pub struct FrameActivity<'w, 's> {
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     space_switch: Res<'w, InstantSpaceSwitch>,
-    following: Query<'w, 's, (), With<FollowSpacePending>>,
+    following: Query<'w, 's, (), (With<FollowSpacePending>, NotSuspended)>,
     creating: Query<'w, 's, (), With<NativeSpaceCreatePending>>,
     placing: Query<'w, 's, (), With<NativeSpacePlacementPending>>,
     destroying: Query<'w, 's, (), With<NativeSpaceDestroyPending>>,
     moving: Query<'w, 's, (), With<SpaceMovePending>>,
+    native_tabs: Query<'w, 's, (), With<NativeTabsDirty>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -265,6 +278,7 @@ impl FrameActivity<'_, '_> {
             || !self.placing.is_empty()
             || !self.destroying.is_empty()
             || !self.moving.is_empty()
+            || !self.native_tabs.is_empty()
     }
 }
 
@@ -294,18 +308,31 @@ type WindowPlacements<'w, 's> = Query<
     With<Window>,
 >;
 
+/// Persistent layout mode and independent visibility suspension flags.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowStateFlags {
+    pub floating: bool,
+    pub minimized: bool,
+    pub hidden: bool,
+}
+
+impl WindowStateFlags {
+    pub fn is_suspended(self) -> bool {
+        self.minimized || self.hidden
+    }
+
+    pub fn is_tiled(self) -> bool {
+        !self.floating && !self.is_suspended()
+    }
+
+    pub fn is_floating(self) -> bool {
+        self.floating && !self.is_suspended()
+    }
+}
+
 #[derive(SystemParam)]
 pub struct Windows<'w, 's> {
-    all: Query<
-        'w,
-        's,
-        (
-            &'static Window,
-            Entity,
-            &'static ChildOf,
-            Option<&'static Unmanaged>,
-        ),
-    >,
+    all: Query<'w, 's, WindowStateData>,
     focus: Query<'w, 's, (&'static Window, Entity), With<FocusedMarker>>,
     previous_size: Query<
         'w,
@@ -319,19 +346,37 @@ pub struct Windows<'w, 's> {
         With<FullWidthMarker>,
     >,
     positions: WindowPlacements<'w, 's>,
+    native_tabs: Query<'w, 's, &'static NativeTabGroups>,
 }
 
 impl Windows<'_, '_> {
-    fn get_all(&self, entity: Entity) -> Option<(&Window, Entity, &ChildOf, Option<&Unmanaged>)> {
+    pub(crate) fn native_tab_groups(&self, entity: Entity) -> Option<&NativeTabGroups> {
+        let (_, _, parent, _, _, _) = self.all.get(entity).ok()?;
+        self.native_tabs.get(parent.parent()).ok()
+    }
+
+    fn get_all(&self, entity: Entity) -> Option<(&Window, Entity, &ChildOf, WindowStateFlags)> {
         self.all
             .get(entity)
             .inspect_err(|err| warn!("unable to find window: {err}"))
             .ok()
+            .map(|(window, entity, parent, floating, minimized, hidden)| {
+                (
+                    window,
+                    entity,
+                    parent,
+                    WindowStateFlags {
+                        floating,
+                        minimized,
+                        hidden,
+                    },
+                )
+            })
     }
 
-    pub fn get_managed(&self, entity: Entity) -> Option<(&Window, Entity, Option<&Unmanaged>)> {
+    pub fn get_managed(&self, entity: Entity) -> Option<(&Window, Entity, WindowStateFlags)> {
         self.get_all(entity)
-            .map(|(window, entity, _, unmanaged)| (window, entity, unmanaged))
+            .map(|(window, entity, _, flags)| (window, entity, flags))
     }
 
     pub fn get(&self, entity: Entity) -> Option<&Window> {
@@ -341,37 +386,45 @@ impl Windows<'_, '_> {
     pub fn find(&self, window_id: WinID) -> Option<(&Window, Entity)> {
         self.all
             .into_iter()
-            .find(|(window, _, _, _)| window.id() == window_id)
-            .map(|(window, entity, _, _)| (window, entity))
+            .find(|(window, _, _, _, _, _)| window.id() == window_id)
+            .map(|(window, entity, _, _, _, _)| (window, entity))
     }
 
     pub fn find_parent(&self, window_id: WinID) -> Option<(&Window, Entity, Entity)> {
-        self.all.iter().find_map(|(window, entity, childof, _)| {
-            (window.id() == window_id).then_some((window, entity, childof.parent()))
-        })
+        self.all
+            .iter()
+            .find_map(|(window, entity, childof, _, _, _)| {
+                (window.id() == window_id).then_some((window, entity, childof.parent()))
+            })
     }
 
     pub fn find_managed(&self, window_id: WinID) -> Option<(&Window, Entity)> {
-        self.all.iter().find_map(|(window, entity, _, unmanaged)| {
-            (unmanaged.is_none() && window.id() == window_id).then_some((window, entity))
-        })
+        self.all
+            .iter()
+            .find_map(|(window, entity, _, floating, minimized, hidden)| {
+                (!floating && !minimized && !hidden && window.id() == window_id)
+                    .then_some((window, entity))
+            })
     }
 
     pub fn focused(&self) -> Option<(&Window, Entity)> {
-        self.focus.single().ok()
+        self.focus.single().ok().filter(|(_, entity)| {
+            self.get_managed(*entity)
+                .is_some_and(|(_, _, flags)| !flags.is_suspended())
+        })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Window, Entity)> {
         self.all
             .iter()
-            .map(|(window, entity, _, _)| (window, entity))
+            .map(|(window, entity, _, _, _, _)| (window, entity))
     }
 
     pub fn managed_iter(&self) -> impl Iterator<Item = (&Window, Entity, &ChildOf)> {
         self.all
             .iter()
-            .filter_map(|(window, entity, childof, unmanaged)| {
-                unmanaged.is_none().then_some((window, entity, childof))
+            .filter_map(|(window, entity, childof, floating, minimized, hidden)| {
+                (!floating && !minimized && !hidden).then_some((window, entity, childof))
             })
     }
 

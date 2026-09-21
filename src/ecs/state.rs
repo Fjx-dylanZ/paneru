@@ -17,9 +17,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
+use crate::ecs::native_spaces::DestroyedSpaceMarker;
+use crate::ecs::native_tabs::NativeTabGroups;
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
-use crate::manager::{Application, Display, WindowManager};
+use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker};
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use paneru_shared_types::windowset::WindowSet;
 
@@ -407,24 +409,29 @@ struct SavedWorkspaceBuilder {
     strips: Vec<SavedStrip>,
 }
 
+type WorkspaceStateData = (
+    &'static ChildOf,
+    &'static LayoutStrip,
+    Has<ActiveWorkspaceMarker>,
+    Has<SelectedVirtualMarker>,
+    Has<DestroyedSpaceMarker>,
+);
+
+/// An inactive logical tab keeps its layout slot and last-known frame even
+/// though Cocoa exposes only the selected member as an on-screen window.
+fn is_inactive_native_tab(groups: Option<&NativeTabGroups>, entity: Entity) -> bool {
+    groups.is_some_and(|groups| groups.is_inactive(entity))
+}
+
 /// The world access [`QueryState::extract`] needs, bundled so callers (the
 /// socket query handler, the embedded Lua runtime) take one parameter instead
 /// of six.
 #[derive(SystemParam)]
 pub struct QueryStateParams<'w, 's> {
-    workspaces: Query<
-        'w,
-        's,
-        (
-            &'static ChildOf,
-            &'static LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
-        ),
-    >,
+    workspaces: Query<'w, 's, WorkspaceStateData>,
     displays: Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows<'w, 's>,
-    apps: Query<'w, 's, &'static Application>,
+    apps: Query<'w, 's, (&'static Application, Option<&'static NativeTabGroups>)>,
     window_manager: Res<'w, WindowManager>,
     config: Res<'w, Config>,
 }
@@ -459,39 +466,56 @@ impl QueryStateParams<'_, '_> {
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
     pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
+        use paneru_shared_types::windowset::{ColumnSet, WorkspaceSet};
 
-        let focused_entity = self.windows.focused().map(|(_, entity)| entity);
+        let focused_window = self.windows.focused();
+        let focused_entity = focused_window.map(|(_, entity)| entity);
         let sliver_width = self.config.sliver_width();
-        let active_workspace_id = self
-            .workspaces
-            .iter()
-            .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
+        let active_workspace_id =
+            self.workspaces
+                .iter()
+                .find_map(|(_, strip, active, _, destroyed)| {
+                    (active && !destroyed).then_some(strip.id())
+                });
+        let mut focused = focused_window
+            .filter(|(window, entity)| !self.inactive_native_tab(window, *entity))
+            .map(|(window, _)| window.id());
 
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
         let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
-        for (child, strip, active_workspace, selected_workspace) in self.workspaces {
-            // Only ask for floating windows on a workspace that's actually
-            // showing, since this read goes out to the window server.
-            let floating_entities = if active_workspace
-                || selected_workspace && active_workspace_id != Some(strip.id())
+        for (child, strip, active_workspace, selected_workspace, destroyed_workspace) in
+            self.workspaces
+        {
+            let active_workspace = active_workspace && !destroyed_workspace;
+            if destroyed_workspace && focused_entity.is_some_and(|entity| strip.contains(entity)) {
+                focused = None;
+            }
+            // Retained rows of destroyed Spaces are last-known layout only.
+            // Only ask the window server for floating windows on a live row
+            // that's actually showing.
+            let floating_entities = if !destroyed_workspace
+                && (active_workspace
+                    || selected_workspace && active_workspace_id != Some(strip.id()))
             {
                 self.window_manager.windows_in_workspace(strip.id())?
             } else {
                 Vec::new()
             };
 
-            // A window stays tracked by the strip after it's floated (so it can
-            // be re-tiled later), so it's the `Floating` marker — not strip
-            // membership — that decides whether it goes in `columns` or `floating`.
+            // Mode, not incidental strip membership, determines a window's
+            // query tier. Floating intent survives visibility suspension.
             let mut floating = Vec::new();
             let mut columns: Vec<ColumnSet> = Vec::new();
             for column in strip.columns() {
                 let mut tiled = Vec::new();
                 for entity in column.window_iter() {
-                    let Some(record) = self.window_record(entity, focused_entity, sliver_width)
-                    else {
+                    let Some(record) = self.window_record(
+                        entity,
+                        focused_entity,
+                        sliver_width,
+                        destroyed_workspace,
+                    ) else {
                         continue;
                     };
                     if record.floating {
@@ -526,11 +550,17 @@ impl QueryStateParams<'_, '_> {
                     .into_iter()
                     .filter_map(|window_id| {
                         let (_, entity) = self.windows.find(window_id)?;
-                        let (_, _, unmanaged) = self.windows.get_managed(entity)?;
-                        (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
-                            .then_some(entity)
+                        let (_, _, flags) = self.windows.get_managed(entity)?;
+                        (flags.floating && !strip.contains(entity)).then_some(entity)
                     })
-                    .filter_map(|entity| self.window_record(entity, focused_entity, sliver_width)),
+                    .filter_map(|entity| {
+                        self.window_record(
+                            entity,
+                            focused_entity,
+                            sliver_width,
+                            destroyed_workspace,
+                        )
+                    }),
             );
 
             strips_by_display
@@ -545,8 +575,26 @@ impl QueryStateParams<'_, '_> {
                 });
         }
 
-        let displays = self
-            .displays
+        Ok(WindowSet::new(
+            self.display_sets(strips_by_display),
+            focused,
+        ))
+    }
+
+    fn inactive_native_tab(&self, window: &Window, entity: Entity) -> bool {
+        self.windows
+            .find_parent(window.id())
+            .and_then(|(_, _, app_entity)| self.apps.get(app_entity).ok())
+            .is_some_and(|(_, groups)| is_inactive_native_tab(groups, entity))
+    }
+
+    fn display_sets(
+        &self,
+        mut strips_by_display: HashMap<Entity, Vec<paneru_shared_types::windowset::WorkspaceSet>>,
+    ) -> Vec<paneru_shared_types::windowset::DisplaySet> {
+        use paneru_shared_types::windowset::DisplaySet;
+
+        self.displays
             .iter()
             .map(|(display, entity, active)| {
                 let bounds = display.bounds();
@@ -564,12 +612,7 @@ impl QueryStateParams<'_, '_> {
                     workspaces: std::sync::Arc::new(workspaces),
                 }
             })
-            .collect();
-
-        let focused = focused_entity
-            .and_then(|entity| self.windows.get(entity))
-            .map(|window| window.id());
-        Ok(WindowSet::new(displays, focused))
+            .collect()
     }
 
     /// One window, as a script sees it. `None` for an entity that is no longer
@@ -579,17 +622,19 @@ impl QueryStateParams<'_, '_> {
         entity: Entity,
         focused: Option<Entity>,
         sliver_width: i32,
+        destroyed_workspace: bool,
     ) -> Option<paneru_shared_types::windowset::WindowRec> {
-        let (window, _, unmanaged) = self.windows.get_managed(entity)?;
+        let (window, _, flags) = self.windows.get_managed(entity)?;
         let (_, _, app_entity) = self.windows.find_parent(window.id())?;
-        let app = self.apps.get(app_entity).ok()?;
+        let (app, groups) = self.apps.get(app_entity).ok()?;
         let frame = self.windows.frame(entity);
-        // Minimized and hidden windows are never on screen, whatever their last
-        // known frame says.
-        let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
-        let visible = frame
-            .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
-            .is_some_and(|(_, visible)| visible && !hidden);
+        // Destroyed workspaces, minimized, hidden and inactive native tabs
+        // are never on screen, whatever their last known frame says.
+        let hidden = flags.is_suspended() || is_inactive_native_tab(groups, entity);
+        let visible = !destroyed_workspace
+            && frame
+                .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
+                .is_some_and(|(_, visible)| visible && !hidden);
 
         Some(paneru_shared_types::windowset::WindowRec {
             id: window.id(),
@@ -602,10 +647,10 @@ impl QueryStateParams<'_, '_> {
                 width: frame.width(),
                 height: frame.height(),
             }),
-            floating: matches!(unmanaged, Some(Unmanaged::Floating)),
-            managed: unmanaged.is_none(),
+            floating: flags.floating,
+            managed: flags.is_tiled(),
             visible,
-            focused: focused == Some(entity),
+            focused: !destroyed_workspace && !hidden && focused == Some(entity),
         })
     }
 }
@@ -623,15 +668,10 @@ fn column_kind(column: &Column) -> paneru_shared_types::windowset::ColumnKind {
 
 pub trait QueryState: std::marker::Sized {
     fn extract(
-        workspaces: &Query<(
-            &ChildOf,
-            &LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
-        )>,
+        workspaces: &Query<WorkspaceStateData>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
-        apps: &Query<&Application>,
+        apps: &Query<(&Application, Option<&NativeTabGroups>)>,
         window_manager: &WindowManager,
         config: &Config,
     ) -> crate::errors::Result<Self>;
@@ -644,15 +684,10 @@ pub trait QueryState: std::marker::Sized {
 impl QueryState for PaneruQueryState {
     #[allow(clippy::too_many_lines)]
     fn extract(
-        workspaces: &Query<(
-            &ChildOf,
-            &LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
-        )>,
+        workspaces: &Query<WorkspaceStateData>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
-        apps: &Query<&Application>,
+        apps: &Query<(&Application, Option<&NativeTabGroups>)>,
         window_manager: &WindowManager,
         config: &Config,
     ) -> crate::errors::Result<Self> {
@@ -664,7 +699,9 @@ impl QueryState for PaneruQueryState {
             .find_map(|(display, entity, active)| active.then_some((display.id(), entity)));
         let active_workspace_id = workspaces
             .iter()
-            .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
+            .find_map(|(_, strip, active, _, destroyed)| {
+                (active && !destroyed).then_some(strip.id())
+            });
 
         let mut virtual_workspaces = Vec::new();
         let mut workspace_max_numbers: HashMap<WorkspaceId, u32> = HashMap::new();
@@ -673,9 +710,14 @@ impl QueryState for PaneruQueryState {
             ..PaneruActiveState::default()
         };
 
-        for (child, strip, active_workspace, selected_workspace) in workspaces {
-            let floating = if active_workspace
-                || selected_workspace && active_workspace_id != Some(strip.id())
+        for (child, strip, active_workspace, selected_workspace, destroyed_workspace) in workspaces
+        {
+            let active_workspace = active_workspace && !destroyed_workspace;
+            // A destroyed row preserves unresolved windows without asking the
+            // window server to enumerate a Space it has definitively removed.
+            let floating = if !destroyed_workspace
+                && (active_workspace
+                    || selected_workspace && active_workspace_id != Some(strip.id()))
             {
                 window_manager.windows_in_workspace(strip.id())?
             } else {
@@ -684,36 +726,36 @@ impl QueryState for PaneruQueryState {
             .into_iter()
             .filter_map(|window_id| {
                 let (_, entity) = windows.find(window_id)?;
-                let (_, _, unmanaged) = windows.get_managed(entity)?;
-                (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
-                    .then_some(entity)
+                let (_, _, flags) = windows.get_managed(entity)?;
+                (flags.floating && !strip.contains(entity)).then_some(entity)
             });
             let row_windows = strip
                 .all_windows()
                 .into_iter()
                 .chain(floating)
                 .filter_map(|entity| {
-                    let (window, _, unmanaged) = windows.get_managed(entity)?;
+                    let (window, _, flags) = windows.get_managed(entity)?;
                     let (_, _, app_entity) = windows.find_parent(window.id())?;
-                    let app = apps.get(app_entity).ok()?;
+                    let (app, groups) = apps.get(app_entity).ok()?;
                     let bundle_id = app.bundle_id().unwrap_or_default().clone();
                     let app_name = app.name().to_string();
                     let title = window.title().unwrap_or_default();
                     let frame = windows.frame(entity);
-                    // Minimized and hidden windows are never on screen, whatever
-                    // their last known frame says.
-                    let hidden =
-                        matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+                    // Inactive native tabs retain their last-known metadata,
+                    // but only the selected member can be on screen or focused.
+                    let hidden = flags.is_suspended() || is_inactive_native_tab(groups, entity);
                     let visibility = frame
                         .and_then(|frame| window_visibility(frame, displays, sliver_width))
-                        .map(|(display_id, visible)| (display_id, visible && !hidden));
+                        .map(|(display_id, visible)| {
+                            (display_id, visible && !hidden && !destroyed_workspace)
+                        });
                     Some(PaneruWindowState {
                         window_id: window.id(),
                         bundle_id,
                         app_name,
                         title,
-                        focused: focused_entity == Some(entity),
-                        floating: matches!(unmanaged, Some(Unmanaged::Floating)),
+                        focused: !destroyed_workspace && !hidden && focused_entity == Some(entity),
+                        floating: flags.floating,
                         display_id: visibility.map(|(display_id, _)| display_id),
                         frame: frame.map(|frame| Frame {
                             x: frame.min.x,
