@@ -1123,6 +1123,42 @@ mod tests {
     }
 
     #[test]
+    fn config_snapshot_customization_is_applied_only_by_setup() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r"
+                local config = paneru.config
+                config.options.skip_native_space_switch_animation =
+                  not config.options.skip_native_space_switch_animation
+                config.options.float_move_step = config.options.float_move_step * 2
+                config.swipe.scroll.window_step = not config.swipe.scroll.window_step
+                paneru.setup(config)
+
+                -- Editing the inspection table after setup must not silently
+                -- change the configuration handed to the window manager.
+                paneru.config.options.skip_native_space_switch_animation =
+                  not paneru.config.options.skip_native_space_switch_animation
+                paneru.config.options.float_move_step = 0.75
+                paneru.config.swipe.scroll.window_step = not paneru.config.swipe.scroll.window_step
+                ",
+            )
+            .expect("the defaults snapshot should be accepted by setup");
+
+        let defaults = Config::defaults().unwrap();
+        let config = runtime.built_config().expect("setup should build a config");
+        assert_eq!(
+            config.skip_native_space_switch_animation(),
+            !defaults.skip_native_space_switch_animation()
+        );
+        assert!((config.float_move_step() - defaults.float_move_step() * 2.0).abs() < f64::EPSILON);
+        assert_eq!(
+            config.swipe_scroll_window_step(),
+            !defaults.swipe_scroll_window_step()
+        );
+    }
+
+    #[test]
     fn paneru_config_has_resolved_defaults_before_setup() {
         let world = TestWorld::default();
         let runtime = world

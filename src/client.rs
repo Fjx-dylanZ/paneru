@@ -1,7 +1,6 @@
 //! The `paneru …` CLI side of the protocol: sends requests to the running
-//! daemon and prints the answer as JSON. This is the only place JSON is
-//! produced; the daemon and its clients otherwise speak typed `MessagePack`
-//! values.
+//! daemon and prints the answer as JSON. The daemon and its clients speak
+//! typed `MessagePack` values; JSON is rendered only at the CLI and Lua edges.
 
 use crate::types::state::{StateEvent, StateQueryKind};
 use crate::types::wire::{

@@ -1,7 +1,7 @@
 //! The Paneru command vocabulary.
 //!
 //! Every way of telling the window manager to do something funnels through
-//! [`Command`]: the TOML `[bindings]` table, the `send-cmd` socket protocol, an
+//! [`Command`]: the TOML `[bindings]` table, the `send-cmd` Mach protocol, an
 //! embedded Lua `init.lua`, and the loadable Lua client module. This crate owns
 //! the types and their argv encoding ([`parse_command`] / [`Command::to_argv`]).
 
@@ -89,10 +89,9 @@ impl Direction {
 
 /// The plain, externally tagged spelling of [`Direction`], used on the wire.
 ///
-/// A binary format cannot decode the flexible `"east"`-or-`3` form below —
-/// `untagged` works by asking the format what the next value *is*, which only a
-/// self-describing one can answer. This mirror carries the same variants with a
-/// derived impl, so the wire gets a discriminant and a payload.
+/// This mirror preserves serde's externally tagged representation, including
+/// the zero-based payload of `Nth`. Human-readable input below instead accepts
+/// a bare one-based number, so it must not decode the wire representation.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DirectionRepr {

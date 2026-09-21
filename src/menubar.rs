@@ -31,9 +31,10 @@ use crate::config::decorations::{
     DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::ActiveDisplay;
+use crate::ecs::params::{ActiveDisplay, NotSuspended};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FloatingMarker,
+    FocusedMarker, HiddenMarker, MinimizedMarker,
 };
 use crate::events::{Event, EventSender};
 use crate::manager::Display;
@@ -779,29 +780,42 @@ impl Drop for MenuBarManager {
 
 type FocusedMenuChanges = (
     With<FocusedMarker>,
-    Or<(Added<FocusedMarker>, Changed<Bounds>, Changed<Unmanaged>)>,
+    Or<(
+        Added<FocusedMarker>,
+        Changed<Bounds>,
+        Changed<FloatingMarker>,
+        Changed<MinimizedMarker>,
+        Changed<HiddenMarker>,
+    )>,
 );
 
 /// Position-only animation and swipe frames do not affect menu content.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn menu_bar_dirty(
     strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
     focus_changed: Query<(), FocusedMenuChanges>,
     workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
     strips_added: Query<(), Added<LayoutStrip>>,
     mut focus_lost: RemovedComponents<FocusedMarker>,
-    mut unmanaged_removed: RemovedComponents<Unmanaged>,
+    mut floating_removed: RemovedComponents<FloatingMarker>,
+    mut minimized_removed: RemovedComponents<MinimizedMarker>,
+    mut hidden_removed: RemovedComponents<HiddenMarker>,
     mut strips_removed: RemovedComponents<LayoutStrip>,
 ) -> bool {
     // Drain every removal reader even when another input already dirtied us.
     let focus_lost = focus_lost.read().count() > 0;
-    let unmanaged_removed = unmanaged_removed.read().count() > 0;
+    let floating_removed = floating_removed.read().count() > 0;
+    let minimized_removed = minimized_removed.read().count() > 0;
+    let hidden_removed = hidden_removed.read().count() > 0;
     let strips_removed = strips_removed.read().count() > 0;
     !strip_changed.is_empty()
         || !focus_changed.is_empty()
         || !workspace_changed.is_empty()
         || !strips_added.is_empty()
         || focus_lost
-        || unmanaged_removed
+        || floating_removed
+        || minimized_removed
+        || hidden_removed
         || strips_removed
 }
 
@@ -832,10 +846,13 @@ fn selected_width_percentages(widths: &[i32], ratio: Option<f64>) -> Vec<i32> {
         .collect()
 }
 
+type MenuBarWindow<'w, 's> =
+    Query<'w, 's, (&'static Bounds, Has<FloatingMarker>), (With<FocusedMarker>, NotSuspended)>;
+
 pub fn update_menu_bar(
     active_display: ActiveDisplay,
     workspaces: Query<&LayoutStrip>,
-    focused: Query<(&Bounds, Has<Unmanaged>), With<FocusedMarker>>,
+    focused: MenuBarWindow,
     config: Res<Config>,
     visibility: Res<MenuBarVisibility>,
     menu_bar: Option<NonSendMut<MenuBarManager>>,
@@ -862,8 +879,8 @@ pub fn update_menu_bar(
     let viewport = active_display.actual_bounds(&config);
 
     let focused_window = focused.iter().next();
-    let focused_width_ratio = focused_window.and_then(|(bounds, unmanaged)| {
-        (!unmanaged).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
+    let focused_width_ratio = focused_window.and_then(|(bounds, floating)| {
+        (!floating).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
     });
 
     menu_bar.update(
@@ -1115,7 +1132,9 @@ mod tests {
     #[test]
     fn menu_updates_ignore_position_animation_but_track_menu_inputs() {
         use crate::ecs::layout::LayoutStrip;
-        use crate::ecs::{ActiveWorkspaceMarker, Bounds, FocusedMarker, Position, Unmanaged};
+        use crate::ecs::{
+            ActiveWorkspaceMarker, Bounds, FloatingMarker, FocusedMarker, MinimizedMarker, Position,
+        };
         use bevy::app::{App, PostUpdate};
         use bevy::ecs::{resource::Resource, schedule::IntoScheduleConfigs, system::ResMut};
         use bevy::math::IVec2;
@@ -1150,37 +1169,45 @@ mod tests {
         app.world_mut().get_mut::<Bounds>(window).unwrap().0.x = 500;
         app.update();
         assert_eq!(app.world().resource::<Updates>().0, 2);
-        app.world_mut()
-            .entity_mut(window)
-            .insert(Unmanaged::Floating);
+        app.world_mut().entity_mut(window).insert(FloatingMarker);
         app.update();
         assert_eq!(app.world().resource::<Updates>().0, 3);
-        app.world_mut().entity_mut(window).remove::<Unmanaged>();
+        app.world_mut()
+            .entity_mut(window)
+            .remove::<FloatingMarker>();
         app.update();
         assert_eq!(app.world().resource::<Updates>().0, 4);
-        app.world_mut().entity_mut(window).remove::<FocusedMarker>();
+        app.world_mut().entity_mut(window).insert(MinimizedMarker);
         app.update();
         assert_eq!(app.world().resource::<Updates>().0, 5);
-        app.world_mut().get_mut::<Bounds>(window).unwrap().0.x = 600;
-        app.update();
-        assert_eq!(app.world().resource::<Updates>().0, 5);
-        app.world_mut().entity_mut(window).insert(FocusedMarker);
+        app.world_mut()
+            .entity_mut(window)
+            .remove::<MinimizedMarker>();
         app.update();
         assert_eq!(app.world().resource::<Updates>().0, 6);
+        app.world_mut().entity_mut(window).remove::<FocusedMarker>();
+        app.update();
+        assert_eq!(app.world().resource::<Updates>().0, 7);
+        app.world_mut().get_mut::<Bounds>(window).unwrap().0.x = 600;
+        app.update();
+        assert_eq!(app.world().resource::<Updates>().0, 7);
+        app.world_mut().entity_mut(window).insert(FocusedMarker);
+        app.update();
+        assert_eq!(app.world().resource::<Updates>().0, 8);
         app.world_mut()
             .get_mut::<LayoutStrip>(strip)
             .unwrap()
             .virtual_index = 1;
         app.update();
-        assert_eq!(app.world().resource::<Updates>().0, 7);
+        assert_eq!(app.world().resource::<Updates>().0, 9);
         let offscreen = app.world_mut().spawn(LayoutStrip::new(1, 2)).id();
         app.update();
-        assert_eq!(app.world().resource::<Updates>().0, 8);
+        assert_eq!(app.world().resource::<Updates>().0, 10);
         app.world_mut().despawn(offscreen);
         app.update();
-        assert_eq!(app.world().resource::<Updates>().0, 9);
+        assert_eq!(app.world().resource::<Updates>().0, 11);
         app.update();
-        assert_eq!(app.world().resource::<Updates>().0, 9);
+        assert_eq!(app.world().resource::<Updates>().0, 11);
     }
 
     #[test]

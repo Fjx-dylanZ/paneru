@@ -1,7 +1,7 @@
 //! The client half of the API: talks to a running daemon over its Mach
 //! service. [`module`] builds the table `require("paneru")` returns.
 //!
-//! Service name defaults to `com.karinushka.paneru`, overridable via the
+//! Service name defaults to [`wire::SERVICE_NAME`], overridable via the
 //! `PANERU_MACH_SERVICE` environment variable or `paneru.set_service_name`.
 //!
 //! Every call here blocks: Lua's C API is synchronous, so a callback cannot

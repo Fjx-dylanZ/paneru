@@ -6,7 +6,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Has, With};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, NonSend, Query, Res};
 use bevy::ecs::world::World;
@@ -22,11 +22,13 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::native_spaces::SpaceMovePending;
+use crate::ecs::params::NotSuspended;
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties, RepositionMarker,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FloatingMarker, FocusedMarker,
+    LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
+    RepositionMarker, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout,
     VerifyWindowSize,
 };
 use crate::events::Event;
@@ -38,7 +40,7 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::system::ResMut;
 
 const ORPHANED_SPACES_TIMEOUT_SEC: u64 = 30;
-const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);
+pub(crate) const DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(350);
 const DISPLAY_VERIFY_DELAY: Duration = Duration::from_secs(1);
 const DISPLAY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DISPLAY_RETRIES: u8 = 3;
@@ -326,10 +328,16 @@ fn migrate_moved_windows_to_space(
         return;
     };
 
-    let managed_windows: HashMap<WinID, Entity> = world
-        .query::<(&Window, Entity, Has<Unmanaged>)>()
+    let candidates: Vec<(WinID, Entity)> = world
+        .query_filtered::<(&Window, Entity), (Without<FloatingMarker>, NotSuspended)>()
         .iter(world)
-        .filter_map(|(window, entity, unmanaged)| (!unmanaged).then_some((window.id(), entity)))
+        .map(|(window, entity)| (window.id(), entity))
+        .collect();
+    // A window travelling with a native Space move is left to that move.
+    let mut moves = world.query::<&SpaceMovePending>();
+    let managed_windows: HashMap<WinID, Entity> = candidates
+        .into_iter()
+        .filter(|(_, entity)| !moves.iter(world).any(|pending| pending.travels(*entity)))
         .collect();
     if managed_windows.is_empty() {
         return;
