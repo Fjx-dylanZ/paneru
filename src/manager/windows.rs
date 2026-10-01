@@ -1,8 +1,9 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess, kAXFloatingWindowSubrole,
-    kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute, kAXStandardWindowSubrole,
-    kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef, AXValueCreate,
+    AXValueGetValue, kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess,
+    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
+    kAXStandardWindowSubrole, kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -512,6 +513,7 @@ impl WindowOS {
                 bundle_id.unwrap_or_default(),
                 role.as_deref(),
                 subrole.as_deref(),
+                || self.identifier().ok(),
             )
             .iter()
             .any(|params| params.manage.is_some_and(|manage| manage))

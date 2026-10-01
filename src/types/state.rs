@@ -336,6 +336,8 @@ mod tests {
                     "bundle_id": "com.example.app",
                     "app_name": "Example",
                     "title": "window",
+                    "role": "AXWindow",
+                    "subrole": "AXStandardWindow",
                     "focused": true,
                     "floating": false,
                     "display_id": 1,

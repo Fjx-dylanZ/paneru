@@ -1393,6 +1393,7 @@ fn copy_window_rule(
     let title = window.title().unwrap_or_default();
     let role = window.role().unwrap_or_default();
     let subrole = window.subrole().unwrap_or_default();
+    let identifier = window.identifier().unwrap_or_default();
     let snippet = window_rule_snippet(
         *dialect,
         &RuleSubject {
@@ -1401,6 +1402,7 @@ fn copy_window_rule(
             title: &title,
             role: &role,
             subrole: &subrole,
+            identifier: &identifier,
         },
     );
 

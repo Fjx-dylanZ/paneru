@@ -229,6 +229,8 @@ mod tests {
                     bundle_id: "com.example.app".to_string(),
                     app_name: "Example".to_string(),
                     title: "日本語".to_string(),
+                    role: Some("AXWindow".to_string()),
+                    subrole: Some("AXStandardWindow".to_string()),
                     focused: true,
                     floating: true,
                     display_id: Some(2),

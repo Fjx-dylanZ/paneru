@@ -168,9 +168,16 @@ fn keyboard_focus_warps_mouse_to_centered_window() {
         )
             .into();
         let mut harness = TestHarness::new().with_config(config).with_windows(3);
-        let mut commands = vec![Event::Command {
-            command: Command::PrintState,
-        }];
+        // Establish focus after startup so First is a real focus transition,
+        // independent of which window workspace restoration initially selects.
+        let mut commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::Last)),
+            },
+        ];
 
         // Include a jump to a window initially outside the viewport.
         for (direction, window_id) in [
