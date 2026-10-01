@@ -476,8 +476,8 @@ structured `paneru query` responses and `paneru subscribe` event stream.
 
 ## 6. Window Rules (`[windows]`)
 
-Define specific behaviors for applications based on their Title, Bundle ID, or
-accessibility role/subrole.
+Define specific behaviors for applications based on their Title, Bundle ID,
+accessibility role/subrole or identifier. All matchers in a rule must match.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
@@ -485,6 +485,7 @@ accessibility role/subrole.
 | `bundle_id` | String | Optional Bundle ID to match (e.g., `com.apple.Terminal`). |
 | `role` | String | Optional accessibility role to match exactly (e.g., `AXWindow`). A rule with `role` never matches a window that reports none. |
 | `subrole` | String | Optional accessibility subrole to match exactly (e.g., `AXStandardWindow`, `AXDialog`, `AXFloatingWindow`). A rule with `subrole` never matches a window that reports none. |
+| `identifier` | Regex | Optional regex to match the window's `AXIdentifier`. Some apps use it to tell window kinds apart when title and bundle ID are the same. A window without an identifier never matches. |
 | `floating` | Boolean | Force the window to be floating/unmanaged. |
 | `follow` | Boolean | Keep the window on Paneru's current native macOS Space. Implies `floating = true`. |
 | `manage` | Boolean | Force Paneru to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
@@ -533,6 +534,21 @@ subrole = "AXFloatingWindow"
 floating = true
 ```
 
+Placement (`floating`, `index`, `width`, …) is decided once, when the window
+first appears, so a title the app sets later does not move it. When an app's
+windows share a bundle ID and their titles at that moment are not distinctive,
+match on `identifier` instead. Arc's Little Arc windows, for example, carry an
+identifier starting with `littleBrowserWindow-`, while regular windows start
+with `bigBrowserWindow-`:
+
+```toml
+[windows.little_arc]
+bundle_id = "company.thebrowser.Browser"
+title = ".*"
+identifier = "^littleBrowserWindow-"
+floating = true
+```
+
 ### Copying a window rule
 
 Neither the bundle ID nor the exact window title is visible anywhere in the UI,
@@ -554,14 +570,17 @@ title = "^paneru — zsh$"
 # width = 0.5
 ```
 
-The two matchers are live; everything else is a comment for you to uncomment.
+`bundle_id` and `title` are live; everything else is a comment for you to uncomment.
 `title` is anchored and regex-escaped so it matches only this window — swap in
 the commented `.*` to cover every window of the app instead. The `app`, `role`
 and `subrole` line is there to tell one pasted rule from the next. `role` and
 `subrole` are also offered as commented-out matchers above it (omitted when the
 window doesn't report one); uncomment them to target, say, only an app's
-dialogs (with `manage = true`, see above). When an `init.lua` is in charge, the
-snippet is written as a Lua table instead of TOML.
+dialogs (with `manage = true`, see above).
+The `identifier` line appears only when the window has an `AXIdentifier`; it is
+anchored the same way, so trim any per-window suffix (such as a UUID) before
+using it. When an `init.lua` is in charge, the snippet is written as a Lua table
+instead of TOML.
 
 ### Following the current workspace
 

@@ -715,7 +715,7 @@ fn test_space_notification_for_dead_window_removes_it() {
     );
 }
 
-/// Closing a floating window despawns it, which removes its `Unmanaged` marker.
+/// Closing a floating window despawns it, which removes its `FloatingMarker`.
 /// That removal must not put the dying window back into the layout strip.
 #[test]
 fn test_closing_floating_window_does_not_reinsert_it_into_the_strip() {
@@ -799,10 +799,9 @@ floating = true
         .on_iteration(0, |world, _state| {
             let is_floating = |world: &mut World, id| {
                 let entity = find_window_entity(id, world);
-                matches!(
-                    world.entity(entity).get::<crate::ecs::Unmanaged>(),
-                    Some(crate::ecs::Unmanaged::Floating)
-                )
+                world
+                    .entity(entity)
+                    .contains::<crate::ecs::FloatingMarker>()
             };
             assert!(!is_floating(world, 0), "standard window must stay tiled");
             assert!(is_floating(world, 1), "dialog must float");

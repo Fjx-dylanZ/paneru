@@ -1022,8 +1022,13 @@ impl WindowProperties {
         // Retry the match once the role becomes readable if this bites.
         let role = window.role().ok();
         let subrole = window.subrole().ok();
-        let params =
-            config.find_window_properties(&title, &bundle_id, role.as_deref(), subrole.as_deref());
+        let params = config.find_window_properties(
+            &title,
+            &bundle_id,
+            role.as_deref(),
+            subrole.as_deref(),
+            || window.identifier().ok(),
+        );
         Self { params }
     }
 

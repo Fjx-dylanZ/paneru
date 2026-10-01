@@ -558,7 +558,7 @@ mod tests {
             )
             .expect("Lua width rule parses");
         let config = runtime.built_config().expect("setup should build a config");
-        let width = config.find_window_properties("Window 1", "", None, None)[0]
+        let width = config.find_window_properties("Window 1", "", None, None, || None)[0]
             .width
             .expect("matched width rule");
         assert_eq!(width.ratio(Some(0.25)), 0.75);

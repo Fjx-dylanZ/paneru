@@ -4,6 +4,7 @@ use objc2_core_foundation::{CFData, CFString};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
 use std::{
+    cell::OnceCell,
     collections::HashMap,
     env,
     ffi::c_void,
@@ -423,9 +424,9 @@ impl Config {
 
     /// Finds window properties for a window.
     /// It iterates through configured window parameters and returns all matching rules.
-    /// A rule matches when its title regex matches and each of its bundle ID, role
-    /// and subrole (if set) equals the window's. A rule's role or subrole never
-    /// matches a window that reports none.
+    /// A rule matches when its title and optional identifier regexes match and its
+    /// optional bundle ID, role and subrole equal the window's. A matcher never
+    /// matches a window that does not report the corresponding attribute.
     ///
     /// # Arguments
     ///
@@ -433,6 +434,9 @@ impl Config {
     /// * `bundle_id` - The bundle identifier of the application owning the window.
     /// * `role` - The window's accessibility role, if it reports one.
     /// * `subrole` - The window's accessibility subrole, if it reports one.
+    /// * `identifier` - Reads the window's `AXIdentifier`, `None` if unreadable.
+    ///   Called at most once, and only after a rule's other matchers pass,
+    ///   since it costs an AX query.
     ///
     /// # Returns
     ///
@@ -443,7 +447,9 @@ impl Config {
         bundle_id: &str,
         role: Option<&str>,
         subrole: Option<&str>,
+        identifier: impl Fn() -> Option<String>,
     ) -> Vec<WindowParams> {
+        let window_identifier = OnceCell::new();
         self.inner()
             .windows
             .as_ref()
@@ -459,6 +465,12 @@ impl Config {
                             && role_match.is_none_or(|m| m)
                             && subrole_match.is_none_or(|m| m)
                             && params.title.is_match(title)
+                            && params.identifier.as_ref().is_none_or(|pattern| {
+                                window_identifier
+                                    .get_or_init(&identifier)
+                                    .as_deref()
+                                    .is_some_and(|id| pattern.is_match(id))
+                            })
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -1417,7 +1429,7 @@ width = "complement_focused"
 "#,
     )
     .expect("dynamic width rule parses");
-    let width = config.find_window_properties("Window 1", "", None, None)[0]
+    let width = config.find_window_properties("Window 1", "", None, None, || None)[0]
         .width
         .expect("matched width rule");
     assert_eq!(width.ratio(Some(0.25)), 0.75);
@@ -1434,13 +1446,14 @@ width = 0.5
 "#,
     )
     .expect("fixed width rule still parses");
-    let width = config.find_window_properties("Window 1", "", None, None)[0]
+    let width = config.find_window_properties("Window 1", "", None, None, || None)[0]
         .width
         .expect("matched width rule");
     assert_eq!(width.ratio(Some(0.25)), 0.5);
 }
 
-/// `WindowParams` defines rules and properties for specific windows based on their title or bundle ID.
+/// `WindowParams` defines rules and properties for specific windows based on their title,
+/// bundle ID, accessibility role/subrole or identifier.
 /// These parameters can override default window management behavior, such as forcing a window to float or setting its initial index.
 #[derive(Clone, Debug, Deserialize)]
 pub struct WindowParams {
@@ -1454,6 +1467,11 @@ pub struct WindowParams {
     /// An optional accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`) the
     /// window must report exactly.
     subrole: Option<String>,
+    /// An optional regular expression to match against the window's `AXIdentifier`,
+    /// which some apps use to tell window kinds apart (e.g. Arc's
+    /// `littleBrowserWindow-<uuid>`). A window without an identifier never matches.
+    #[serde(default, deserialize_with = "deserialize_identifier")]
+    identifier: Option<Regex>,
     /// If `true`, the window will be managed as a floating window (not tiled).
     pub floating: Option<bool>,
     /// If `true`, keep the floating window on Paneru's current native macOS Space.
@@ -1495,6 +1513,7 @@ impl WindowParams {
             bundle_id,
             role: None,
             subrole: None,
+            identifier: None,
             floating: None,
             follow: None,
             manage: None,
@@ -1542,6 +1561,16 @@ where
 {
     let s = String::deserialize(deserializer)?;
     Regex::new(&s).map_err(de::Error::custom)
+}
+
+/// Deserializes the optional `identifier` regular expression of a window rule.
+fn deserialize_identifier<'de, D>(deserializer: D) -> std::result::Result<Option<Regex>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|s| Regex::new(&s).map_err(de::Error::custom))
+        .transpose()
 }
 
 fn deserialize_modifier<'de, D>(deserializer: D) -> std::result::Result<Option<Modifiers>, D::Error>
@@ -2162,8 +2191,13 @@ index = 1
         Some(Command::Window(Operation::Resize(ResizeDirection::Shrink)))
     ));
 
-    let props =
-        config.find_window_properties("picture in picture", "com.something.apple", None, None);
+    let props = config.find_window_properties(
+        "picture in picture",
+        "com.something.apple",
+        None,
+        None,
+        || None,
+    );
     assert_eq!(props[0].floating, Some(true));
     assert_eq!(props[0].index, Some(1));
 
@@ -2427,6 +2461,7 @@ fn test_grid_ratios() {
         bundle_id: None,
         role: None,
         subrole: None,
+        identifier: None,
         floating: None,
         follow: None,
         manage: None,
@@ -2572,13 +2607,19 @@ floating = true
         "com.hegenberg.BetterTouchTool",
         None,
         None,
+        || None,
     );
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].manage, Some(true));
 
     // Screenshot window matches the floating rule.
-    let props =
-        config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool", None, None);
+    let props = config.find_window_properties(
+        "Screenshot 1",
+        "com.hegenberg.BetterTouchTool",
+        None,
+        None,
+        || None,
+    );
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].floating, Some(true));
 }
@@ -2615,7 +2656,7 @@ dont_focus = true
     let config = Config::try_from(input).expect("config should parse");
     let matched = |title, bundle_id, role, subrole| {
         let mut names = config
-            .find_window_properties(title, bundle_id, role, subrole)
+            .find_window_properties(title, bundle_id, role, subrole, || None)
             .iter()
             .map(|params| {
                 if params.floating == Some(true) {
@@ -2712,9 +2753,122 @@ follow = true
         "com.1password.1password",
         None,
         None,
+        || None,
     );
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].follow, Some(true));
+}
+
+#[test]
+fn test_window_rules_identifier() {
+    let input = r#"
+[windows.little_arc]
+bundle_id = "company.thebrowser.Browser"
+title = ".*"
+identifier = "^littleBrowserWindow-"
+floating = true
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    let find = |identifier: Option<&str>| {
+        config.find_window_properties(
+            "Example Domain",
+            "company.thebrowser.Browser",
+            None,
+            None,
+            || identifier.map(str::to_owned),
+        )
+    };
+
+    // Same app and title: only the identifier tells the two window kinds apart.
+    let props = find(Some("littleBrowserWindow-0FEC21ED"));
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].floating, Some(true));
+    assert!(find(Some("bigBrowserWindow-6CF5C4C0")).is_empty());
+    // An unreadable identifier cannot satisfy an identifier matcher.
+    assert!(find(None).is_empty());
+
+    let invalid = r#"
+[windows.broken]
+title = ".*"
+identifier = "("
+"#;
+    assert!(Config::try_from(invalid).is_err());
+}
+
+#[test]
+fn test_window_rules_combine_identifier_role_and_subrole() {
+    let config = Config::try_from(
+        r#"
+[windows.little_arc]
+bundle_id = "company.thebrowser.Browser"
+title = "^Example Domain$"
+role = "AXWindow"
+subrole = "AXStandardWindow"
+identifier = "^littleBrowserWindow-"
+floating = true
+"#,
+    )
+    .expect("combined matcher rule should parse");
+    let matching = (
+        "Example Domain",
+        "company.thebrowser.Browser",
+        Some("AXWindow"),
+        Some("AXStandardWindow"),
+        Some("littleBrowserWindow-123"),
+    );
+    let find = |(title, bundle, role, subrole, identifier): (
+        &str,
+        &str,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+    )| {
+        config.find_window_properties(title, bundle, role, subrole, || {
+            identifier.map(str::to_owned)
+        })
+    };
+    let props = find(matching);
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].floating, Some(true));
+    for mismatch in [
+        (
+            "Other Title",
+            matching.1,
+            matching.2,
+            matching.3,
+            matching.4,
+        ),
+        (matching.0, "other.app", matching.2, matching.3, matching.4),
+        (
+            matching.0,
+            matching.1,
+            Some("AXSheet"),
+            matching.3,
+            matching.4,
+        ),
+        (matching.0, matching.1, None, matching.3, matching.4),
+        (
+            matching.0,
+            matching.1,
+            matching.2,
+            Some("AXDialog"),
+            matching.4,
+        ),
+        (matching.0, matching.1, matching.2, None, matching.4),
+        (
+            matching.0,
+            matching.1,
+            matching.2,
+            matching.3,
+            Some("bigBrowserWindow-123"),
+        ),
+        (matching.0, matching.1, matching.2, matching.3, None),
+    ] {
+        assert!(
+            find(mismatch).is_empty(),
+            "unexpected match for {mismatch:?}"
+        );
+    }
 }
 
 #[test]
@@ -2841,7 +2995,7 @@ mod lua_setup_tests {
                 windows = { term = { title = "kitty", bindings_passthrough = { "ctrl+alt-h" } } },
             }"#,
         );
-        let rules = config.find_window_properties("kitty", "", None, None);
+        let rules = config.find_window_properties("kitty", "", None, None, || None);
         assert_eq!(rules.len(), 1);
         assert!(
             !rules[0].passthrough_keys().is_empty(),
@@ -2860,17 +3014,24 @@ mod lua_setup_tests {
             }"#,
         );
 
-        let rules = config.find_window_properties("Save", "", Some("AXWindow"), Some("AXDialog"));
+        let rules =
+            config.find_window_properties("Save", "", Some("AXWindow"), Some("AXDialog"), || None);
         assert_eq!(rules.len(), 1, "only the subrole rule matches a dialog");
         assert_eq!(rules[0].floating, Some(true));
 
-        let rules = config.find_window_properties("Sheet", "", Some("AXSheet"), None);
+        let rules = config.find_window_properties("Sheet", "", Some("AXSheet"), None, || None);
         assert_eq!(rules.len(), 1, "only the role rule matches a sheet");
         assert_eq!(rules[0].index, Some(2));
 
         assert!(
             config
-                .find_window_properties("Main", "", Some("AXWindow"), Some("AXStandardWindow"))
+                .find_window_properties(
+                    "Main",
+                    "",
+                    Some("AXWindow"),
+                    Some("AXStandardWindow"),
+                    || None
+                )
                 .is_empty(),
             "neither rule matches a standard window"
         );

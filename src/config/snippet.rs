@@ -1,10 +1,11 @@
 //! Generates a ready-to-paste `[windows]` rule for a window.
 //!
-//! Four fields in a window rule are matchers: `title` (a regex, matched
-//! unanchored), and `bundle_id`, `role` and `subrole` (exact string equality).
-//! See [`crate::config::Config::find_window_properties`]. Everything else a rule
-//! can carry is an effect. The snippet emits `title` and `bundle_id` live, and
-//! suggests `role`/`subrole`, the effects and the window's identity as comments.
+//! Five fields in a window rule are matchers: `title` and `identifier` (regexes),
+//! and `bundle_id`, `role` and `subrole` (exact string equality). See
+//! [`crate::config::Config::find_window_properties`]. The snippet emits `title`
+//! and `bundle_id` live, and suggests `role`/`subrole`, `identifier`, the effects
+//! and the window's identity as comments. `identifier` often embeds a per-window
+//! UUID that has to be trimmed to a prefix first.
 
 use bevy::ecs::resource::Resource;
 
@@ -26,13 +27,15 @@ pub struct RuleSubject<'a> {
     pub title: &'a str,
     pub role: &'a str,
     pub subrole: &'a str,
+    pub identifier: &'a str,
 }
 
 /// Builds the snippet for `subject` in `dialect`.
 #[must_use]
 pub fn window_rule_snippet(dialect: SnippetDialect, subject: &RuleSubject<'_>) -> String {
     let key = rule_key(subject.app_name);
-    let title = title_pattern(subject.title);
+    let title = exact_pattern(subject.title);
+    let identifier = (!subject.identifier.is_empty()).then(|| exact_pattern(subject.identifier));
     // An anchored empty title matches nothing useful, so the wildcard is already
     // the live pattern and there is no alternative left to suggest.
     let wildcard_alternative = !subject.title.is_empty();
@@ -58,6 +61,9 @@ pub fn window_rule_snippet(dialect: SnippetDialect, subject: &RuleSubject<'_>) -
             if !subject.subrole.is_empty() {
                 lines.push(format!("# subrole = \"{}\"", quote(subject.subrole)));
             }
+            if let Some(identifier) = &identifier {
+                lines.push(format!("# identifier = \"{identifier}\""));
+            }
             lines.push(format!("# {identity}"));
             lines.push("# floating = true".to_owned());
             lines.push("# manage = true".to_owned());
@@ -82,6 +88,9 @@ pub fn window_rule_snippet(dialect: SnippetDialect, subject: &RuleSubject<'_>) -
             }
             if !subject.subrole.is_empty() {
                 lines.push(format!("    -- subrole = \"{}\",", quote(subject.subrole)));
+            }
+            if let Some(identifier) = &identifier {
+                lines.push(format!("    -- identifier = \"{identifier}\","));
             }
             lines.push(format!("    -- {identity}"));
             lines.push("    -- floating = true,".to_owned());
@@ -140,14 +149,14 @@ fn rule_key(app_name: &str) -> String {
     }
 }
 
-/// The regex a rule should carry to match exactly this title. Escaped so the
-/// title's own punctuation stays literal, then anchored so it does not also
-/// match longer titles — `is_match` is unanchored.
-fn title_pattern(title: &str) -> String {
-    if title.is_empty() {
+/// The regex a rule should carry to match exactly this text. Escaped so the
+/// text's own punctuation stays literal, then anchored so it does not also
+/// match longer text — `is_match` is unanchored.
+fn exact_pattern(text: &str) -> String {
+    if text.is_empty() {
         return ".*".to_owned();
     }
-    quote(&format!("^{}$", regex::escape(title)))
+    quote(&format!("^{}$", regex::escape(text)))
 }
 
 /// Escapes a string for a TOML basic string or a Lua double-quoted string. Runs
@@ -201,6 +210,7 @@ mod tests {
             title,
             role: "AXWindow",
             subrole: "AXStandardWindow",
+            identifier: "",
         }
     }
 
@@ -285,6 +295,31 @@ mod tests {
         let rule = rules.values().next().expect("exactly one rule");
         assert!(rule.title.is_match(title));
         assert_eq!(rule.bundle_id.as_deref(), Some(bundle_id));
+    }
+
+    /// Uncommenting the suggested `identifier` line must yield a rule matching
+    /// the window it came from, including the `regex::escape` round-trip.
+    #[test]
+    fn suggested_identifier_matches_the_window_it_came_from() {
+        let identifier = "littleBrowserWindow-0FEC21ED.(1)";
+        let snippet = window_rule_snippet(
+            SnippetDialect::Toml,
+            &RuleSubject {
+                identifier,
+                ..subject("Arc", "company.thebrowser.Browser", "Space 1")
+            },
+        )
+        .replace("# identifier = ", "identifier = ");
+
+        let config = InnerConfig::new(&snippet).expect("snippet parses as TOML config");
+        let rules = config.windows.as_ref().expect("windows table");
+        let pattern = rules
+            .values()
+            .next()
+            .and_then(|rule| rule.identifier.as_ref())
+            .expect("uncommented identifier matcher");
+        assert!(pattern.is_match(identifier));
+        assert!(!pattern.is_match("littleBrowserWindow-0FEC21ED.(1)-extra"));
     }
 
     #[test]
