@@ -109,12 +109,15 @@ Visual styling for workspaces, active and inactive windows.
 
 Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. Both are enabled by default. `workspace_menu_status` controls only the workspace indicator; the descriptor and menu remain available.
 
+`workspace_popup_native_space` controls whether the popup also appears when the active workspace changes because a different macOS Space became current (Mission Control, Ctrl+arrow, native Space commands, or focusing a window on another Space). Set it to `false` to flash only on virtual workspace switches within a Space. It has no effect when `workspace_popup_status = false`.
+
 **Example:**
 ```toml
 [decorations]
-# Both default to true
+# All default to true
 workspace_menu_status = false
 workspace_popup_status = true
+workspace_popup_native_space = false
 ```
 
 ### `[decorations.menu]`

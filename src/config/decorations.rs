@@ -7,6 +7,7 @@ pub struct DecorationsOptions {
     pub workspace_menu_status: Option<bool>,
     pub menu: Option<MenubarOptions>,
     pub workspace_popup_status: Option<bool>,
+    pub workspace_popup_native_space: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

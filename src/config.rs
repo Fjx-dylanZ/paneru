@@ -890,6 +890,16 @@ impl Config {
             .is_none_or(|enabled| enabled)
     }
 
+    /// Whether the workspace popup also flashes when the active workspace
+    /// changes because a different macOS Space became current.
+    pub fn workspace_popup_native_space(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.workspace_popup_native_space)
+            .is_none_or(|enabled| enabled)
+    }
+
     pub fn virtual_workspace_animations(&self) -> bool {
         // Default is disabled
         self.options()

@@ -2403,6 +2403,48 @@ fn test_workspace_popup_setting_disables_native_space_switch_flash() {
         ]);
 }
 
+#[test]
+fn test_native_space_popup_setting_keeps_virtual_switch_flash() {
+    let config =
+        Config::try_from("[decorations]\nworkspace_popup_native_space = false\n[bindings]\n")
+            .expect("config should parse");
+    let other_space = TEST_WORKSPACE_ID + 1;
+
+    TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "macOS Space switches should not flash while native Space popups are disabled"
+            );
+        })
+        .on_iteration(2, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "2"),
+                "virtual workspace switches should still flash"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+        ]);
+}
+
 // When the focused window leaves the active strip (e.g. it just became
 // floating, or the OS handed focus to an off-strip window), window_focus
 // east/west must enter the strip from the appropriate side rather than

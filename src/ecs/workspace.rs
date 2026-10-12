@@ -1116,7 +1116,7 @@ fn flash_workspace_on_activation(
     strips: PopupStrips,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
-    mut previous_by_display: Local<EntityHashMap<Entity>>,
+    mut previous_by_display: Local<EntityHashMap<(Entity, WorkspaceId)>>,
     mut commands: Commands,
 ) {
     previous_by_display.retain(|display, _| displays.contains(*display));
@@ -1133,8 +1133,8 @@ fn flash_workspace_on_activation(
                 parent.parent() == display_entity && strip.id() == space_id
             })
             .min_by_key(|(_, strip, _, _, selected, _)| (!*selected, strip.virtual_index));
-        if let Some((strip_entity, _, _, _, _, _)) = selected {
-            previous_by_display.insert(display_entity, strip_entity);
+        if let Some((strip_entity, strip, _, _, _, _)) = selected {
+            previous_by_display.insert(display_entity, (strip_entity, strip.id()));
         }
     }
 
@@ -1151,17 +1151,22 @@ fn flash_workspace_on_activation(
     }
 
     // Compare only with the strip last active on this display. A focus move
-    // between displays is not a workspace switch on either display.
-    let switched = previous_by_display
-        .insert(display.parent(), entity)
-        .is_some_and(|old| old != entity);
+    // between displays is not a workspace switch on either display. The
+    // native Space id is kept with the entity because the old strip may
+    // already be despawned by the time the new one activates.
+    let previous = previous_by_display.insert(display.parent(), (entity, strip.id()));
+    let switched = previous.is_some_and(|(old, _)| old != entity);
+    let native_space_switched = previous.is_some_and(|(_, old_space)| old_space != strip.id());
     if restored {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<RestoredActivation>();
         }
         return;
     }
-    if switched && config.workspace_popup_status() {
+    if switched
+        && config.workspace_popup_status()
+        && (!native_space_switched || config.workspace_popup_native_space())
+    {
         commands.flash_message(format!("{}", strip.virtual_index + 1), 1.0);
     }
 }
