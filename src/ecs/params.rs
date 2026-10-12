@@ -235,6 +235,19 @@ impl ActiveDisplayMut<'_, '_> {
 
 pub(crate) type NotSuspended = (Without<MinimizedMarker>, Without<HiddenMarker>);
 pub(crate) type Suspended = Or<(With<MinimizedMarker>, With<HiddenMarker>)>;
+
+/// Windows and strips still easing toward a `RepositionMarker` or
+/// `ResizeMarker` target.
+pub(crate) type AnimationInFlight<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        Or<(With<RepositionMarker>, With<ResizeMarker>)>,
+        NotSuspended,
+    ),
+>;
+
 pub(crate) type WindowStateData = (
     &'static Window,
     Entity,

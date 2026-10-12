@@ -10,7 +10,7 @@ use bevy::prelude::*;
 
 use super::layout::LayoutStrip;
 use super::native_spaces::{NATIVE_CHECK_INTERVAL, NATIVE_REQUEST_TIMEOUT, SpaceMovePending};
-use super::params::Windows;
+use super::params::{AnimationInFlight, Windows};
 use super::{
     ActiveWorkspaceMarker, MissionControlActive, SelectedVirtualMarker, SpawnCommandsExt,
     SpawnWindowTrigger,
@@ -113,13 +113,21 @@ pub(crate) struct NativeTabsPlugin;
 
 impl Plugin for NativeTabsPlugin {
     fn build(&self, app: &mut App) {
+        // Discovery and reconciliation read every window of an app over AX on
+        // the main thread, and an app that is busy being activated or
+        // deactivated answers only at the AX timeout. Run them once the
+        // animation a focus change started has settled, so it never waits on
+        // them. The dirty marker keeps its deadlines and keeps the pump awake
+        // meanwhile. Swipes are not held back: a tab selected mid-pan still has
+        // to be discovered promptly.
+        let animation_settled = |animating: AnimationInFlight| animating.is_empty();
         app.add_observer(reconcile_after_move);
         app.add_systems(
             PreUpdate,
             (
                 dirty_native_tabs,
-                discover_exposed_native_tabs,
-                reconcile_native_tabs,
+                discover_exposed_native_tabs.run_if(animation_settled),
+                reconcile_native_tabs.run_if(animation_settled),
                 sync_selected_geometry,
             )
                 .chain()
@@ -130,7 +138,7 @@ impl Plugin for NativeTabsPlugin {
             Update,
             (
                 discover_native_tabs,
-                reconcile_native_tabs,
+                reconcile_native_tabs.run_if(animation_settled),
                 sync_selected_geometry,
             )
                 .chain()

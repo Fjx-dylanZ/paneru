@@ -5462,9 +5462,8 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
 }
 
 /// Issuing a keyboard focus command to an off-edge window must compute the
-/// strip target, project all window targets against that strip target, and
-/// advance their positions on the very first `app.update()` frame (Frame 0),
-/// rather than lagging by extra frames.
+/// strip target and advance the strip and its windows on the very first
+/// `app.update()` frame (Frame 0), rather than lagging by extra frames.
 #[test]
 fn test_focus_command_starts_animation_on_first_frame() {
     let config: Config = (
@@ -5528,6 +5527,157 @@ fn test_focus_command_starts_animation_on_first_frame() {
     assert_ne!(
         win0_pos.x, initial_win0_x,
         "window 0 should already have advanced on Frame 0"
+    );
+}
+
+/// The active strip's x and in-flight target x, and window 0's x.
+fn focus_animation_sample(world: &mut World) -> (i32, Option<i32>, i32) {
+    let (strip, target) = world
+        .query_filtered::<(&Position, Option<&RepositionMarker>), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .map(|(position, target)| (position.x, target.map(|target| target.x)))
+        .expect("active strip");
+    let entity = find_window_entity(0, world);
+    let window = world.get::<Position>(entity).expect("window 0 position").x;
+    (strip, target, window)
+}
+
+/// Three windows with window 0 focused and a `Focus(Last)` queued, which
+/// scrolls the strip left once the next frame runs.
+fn queued_focus_animation(speed: f64) -> TestHarness {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(speed),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    harness
+}
+
+fn set_frame_length(harness: &mut TestHarness, frame: Duration) {
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(frame));
+}
+
+fn animation_settled(world: &mut World) -> bool {
+    world
+        .query_filtered::<(), With<RepositionMarker>>()
+        .iter(world)
+        .next()
+        .is_none()
+}
+
+/// Windows chase the strip as it eases rather than each running its own
+/// ease-out toward the strip's final offset. On their own they cover most of
+/// the distance in a frame or two and then creep into place, which reads as
+/// lag; chasing the strip they start gently and never get ahead of it.
+#[test]
+fn focus_animation_windows_trail_the_strip() {
+    let mut harness = queued_focus_animation(30.0);
+    let (strip_start, _, window_start) = focus_animation_sample(harness.world());
+
+    let mut frames = Vec::new();
+    for _ in 0..100 {
+        harness.app.update();
+        frames.push(focus_animation_sample(harness.world()));
+        if animation_settled(harness.world()) {
+            break;
+        }
+    }
+    assert!(
+        animation_settled(harness.world()),
+        "the focus animation should settle"
+    );
+    let (strip_end, _, window_end) = *frames.last().expect("at least one frame");
+    assert_ne!(
+        strip_end, strip_start,
+        "Focus(Last) should scroll the strip"
+    );
+    let progress = |from: i32, at: i32, to: i32| f64::from(at - from) / f64::from(to - from);
+
+    for (frame, (strip, target, window)) in frames.iter().copied().enumerate() {
+        if target.is_none() {
+            break;
+        }
+        let strip_progress = progress(strip_start, strip, strip_end);
+        let window_progress = progress(window_start, window, window_end);
+        assert!(
+            window_progress <= strip_progress,
+            "frame {frame}: window 0 at {window_progress:.2} got ahead of the strip at {strip_progress:.2}"
+        );
+        if frame == 0 {
+            assert!(
+                window_progress > 0.0 && window_progress < strip_progress,
+                "Frame 0: window 0 should start moving, behind the strip: {window_progress:.2} vs {strip_progress:.2}"
+            );
+        }
+    }
+}
+
+/// The frame that starts an animation also spans the idle sleep before it. It
+/// must not count that sleep as animation time, or the move lands mostly in
+/// one jump.
+#[test]
+fn focus_animation_does_not_jump_after_idle() {
+    let mut harness = queued_focus_animation(30.0);
+    let (strip_start, _, _) = focus_animation_sample(harness.world());
+    set_frame_length(&mut harness, Duration::from_millis(500));
+    harness.app.update();
+    let (strip, target, _) = focus_animation_sample(harness.world());
+    let target = target.expect("the strip should still be animating after its first frame");
+
+    let progress = f64::from(strip - strip_start) / f64::from(target - strip_start);
+    assert!(
+        progress > 0.0 && progress < 0.5,
+        "the first frame after idle covered {progress:.2} of the scroll"
+    );
+}
+
+/// A frame stalled mid-animation (a blocking AX call to a busy app) is time
+/// the motion has been on screen. The next frame catches up instead of the
+/// animation crawling on long after the window manager responds again.
+#[test]
+fn focus_animation_catches_up_after_a_stalled_frame() {
+    let mut harness = queued_focus_animation(30.0);
+    harness.app.update();
+    harness.app.update();
+    assert!(
+        !animation_settled(harness.world()),
+        "two short frames should leave the scroll in flight"
+    );
+
+    set_frame_length(&mut harness, Duration::from_millis(300));
+    harness.app.update();
+    assert!(
+        animation_settled(harness.world()),
+        "the frame after a 300ms stall should finish the scroll"
+    );
+}
+
+/// While our own moves echo back as window events, frames arrive a millisecond
+/// or two apart and each step is a fraction of a pixel. Rounded back onto the
+/// current position, such steps freeze the animation short of its target.
+#[test]
+fn focus_animation_finishes_at_a_high_frame_rate() {
+    let mut harness = queued_focus_animation(30.0);
+    set_frame_length(&mut harness, Duration::from_millis(1));
+    for _ in 0..2000 {
+        harness.app.update();
+        if animation_settled(harness.world()) {
+            break;
+        }
+    }
+    assert!(
+        animation_settled(harness.world()),
+        "the scroll should arrive even when every frame is a sub-pixel step"
     );
 }
 

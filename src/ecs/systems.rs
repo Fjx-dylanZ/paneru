@@ -4,10 +4,11 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
@@ -26,7 +27,7 @@ use super::{
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{ActiveDisplay, FrameActivity, NotSuspended, Windows};
+use crate::ecs::params::{ActiveDisplay, AnimationInFlight, FrameActivity, NotSuspended, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker,
     FollowCurrentWorkspaceMarker, HiddenMarker, Initializing, LowPowerMode, MinimizedMarker,
@@ -596,122 +597,123 @@ pub(super) fn retry_front_switch(
     }
 }
 
-/// Upper bound on the timestep fed into [`ease_out_factor`].
-///
-/// When the event loop wakes from an idle sleep (up to 500ms, or 2s in low
-/// power mode), `Time::delta_secs_f64()` reports the entire sleep duration on
-/// the wakeup frame. Feeding that straight into the exponential decay would
-/// consume almost the entire distance on Frame 0 and turn the animation into a
-/// single-frame jump. Cap each frame's step to a 30fps tick (matching the
-/// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
-const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
+/// Timestep of an animation's first frame. That frame's real delta also spans
+/// the idle sleep before it (up to 500ms, or 2s in low power mode), which would
+/// land most of the move in a single jump.
+const FIRST_ANIMATION_STEP_SECS: f64 = 1.0 / 60.0;
 
-/// Animates window movement.
-/// Fraction of the remaining distance an exponential ease-out consumes in a
-/// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
-/// Shared by the reposition and resize animators so the two never drift out of step.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
-)]
-fn ease_out_factor(rate: f64, delta: f64) -> f32 {
-    let delta = delta.min(MAX_ANIMATION_STEP_SECS);
-    (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
+/// The timestep every animator advances by this frame.
+///
+/// Computed once per frame, so the reposition and resize animators and
+/// `position_layout_windows`' projection of a moving strip all take the same
+/// step.
+#[derive(Resource, Default)]
+pub(crate) struct AnimationStep {
+    delta: f64,
 }
 
-/// This is a Bevy system that runs on `Update`. It smoothly moves windows to their target
-/// positions, as indicated by the `RepositionMarker` component.
-/// Animation speed is controlled by the `animation_speed` in the `Config`.
-/// When a window reaches its target position, the `RepositionMarker` is removed.
+impl AnimationStep {
+    /// Fraction of the remaining distance an exponential ease-out with decay
+    /// `rate` (per second) consumes this frame.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
+    )]
+    pub(crate) fn factor(&self, rate: f64) -> f32 {
+        (1.0 - (-rate * self.delta).exp()).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// Runs in `First`, once Bevy has advanced `Time`.
 ///
-/// # Arguments
+/// While motion is already in flight the pump wakes at least every
+/// `LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS`, so the real delta is how long the motion
+/// has actually been on screen. That includes a frame stalled in a blocking AX
+/// call: the animation catches up on the next frame instead of crawling on at
+/// a capped rate once the window manager responds again.
+pub(crate) fn update_animation_step(
+    in_flight: AnimationInFlight,
+    time: Res<Time>,
+    mut step: ResMut<AnimationStep>,
+) {
+    step.delta = if in_flight.is_empty() {
+        FIRST_ANIMATION_STEP_SECS
+    } else {
+        time.delta_secs_f64()
+    };
+}
+
+/// One animation step from `current` toward `target`, consuming `t` of the
+/// remaining distance. Returns where it lands and whether it has arrived.
 ///
-/// * `windows` - A `Populated` query for `(&mut Window, Entity, &RepositionMarker)` components.
-/// * `displays` - A query for all `Display` entities, used to get display bounds and menubar height.
-/// * `time` - The Bevy `Time` resource for calculating delta time.
-/// * `config` - The `Config` resource, used for animation speed.
-/// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
+/// A step that has not arrived moves at least a pixel along every axis still
+/// short of the target. Rounding a sub-pixel step back onto `current` would
+/// otherwise freeze the tail whenever frames come quickly — and they do while
+/// our own moves echo back as window events.
+pub(crate) fn ease_toward(current: IVec2, target: IVec2, t: f32) -> (IVec2, bool) {
+    let lerped = current.as_vec2().lerp(target.as_vec2(), t);
+    if (target.as_vec2() - lerped).length() <= ANIAMTE_SNAP_THRESHOLD {
+        return (target, true);
+    }
+    let remaining = target - current;
+    let mut next = lerped.round().as_ivec2();
+    if next.x == current.x {
+        next.x += remaining.x.signum();
+    }
+    if next.y == current.y {
+        next.y += remaining.y.signum();
+    }
+    (next, false)
+}
+
+/// Runs in `PostUpdate`: eases every entity carrying a `RepositionMarker`
+/// toward its target at the configured `animation_speed` (a decay rate per
+/// second; higher is snappier), dropping the marker on arrival.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
     animate: Populated<(&mut Position, Entity, &RepositionMarker), NotSuspended>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    // Frame-rate-independent exponential smoothing (ease-out).
-    // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = step.factor(config.animation_speed());
 
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let target = origin.as_vec2();
-            let current = position.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            // Snap once we're within a pixel of the target (or after one effectively-
-            // complete tick), so the marker is dropped promptly.
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_pos = if finished {
-                *origin
-            } else {
-                lerped.round().as_ivec2()
-            };
-
-            trace!(
-                "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
-                position.0,
-            );
-            position.0 = new_pos;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
-            }
-        });
+    for (mut position, entity, RepositionMarker(origin)) in animate {
+        let (new_pos, finished) = ease_toward(position.0, *origin, t);
+        trace!(
+            "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
+            position.0,
+        );
+        position.0 = new_pos;
+        if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<RepositionMarker>();
+        }
+    }
 }
 
-/// Animates window resizing.
-/// This is a Bevy system that runs on `Update`. It resizes windows to their target
-/// dimensions, as indicated by the `ResizeMarker` component.
-/// When a window reaches its target size, the `ResizeMarker` is removed.
-///
-/// # Arguments
-///
-/// * `windows` - A `Populated` query for `(&mut Window, Entity, &ResizeMarker)` components.
-/// * `active_display` - An `ActiveDisplay` system parameter providing immutable access to the active display.
-/// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
+/// Runs in `PostUpdate`: eases every window carrying a `ResizeMarker` toward
+/// its target size in step with [`animate_entities`], dropping the marker on
+/// arrival.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker), NotSuspended>,
-    time: Res<Time>,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = step.factor(config.animation_speed());
 
-    animate
-        .into_iter()
-        .for_each(|(mut bounds, entity, ResizeMarker(size))| {
-            let target = size.as_vec2();
-            let current = bounds.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_size = if finished {
-                *size
-            } else {
-                lerped.round().as_ivec2()
-            };
-
-            trace!(
-                "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
-                bounds.0,
-            );
-            bounds.0 = new_size;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<ResizeMarker>();
-            }
-        });
+    for (mut bounds, entity, ResizeMarker(size)) in animate {
+        let (new_size, finished) = ease_toward(bounds.0, *size, t);
+        trace!(
+            "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
+            bounds.0,
+        );
+        bounds.0 = new_size;
+        if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ResizeMarker>();
+        }
+    }
 }
 
 /// Republishes the pointer and gesture events onto [`InputEvent`], so the input

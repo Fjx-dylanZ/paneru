@@ -402,7 +402,6 @@ fn autocenter_window_on_focus(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-#[allow(clippy::too_many_arguments)]
 fn mouse_follows_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     windows: Windows,
@@ -411,7 +410,6 @@ fn mouse_follows_focus(
     window_manager: Res<WindowManager>,
     displays: Query<&Display>,
     workspaces: MouseFocusStrips,
-    restored: Query<&RestoreFocusMarker>,
 ) {
     let entity = *focused;
     let Some(window) = windows.get(entity) else {
@@ -441,14 +439,9 @@ fn mouse_follows_focus(
             .find(|(strip, _, _, _, _, _)| strip.contains(entity))
         && let Ok(display) = displays.get(child.parent())
     {
-        // Project the window's slot onto the strip destination when the window
-        // does not carry its own auto-center target (workspace restore or
-        // auto-center disabled), since the strip moves before its members are
-        // laid out on a following tick.
-        let frame = if (restored.iter().any(|marker| marker.entity == entity)
-            || !config.auto_center())
-            && let Some(layout) = windows.layout_position(entity)
-        {
+        // A tiled window comes to rest at its slot on the strip's destination;
+        // until then its own target only tracks where the strip is this frame.
+        let frame = if let Some(layout) = windows.layout_position(entity) {
             let origin = layout.0 + reposition.map_or(position.0, |target| target.0);
             IRect::from_corners(origin, origin + frame.size())
         } else {

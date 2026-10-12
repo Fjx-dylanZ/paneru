@@ -15,7 +15,7 @@ use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
 use bevy::time::common_conditions::on_timer;
-use bevy::time::{Time, Virtual};
+use bevy::time::{Time, TimeSystems, Virtual};
 use bevy::{
     app::Update,
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
@@ -118,6 +118,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    app.init_resource::<systems::AnimationStep>();
+    app.add_systems(First, systems::update_animation_step.after(TimeSystems));
     app.add_systems(
         PreUpdate,
         (

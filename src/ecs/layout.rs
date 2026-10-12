@@ -14,6 +14,7 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
+use crate::ecs::systems::{AnimationStep, ease_toward};
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
@@ -1663,21 +1664,34 @@ fn position_layout_windows(
     workspaces: StripsForWindowPositioning,
     snap_guards: Query<&SnapStripMarker>,
     displays: DisplayViewports,
+    step: Res<AnimationStep>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
     let offscreen_sliver_width = config.sliver_width();
     let (_, pad_right, _, pad_left) = config.edge_padding();
+    let strip_step = step.factor(config.animation_speed());
     let mut strip_contexts = EntityHashMap::default();
     for (strip_entity, layout_strip, Position(strip_position), reposition, swiping, child_of) in
         &workspaces
     {
         let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
-        let strip_target = reposition.map_or(*strip_position, |target| target.0);
+        // Follow where the strip lands at the end of this frame, which
+        // `animate_entities` steps by the same amount. Windows then chase the
+        // strip as it eases, starting gently on this very frame. Aiming them at
+        // the strip's final offset instead makes each window its own ease-out,
+        // which covers most of the distance in the first frame or two and
+        // spends the rest creeping into place.
+        let strip_origin = match reposition {
+            Some(RepositionMarker(target)) if !swiping => {
+                ease_toward(*strip_position, *target, strip_step).0
+            }
+            _ => *strip_position,
+        };
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
-            strip_target,
+            strip_origin,
             swiping,
             child_of.parent(),
             snap_settling,
@@ -1764,8 +1778,8 @@ fn position_layout_windows(
             //   distance should be instantaneous.
             // Otherwise (programmatic strip animation, or pure layout change), animate toward the
             // new position so layout changes (swap/add/remove) slide instead of teleport. When the
-            // strip is also being animated, the per-window target is recomputed each tick from the
-            // strip's current position, so the two motions compose: e.g., on swap, the focused
+            // strip is also being animated, the per-window target is recomputed each tick from
+            // where the strip lands that tick, so the two motions compose: e.g., on swap, the focused
             // window's target converges back to its old visual position as the strip settles, while
             // the other window slides past.
             // Parking and un-parking have to snap as one move. The clamp above

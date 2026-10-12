@@ -1,9 +1,9 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef, AXValueCreate,
-    AXValueGetValue, kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess,
-    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
-    kAXStandardWindowSubrole, kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef,
+    AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetValue, kAXErrorAttributeUnsupported,
+    kAXErrorNoValue, kAXErrorSuccess, kAXFloatingWindowSubrole, kAXPositionAttribute,
+    kAXRaiseAction, kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownRole, kAXUnknownSubrole,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -34,6 +34,15 @@ use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size, irect_from};
 use crate::platform::{OSStatus, Pid, ProcessSerialNumber, WinID, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
+
+/// How long a position write waits for the owning app to acknowledge it.
+///
+/// The write only has to reach the app, which applies queued writes in order
+/// once it services accessibility again. An app being activated or deactivated
+/// can stop answering for half a second; waiting out the full messaging
+/// timeout there holds up every other window's animation frame on the main
+/// thread.
+const AX_WRITE_TIMEOUT_SEC: f32 = 0.05;
 
 /// The registry lock only looks up per-app locks; AX calls never hold it.
 static ENHANCED_UI_STATES: LazyLock<Mutex<HashMap<Pid, Arc<Mutex<EnhancedUiState>>>>> =
@@ -618,13 +627,18 @@ impl WindowOS {
             )
         };
         if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
+            let element = self.ax_element.as_ptr();
             unsafe {
+                AXUIElementSetMessagingTimeout(element, AX_WRITE_TIMEOUT_SEC);
                 AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
+                    element,
                     CFString::from_static_str(kAXPositionAttribute).as_ref(),
                     position.as_ref(),
-                )
-            };
+                );
+                // Zero puts the element back on the process-wide timeout,
+                // which every read through it relies on.
+                AXUIElementSetMessagingTimeout(element, 0.0);
+            }
             let size = self.frame.size();
             self.frame.min = origin;
             self.frame.max = origin + size;
